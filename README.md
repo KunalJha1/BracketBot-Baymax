@@ -62,6 +62,13 @@ the configured order. Override the aliases when necessary:
 python3 scripts/robot_dashboard.py --ssh-hosts botwifi,bot
 ```
 
+On connection, the dashboard preloads its fixed runners and assets into the
+robot's `/tmp` directory. Subsequent actions reuse an SSH control connection
+and invoke the existing `~/bbos/.venv` directly (with `uv --no-sync` as a
+fallback), avoiding a file upload and environment launch on every button
+press. The status card reports measured runner-ready dispatch latency. Arm
+gestures still retain their three-second safe entry and return ramps.
+
 Develop or demo the full dashboard while the robot is offline:
 
 ```sh

@@ -1,4 +1,5 @@
 import time
+from types import SimpleNamespace
 import wave
 
 from scripts.robot_dashboard import (
@@ -10,8 +11,10 @@ from scripts.robot_dashboard import (
     ROOT,
     RUNNER,
     RobotController,
+    action_bundle_paths,
     action_resource_path,
     parse_hosts,
+    remote_python_command,
 )
 
 
@@ -142,3 +145,41 @@ def test_unknown_operations_are_rejected():
 
 def test_parse_hosts_deduplicates_and_preserves_order():
     assert parse_hosts("botwifi, bot, botwifi") == ("botwifi", "bot")
+
+
+def test_action_bundle_contains_each_runner_and_asset_once():
+    bundle = action_bundle_paths()
+
+    assert RUNNER in bundle
+    assert EFFECT_RUNNER in bundle
+    assert len(bundle) == len(set(bundle))
+    assert all(path.is_file() for path in bundle)
+
+
+def test_remote_python_prefers_existing_venv_and_keeps_uv_fallback():
+    command = remote_python_command("/tmp/example.py", "--name", "Fist bump")
+
+    assert '"$HOME/bbos/.venv/bin/python"' in command
+    assert 'uv" run --no-sync --project "$HOME/bbos"' in command
+    assert "'Fist bump'" in command
+
+
+def test_deploy_skips_unchanged_cached_files(tmp_path, monkeypatch):
+    asset = tmp_path / "asset.txt"
+    asset.write_text("v1")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr("scripts.robot_dashboard.subprocess.run", fake_run)
+    controller = RobotController(("bot",))
+
+    assert controller._deploy("bot", asset) is True
+    assert controller._deploy("bot", asset) is False
+    assert len(calls) == 1
+
+    asset.write_text("version two")
+    assert controller._deploy("bot", asset) is True
+    assert len(calls) == 2

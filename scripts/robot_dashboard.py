@@ -37,6 +37,11 @@ SSH_OPTIONS = (
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=3",
     "-o", "ConnectionAttempts=1",
+    "-o", "ControlMaster=auto",
+    "-o", "ControlPersist=90",
+    "-o", "ControlPath=/tmp/bracketbot-dashboard-%C",
+    "-o", "ServerAliveInterval=2",
+    "-o", "ServerAliveCountMax=2",
 )
 
 @dataclass(frozen=True)
@@ -174,6 +179,30 @@ def action_resource_path(info):
     raise ValueError(f"{info.id} does not have a file resource")
 
 
+def action_bundle_paths():
+    """Files preloaded once per connection to keep button dispatch fast."""
+    paths = [RUNNER, EFFECT_RUNNER, BASE_RUNNER]
+    paths.extend(
+        action_resource_path(action)
+        for action in ACTION_LIST
+        if action.executor in {"gesture", "sound"}
+    )
+    return tuple(dict.fromkeys(paths))
+
+
+def remote_python_command(script, *args):
+    """Prefer the already-created BBOS venv, with uv as a portable fallback."""
+    payload = " ".join(shlex.quote(str(value)) for value in (script, *args))
+    return (
+        'export PATH="$HOME/.local/bin:$PATH"; '
+        'if test -x "$HOME/bbos/.venv/bin/python"; then '
+        f'exec "$HOME/bbos/.venv/bin/python" {payload}; '
+        "else "
+        f'exec "$HOME/.local/bin/uv" run --no-sync --project "$HOME/bbos" '
+        f'python {payload}; fi'
+    )
+
+
 class DashboardState:
     def __init__(self, ssh_hosts, simulate=False):
         self.ssh_hosts = tuple(ssh_hosts)
@@ -185,6 +214,8 @@ class DashboardState:
         self.action = None
         self.operation_id = None
         self.step = None
+        self.step_started_at = None
+        self.last_dispatch_ms = None
         self.phase = "Simulation ready — no robot commands will run" if simulate else "Starting connection check"
         self.error = None
         self.log = []
@@ -208,6 +239,7 @@ class DashboardState:
                 "action": self.action,
                 "operation_id": self.operation_id,
                 "step": self.step,
+                "last_dispatch_ms": self.last_dispatch_ms,
                 "phase": self.phase,
                 "error": self.error,
                 "log": list(self.log[-24:]),
@@ -246,6 +278,8 @@ class RobotController:
         self._stop_monitor = threading.Event()
         self._operation_counter = 0
         self._lean_counter = 0
+        self._deploy_lock = threading.Lock()
+        self._deployed_files = set()
 
     @staticmethod
     def _probe(host):
@@ -291,11 +325,29 @@ class RobotController:
             selected = next(
                 (host for host in self.state.ssh_hosts if host in reachable), None
             )
-            with self.state.lock:
-                self.state.host = selected
-                if selected:
-                    self.state.phase = f"Ready — connected through {selected}"
+            if selected:
+                with self.state.lock:
+                    self.state.host = selected
+                    self.state.phase = f"Connected through {selected} — preloading actions…"
+                self._invalidate_deploy_cache(selected)
+                started = time.monotonic()
+                try:
+                    self._deploy(selected, *action_bundle_paths())
+                except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+                    with self.state.lock:
+                        self.state.host = None
+                        self.state.phase = "Robot action preload failed"
+                        self.state.error = str(exc)
                 else:
+                    elapsed = time.monotonic() - started
+                    with self.state.lock:
+                        self.state.phase = (
+                            f"Ready — {len(action_bundle_paths())} action files cached "
+                            f"in {elapsed:.1f}s"
+                        )
+            else:
+                with self.state.lock:
+                    self.state.host = None
                     self.state.phase = "Robot not found"
                     self.state.error = (
                         "No configured SSH connection is reachable. Check Wi-Fi/USB, "
@@ -322,6 +374,8 @@ class RobotController:
                 if busy:
                     continue
                 if host is None or not self._probe(host):
+                    if host is not None:
+                        self._invalidate_deploy_cache(host)
                     self.discover()
 
         threading.Thread(target=monitor, name="robot-monitor", daemon=True).start()
@@ -378,6 +432,8 @@ class RobotController:
                         "id": action_id,
                         "label": ACTIONS[action_id].label,
                     }
+                    self.state.step_started_at = time.monotonic()
+                    self.state.last_dispatch_ms = None
                 self.state.add_log(
                     f"Step {index}/{len(steps)} — {ACTIONS[action_id].label}"
                 )
@@ -390,17 +446,22 @@ class RobotController:
             with self.state.lock:
                 self.state.phase = f"{operation_label} complete"
         except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+            disconnected_host = None
             with self.state.lock:
                 self.state.error = str(exc)
                 self.state.phase = "Command failed"
                 if not self.state.simulate:
+                    disconnected_host = self.state.host
                     self.state.host = None
+            if disconnected_host is not None:
+                self._invalidate_deploy_cache(disconnected_host)
         finally:
             with self.state.lock:
                 self.state.running = False
                 self.state.action = None
                 self.state.operation_id = None
                 self.state.step = None
+                self.state.step_started_at = None
                 self.state.process = None
                 self.state.cancel_requested = False
                 self.state.pid_file = None
@@ -446,7 +507,21 @@ class RobotController:
             self.state.process = process
 
         assert process.stdout is not None
+        first_line = True
         for line in process.stdout:
+            if first_line:
+                with self.state.lock:
+                    started = self.state.step_started_at
+                    if started is not None:
+                        self.state.last_dispatch_ms = round(
+                            (time.monotonic() - started) * 1000
+                        )
+                        dispatch_ms = self.state.last_dispatch_ms
+                    else:
+                        dispatch_ms = None
+                if dispatch_ms is not None:
+                    self.state.add_log(f"[latency] runner ready in {dispatch_ms} ms")
+                first_line = False
             self.state.add_log(line)
         return_code = process.wait()
         with self.state.lock:
@@ -456,15 +531,34 @@ class RobotController:
             raise RuntimeError(f"Robot command exited with status {return_code}")
 
     def _deploy(self, host, *paths):
-        deploy = subprocess.run(
-            ["scp", "-q", *SSH_OPTIONS, *(str(path) for path in paths), f"{host}:/tmp/"],
-            capture_output=True,
-            text=True,
-            timeout=12,
-        )
-        if deploy.returncode != 0:
-            detail = deploy.stderr.strip() or "copy failed"
-            raise RuntimeError(f"Could not send action files: {detail}")
+        with self._deploy_lock:
+            signatures = []
+            for path in paths:
+                path = Path(path)
+                stat = path.stat()
+                signature = (host, str(path.resolve()), stat.st_mtime_ns, stat.st_size)
+                signatures.append((path, signature))
+            missing = [path for path, signature in signatures if signature not in self._deployed_files]
+            if not missing:
+                return False
+
+            deploy = subprocess.run(
+                ["scp", "-q", *SSH_OPTIONS, *(str(path) for path in missing), f"{host}:/tmp/"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if deploy.returncode != 0:
+                detail = deploy.stderr.strip() or "copy failed"
+                raise RuntimeError(f"Could not preload action files: {detail}")
+            self._deployed_files.update(signature for _, signature in signatures)
+            return True
+
+    def _invalidate_deploy_cache(self, host):
+        with self._deploy_lock:
+            self._deployed_files = {
+                signature for signature in self._deployed_files if signature[0] != host
+            }
 
     def _execute_gesture(self, host, info):
         self.state.add_log(f"Connecting through {host}")
@@ -474,12 +568,13 @@ class RobotController:
             if self.state.cancel_requested:
                 return
             pid_file = self.state.pid_file
-        remote_command = (
-            'export PATH="$HOME/.local/bin:$PATH"; '
-            f'exec "$HOME/.local/bin/uv" run --no-sync --project "$HOME/bbos" '
-            f'python {REMOTE_RUNNER} {shlex.quote("/tmp/" + info.resource)} '
-            f'--name {shlex.quote(info.label)} --speed 0.6 --execute '
-            f'--pid-file {pid_file}'
+        remote_command = remote_python_command(
+            REMOTE_RUNNER,
+            "/tmp/" + info.resource,
+            "--name", info.label,
+            "--speed", "0.6",
+            "--execute",
+            "--pid-file", pid_file,
         )
         self._run_remote_process(host, remote_command)
 
@@ -490,11 +585,10 @@ class RobotController:
             if self.state.cancel_requested:
                 return
             pid_file = self.state.pid_file
-        remote_command = (
-            'export PATH="$HOME/.local/bin:$PATH"; '
-            f'exec "$HOME/.local/bin/uv" run --no-sync --project "$HOME/bbos" '
-            f'python {REMOTE_EFFECT_RUNNER} --pid-file {pid_file} sound '
-            f'{shlex.quote("/tmp/" + info.resource)}'
+        remote_command = remote_python_command(
+            REMOTE_EFFECT_RUNNER,
+            "--pid-file", pid_file,
+            "sound", "/tmp/" + info.resource,
         )
         self._run_remote_process(host, remote_command)
 
@@ -505,11 +599,12 @@ class RobotController:
                 return
             pid_file = self.state.pid_file
         rgb = ",".join(str(value) for value in info.rgb)
-        remote_command = (
-            'export PATH="$HOME/.local/bin:$PATH"; '
-            f'exec "$HOME/.local/bin/uv" run --no-sync --project "$HOME/bbos" '
-            f'python {REMOTE_EFFECT_RUNNER} --pid-file {pid_file} led '
-            f'--rgb {rgb} --pattern {info.pattern} --duration {info.duration}'
+        remote_command = remote_python_command(
+            REMOTE_EFFECT_RUNNER,
+            "--pid-file", pid_file,
+            "led", "--rgb", rgb,
+            "--pattern", info.pattern,
+            "--duration", info.duration,
         )
         self._run_remote_process(host, remote_command)
 
@@ -573,10 +668,10 @@ class RobotController:
                     self.state.lean_transition = False
                     self.state.lean_phase = "Balance mode"
                     return
-            remote_command = (
-                'export PATH="$HOME/.local/bin:$PATH"; '
-                f'exec "$HOME/.local/bin/uv" run --no-sync --project "$HOME/bbos" '
-                f'python {REMOTE_BASE_RUNNER} --angle 4.0 --pid-file {pid_file}'
+            remote_command = remote_python_command(
+                REMOTE_BASE_RUNNER,
+                "--angle", "4.0",
+                "--pid-file", pid_file,
             )
             process = subprocess.Popen(
                 ["ssh", *SSH_OPTIONS, host, remote_command],
@@ -670,62 +765,128 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark light">
-<title>BracketBot controls</title>
+<meta name="color-scheme" content="light">
+<title>Baymax Control Center</title>
 <style>
-:root { --bg:#101319; --card:#1a2029; --text:#f7f8fa; --muted:#bac4d1;
-  --line:#3c4858; --accent:#63d8ff; --good:#72e6a1; --warn:#ffd166; --danger:#ff6577; }
+:root { --bg:#f4f1ef; --surface:#fff; --surface-soft:#faf8f7; --text:#252427;
+  --muted:#777278; --line:#e6dfdc; --red:#e6383f; --red-dark:#b91f2d;
+  --red-soft:#fff0f1; --good:#23a66f; --warn:#e19b23; --danger:#d92f3d;
+  --shadow:0 18px 50px rgba(86,47,49,.10); }
 * { box-sizing:border-box; }
-body { margin:0; min-height:100vh; background:var(--bg); color:var(--text);
-  font:18px/1.5 system-ui,-apple-system,sans-serif; }
-main { width:min(760px,calc(100% - 28px)); margin:0 auto; padding:28px 0 48px; }
-h1 { margin:0 0 4px; font-size:clamp(1.8rem,5vw,2.6rem); }
-.intro { color:var(--muted); margin:0 0 22px; }
-.status { border:2px solid var(--line); background:var(--card); border-radius:16px;
-  padding:16px 18px; margin-bottom:20px; }
-.status-line { display:flex; align-items:center; gap:12px; font-weight:750; }
-.dot { width:14px; height:14px; flex:none; border-radius:50%; background:var(--warn); }
+body { margin:0; min-height:100vh; background:
+  radial-gradient(circle at 88% 4%,rgba(230,56,63,.13),transparent 24rem),
+  linear-gradient(180deg,#fbf9f8 0,var(--bg) 36rem); color:var(--text);
+  font:17px/1.5 Inter,Avenir Next,ui-rounded,system-ui,-apple-system,sans-serif; }
+body::before { content:""; position:fixed; inset:0; pointer-events:none; opacity:.35;
+  background-image:radial-gradient(#c7bebb 1px,transparent 1px); background-size:24px 24px;
+  mask-image:linear-gradient(to bottom,black,transparent 35rem); }
+main { position:relative; width:min(1060px,calc(100% - 36px)); margin:0 auto; padding:34px 0 64px; }
+.hero { display:flex; align-items:center; justify-content:space-between; gap:32px;
+  min-height:210px; border-radius:36px; padding:30px 38px; margin-bottom:20px; overflow:hidden;
+  background:linear-gradient(125deg,#d72e37 0,#f0494f 56%,#be1e2d 100%);
+  box-shadow:0 24px 60px rgba(184,31,43,.23); color:#fff; position:relative; }
+.hero::before,.hero::after { content:""; position:absolute; border:1px solid rgba(255,255,255,.18);
+  border-radius:50%; width:330px; height:330px; right:-105px; top:-210px; }
+.hero::after { width:230px; height:230px; right:120px; top:115px; }
+.hero-copy { position:relative; z-index:1; max-width:620px; }
+.eyebrow { margin:0 0 8px; font-size:.72rem; font-weight:850; letter-spacing:.18em;
+  text-transform:uppercase; opacity:.78; }
+h1 { margin:0; font-size:clamp(2.1rem,6vw,4rem); line-height:1; letter-spacing:-.055em; }
+.intro { max-width:540px; margin:14px 0 0; color:rgba(255,255,255,.82); font-weight:600; }
+.baymax-mark { width:154px; height:154px; flex:none; display:grid; place-items:center;
+  border-radius:50%; background:linear-gradient(145deg,#fff,#e9e6e5); position:relative; z-index:1;
+  box-shadow:inset -9px -12px 22px rgba(90,68,68,.14),0 20px 28px rgba(92,12,19,.22); }
+.baymax-face { width:91px; height:28px; position:relative; }
+.baymax-face::before,.baymax-face::after { content:""; position:absolute; top:7px; width:19px;
+  height:19px; background:#1f2022; border-radius:50%; z-index:1; }
+.baymax-face::before { left:0; } .baymax-face::after { right:0; }
+.face-line { position:absolute; left:16px; right:16px; top:15px; height:3px; background:#1f2022; }
+.status { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:18px; align-items:center;
+  border:1px solid var(--line); background:rgba(255,255,255,.92); border-radius:24px;
+  padding:19px 22px; margin-bottom:26px; box-shadow:var(--shadow); backdrop-filter:blur(14px); }
+.status-line { display:flex; align-items:center; gap:12px; font-weight:850; }
+.status-copy { min-width:0; }
+.status-tag { padding:8px 12px; border-radius:999px; background:var(--red-soft); color:var(--red-dark);
+  font-size:.7rem; line-height:1; font-weight:900; letter-spacing:.12em; text-transform:uppercase; }
+.dot { width:12px; height:12px; flex:none; border-radius:50%; background:var(--warn);
+  box-shadow:0 0 0 5px rgba(225,155,35,.13); }
 .dot.good { background:var(--good); } .dot.bad { background:var(--danger); }
-#detail, #base-detail { color:var(--muted); margin:5px 0 0 26px; }
-.group { margin:22px 0 0; }
-.group h2 { margin:0 0 10px; font-size:1.05rem; color:var(--muted); }
-.grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
-button { min-height:94px; border:2px solid var(--line); border-radius:16px; padding:14px;
-  text-align:left; background:var(--card); color:var(--text); font:inherit; cursor:pointer; }
-button:hover:not(:disabled) { border-color:var(--accent); transform:translateY(-1px); }
-button:focus-visible { outline:4px solid var(--accent); outline-offset:3px; }
-button:disabled { opacity:.48; cursor:not-allowed; }
-.label { display:block; font-size:1.15rem; font-weight:800; }
-.desc { display:block; color:var(--muted); font-size:.9rem; margin-top:3px; }
-.key { float:right; border:1px solid var(--line); border-radius:6px; padding:1px 7px;
-  color:var(--muted); font-size:.8rem; }
-.controls { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:14px; }
-.secondary { min-height:58px; text-align:center; }
-.lean-active { background:#173c35; border-color:var(--good); }
-.stop { min-height:58px; text-align:center; background:#491923; border-color:var(--danger); font-weight:850; }
-.log-wrap { margin-top:22px; }
-.log-wrap summary { cursor:pointer; color:var(--muted); }
+#detail, #base-detail, #latency-detail { color:var(--muted); margin:4px 0 0 24px; font-size:.9rem; }
+#catalog { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:18px; align-items:start; }
+.group { margin:0; padding:20px; border:1px solid var(--line); border-radius:28px;
+  background:rgba(255,255,255,.72); }
+.group h2 { display:flex; align-items:center; gap:10px; margin:0 0 14px; color:#4d484c;
+  font-size:.78rem; letter-spacing:.12em; text-transform:uppercase; }
+.group-icon { width:28px; height:28px; display:grid; place-items:center; border-radius:9px;
+  background:var(--red-soft); color:var(--red); font-size:.9rem; font-weight:900; }
+.grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+button { min-height:104px; border:1px solid var(--line); border-radius:20px; padding:15px;
+  text-align:left; background:var(--surface); color:var(--text); font:inherit; cursor:pointer;
+  box-shadow:0 5px 14px rgba(61,37,38,.05); transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease; }
+button:hover:not(:disabled) { border-color:#ef8d92; transform:translateY(-3px);
+  box-shadow:0 12px 24px rgba(160,48,55,.12); }
+button:focus-visible { outline:4px solid rgba(230,56,63,.28); outline-offset:3px; }
+button:disabled { opacity:.48; cursor:not-allowed; filter:saturate(.4); }
+.action-card { position:relative; overflow:hidden; }
+.action-card::after { content:""; position:absolute; width:50px; height:50px; right:-25px; bottom:-25px;
+  border-radius:50%; background:var(--red-soft); transition:transform .2s ease; }
+.action-card:hover::after { transform:scale(1.35); }
+.routine-card { background:linear-gradient(145deg,#fff,var(--red-soft)); }
+.label { display:block; padding-right:22px; font-size:1rem; font-weight:850; letter-spacing:-.015em; }
+.desc { display:block; color:var(--muted); font-size:.79rem; line-height:1.4; margin-top:5px; }
+.key { float:right; border:1px solid #e8d9d9; border-radius:7px; padding:1px 7px;
+  background:#faf5f4; color:#8b7b7c; font:800 .68rem/1.45 ui-monospace,SFMono-Regular,monospace; }
+.controls { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:18px; }
+.secondary,.stop { min-height:60px; border-radius:18px; text-align:center; font-size:.9rem; font-weight:800; }
+.lean-active { background:#eaf8f2; border-color:#7dccac; color:#14744d; }
+.stop { background:var(--red); border-color:var(--red); color:#fff; }
+.stop .key { background:rgba(255,255,255,.14); border-color:rgba(255,255,255,.32); color:#fff; }
+.log-wrap { margin-top:24px; border-top:1px solid var(--line); padding-top:18px; }
+.log-wrap summary { width:max-content; cursor:pointer; color:var(--muted); font-size:.82rem; font-weight:700; }
 pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:220px; overflow:auto;
-  background:#090b0f; padding:12px; border-radius:10px; color:#d7e0ea; font-size:.78rem; }
-.error { color:#ff9ca8; font-weight:700; margin-top:10px; }
+  background:#292629; padding:14px; border-radius:14px; color:#f7eeee; font-size:.75rem; }
+.error { color:var(--danger); font-weight:750; margin:8px 0 0 24px; }
 .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px;
   overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
-@media (max-width:560px) { .grid, .controls { grid-template-columns:1fr; } main { padding-top:18px; } }
+@media (max-width:820px) { #catalog { grid-template-columns:1fr; } }
+@media (max-width:600px) {
+  main { width:min(100% - 22px,1060px); padding-top:12px; }
+  .hero { min-height:190px; padding:25px 23px; border-radius:28px; }
+  .baymax-mark { width:94px; height:94px; position:absolute; right:20px; top:20px; opacity:.24; }
+  .baymax-face { transform:scale(.68); }
+  .hero-copy { padding-top:55px; } .intro { font-size:.88rem; }
+  .status { grid-template-columns:1fr; border-radius:20px; padding:17px; }
+  .status-tag { width:max-content; margin-left:24px; }
+  .group { padding:15px; border-radius:22px; }
+  .grid { grid-template-columns:1fr; }
+  .controls { grid-template-columns:1fr; }
+  button { min-height:92px; }
+}
 @media (prefers-reduced-motion:reduce) { * { transition:none!important; scroll-behavior:auto!important; }
   button:hover:not(:disabled) { transform:none; } }
-@media (prefers-contrast:more) { :root { --line:#eef3f8; --muted:#eef3f8; } }
+@media (prefers-contrast:more) { :root { --line:#524b4c; --muted:#4f4849; } }
 </style>
 </head>
 <body>
 <main>
-  <h1>BracketBot controls</h1>
-  <p class="intro">Run an allowlisted action or a deterministic multi-step routine.</p>
+  <header class="hero">
+    <div class="hero-copy">
+      <p class="eyebrow">Personal healthcare companion</p>
+      <h1>Baymax Control Center</h1>
+      <p class="intro">Your friendly command station for safe gestures, expressions, and care routines.</p>
+    </div>
+    <div class="baymax-mark" aria-hidden="true"><div class="baymax-face"><span class="face-line"></span></div></div>
+  </header>
   <section class="status" aria-labelledby="connection-title">
     <h2 id="connection-title" class="sr-only">Robot connection</h2>
-    <div class="status-line"><span id="dot" class="dot" aria-hidden="true"></span><span id="status">Connecting…</span></div>
-    <p id="detail" aria-live="polite">Checking botwifi and bot</p>
-    <p id="base-detail">Base: balance mode</p>
-    <p id="error" class="error" role="alert" hidden></p>
+    <div class="status-copy">
+      <div class="status-line"><span id="dot" class="dot" aria-hidden="true"></span><span id="status">Connecting…</span></div>
+      <p id="detail" aria-live="polite">Checking botwifi and bot</p>
+      <p id="base-detail">Base: balance mode</p>
+      <p id="latency-detail">Dispatch: waiting for an action</p>
+      <p id="error" class="error" role="alert" hidden></p>
+    </div>
+    <span class="status-tag">System status</span>
   </section>
   <div id="catalog" aria-live="polite"></div>
   <div class="controls">
@@ -740,6 +901,7 @@ const statusEl=document.getElementById('status'), detail=document.getElementById
 const dot=document.getElementById('dot'), error=document.getElementById('error');
 const stop=document.getElementById('stop'), reconnect=document.getElementById('reconnect');
 const lean=document.getElementById('lean'), baseDetail=document.getElementById('base-detail');
+const latencyDetail=document.getElementById('latency-detail');
 const log=document.getElementById('log'), catalog=document.getElementById('catalog');
 let current={}, buttons=[], rendered=false, previewAudio=null;
 async function post(path, body={}) {
@@ -748,10 +910,18 @@ async function post(path, body={}) {
 }
 function makeButton(item, type) {
   const button=document.createElement('button');
+  button.className=type==='routine'?'routine-card':'action-card';
   button.dataset[type]=item.id;
   if(item.key){ const key=document.createElement('span'); key.className='key'; key.textContent=item.key; button.append(key); }
   const label=document.createElement('span'); label.className='label'; label.textContent=item.label; button.append(label);
   const desc=document.createElement('span'); desc.className='desc'; desc.textContent=item.description; button.append(desc);
+  if(type==='routine') {
+    const specs=item.steps.map(id=>current.actions.find(action=>action.id===id)).filter(Boolean);
+    const hasMotion=specs.some(spec=>spec.channels.some(channel=>channel.includes('arm')));
+    const steps=document.createElement('span'); steps.className='desc';
+    steps.textContent=`${hasMotion?'Includes arm motion':'No arm motion'} · ${specs.map(spec=>spec.label).join(' → ')}`;
+    button.append(steps);
+  }
   button.addEventListener('click',()=>{
     if(type==='action'&&current.mode==='simulation'&&item.preview_url) {
       if(previewAudio) previewAudio.pause();
@@ -763,6 +933,7 @@ function makeButton(item, type) {
 }
 function renderCatalog() {
   if(rendered) return;
+  const groupIcons={Gestures:'✦',Lights:'◉',Sounds:'♫',Music:'♪',Routines:'＋'};
   const groups=new Map();
   for(const action of current.actions) {
     if(!groups.has(action.category)) groups.set(action.category,[]);
@@ -770,12 +941,16 @@ function renderCatalog() {
   }
   for(const [name,items] of groups) {
     const section=document.createElement('section'); section.className='group'; section.setAttribute('aria-label',name);
-    const title=document.createElement('h2'); title.textContent=name; section.append(title);
+    const title=document.createElement('h2');
+    const icon=document.createElement('span'); icon.className='group-icon'; icon.setAttribute('aria-hidden','true'); icon.textContent=groupIcons[name]||'•';
+    title.append(icon,document.createTextNode(name)); section.append(title);
     const grid=document.createElement('div'); grid.className='grid';
     items.forEach(item=>grid.append(makeButton(item,'action'))); section.append(grid); catalog.append(section);
   }
   const section=document.createElement('section'); section.className='group'; section.setAttribute('aria-label','Routines');
-  const title=document.createElement('h2'); title.textContent='Routines'; section.append(title);
+  const title=document.createElement('h2');
+  const icon=document.createElement('span'); icon.className='group-icon'; icon.setAttribute('aria-hidden','true'); icon.textContent=groupIcons.Routines;
+  title.append(icon,document.createTextNode('Routines')); section.append(title);
   const grid=document.createElement('div'); grid.className='grid';
   current.routines.forEach(item=>grid.append(makeButton(item,'routine'))); section.append(grid); catalog.append(section);
   buttons=[...catalog.querySelectorAll('button')]; rendered=true;
@@ -792,6 +967,7 @@ async function refresh() {
     lean.setAttribute('aria-pressed',String(current.lean_enabled));
     lean.innerHTML=`<span class="key">Z</span>${current.lean_transition?'Changing base mode…':current.lean_enabled?'Return to balance':'Enable lean'}`;
     baseDetail.textContent=`Base: ${current.lean_phase}`;
+    latencyDetail.textContent=current.last_dispatch_ms==null?'Dispatch: waiting for runner':`Dispatch: runner ready in ${current.last_dispatch_ms} ms`;
     dot.className='dot '+(current.connected?'good':current.checking?'':'bad');
     statusEl.textContent=current.running?`${current.action} in progress`:current.mode==='simulation'?'Local simulation':current.connected?`Connected: ${current.host}`:current.checking?'Connecting…':'Robot offline';
     detail.textContent=current.phase;
@@ -817,7 +993,7 @@ document.addEventListener('keydown',event=>{
   const selector=action?`[data-action="${action.id}"]`:routine?`[data-routine="${routine.id}"]`:null;
   if(selector) { const button=document.querySelector(selector); if(!button.disabled) button.click(); }
 });
-setInterval(refresh,500); refresh();
+setInterval(refresh,250); refresh();
 </script>
 </body>
 </html>"""
