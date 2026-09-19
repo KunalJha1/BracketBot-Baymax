@@ -44,7 +44,7 @@ Feasible, with one physical limit.
 - Following through doors/corners after the person leaves the camera's view.
 - Re-identifying a person after a long absence (> 10 s) — whoever stands in the start zone is locked next.
 - Telling a person apart from person-sized objects (pillars, coat racks, tall plants), or from a
-  wall or another person within ~15 cm of them.
+  wall or another person within about 10 cm of them.
 - Voice start/stop, sound cues (the speaker would be a second hardware writer).
 - Arm motion of any kind during follow.
 - Using facial-expression estimates for anything.
@@ -114,8 +114,12 @@ cluster and the whole cloud in robot-local coordinates for the corridor check.
 Pure numpy; a few milliseconds per frame on the Jetson CPU.
 
 Known limits (accepted): any tall, narrow object (pillar, coat rack, tall plant)
-is person-sized; a person within ~10–15 cm of a wall or another person merges
+is person-sized; a person within about 10 cm of a wall or another person merges
 with it into one cluster that is either too wide (rejected) or displaced.
+
+**What "range" measures:** the depth camera sees the front of the person, so the
+cluster position (and therefore the held gap) is measured from the base origin to
+the front of the torso, about 0.1 m nearer than the person's centre.
 
 ### 6.2 Tracker (`follow_core.Tracker`)
 
@@ -326,7 +330,7 @@ are recorded in `docs/robot-facts.md` with date and robot ID.
 |---|---|---|
 | G0 — read-only probe | Depth daemon running? `camera.depth`/`camera.points` rate; base-frame x sign; drive clamp and command timeout from `Config("drive")`; self points (arms at home) inside the corridor; `robot_follow.py --check` lists clusters (none with the area clear, one near 1.0 m with a person there). | All values recorded; self-mask defined. |
 | G1 | Removed with the switch to depth-only perception (there is no TensorRT engine). | — |
-| G2 — dry run | `robot_follow.py --dry-run` (never opens `drive.ctrl`). Person stands at taped marks 0.6 / 1.0 / 1.5 m straight ahead and ±30°; then 0.3 m beside a wall, next to a chair, and next to any pillar or coat rack; a bystander walks past 0.3 m to the side. | Range within ±5 cm of tape at every mark; lock-on works; the chair is not a cluster; the wall case still finds the person; bystander doesn't steal the track; which tall objects count as people is recorded. |
+| G2 — dry run | `robot_follow.py --dry-run` (never opens `drive.ctrl`). Person stands with the front of their torso above taped marks 0.6 / 1.0 / 1.5 m from the wheel axle, straight ahead and ±30°; then 0.3 m beside a wall, next to a chair, and next to any pillar or coat rack; a bystander walks past 0.3 m to the side. | Range within ±5 cm of tape at every mark; lock-on works; the chair is not a cluster; the wall case still finds the person; bystander doesn't steal the track; which tall objects count as people is recorded. |
 | G3 — rotate only | `--rotate-only` (v forced to 0). Person walks an arc around the robot. | Keeps person within ±10° bearing at walking pace. |
 | G4a — follow, 0.15 m/s | Open floor. Person stands, steps back 0.5 m repeatedly, strolls slowly. | ≥ 95% of FOLLOWING samples within ±20 cm while the person moves ≤ 0.10 m/s; settled tape measurements agree with logged range within 5 cm. |
 | G4b — follow, 0.30 m/s | Same, `v_max` = 0.30. | Same criterion for person speed ≤ 0.25 m/s; no visible balance instability. |
@@ -342,7 +346,7 @@ previously shifted another robot's point cloud by 0.78 m.
 |---|---|
 | Person walks faster than 0.3 m/s | Documented limit; gap reopens; dashboard shows the error. |
 | A pillar, coat rack, or bystander is person-sized | Start in open space; auto re-lock after 10 s LOST can pick them (user choice); G2 records which objects count. |
-| Person merges with a wall or another person within ~15 cm | Cluster rejected or displaced → LOST; documented limit. |
+| Person merges with a wall or another person within about 10 cm | Cluster rejected or displaced → LOST; documented limit. |
 | Point-cloud calibration drift | G2 tape check after every reflash. |
 | Braking/acceleration pitch shakes the camera | Depth daemon compensates with IMU pitch; conservative ramps; check at G4. |
 | Robot's own arms/wheels in the depth cloud | Self-mask from G0; arms must be idle and at home. |
@@ -388,6 +392,8 @@ What changed:
 - After 10 s LOST the robot re-locks automatically (user's choice over stopping).
 - The runner needs only BBOS + numpy and runs in the BBOS venv like the Lean runner;
   gate G1 and the TensorRT/fisheye tooling are removed.
+- Clustering measured about 9 ms per frame on a laptop for a worst-case 40k-point
+  cloud; the Jetson CPU is expected within the 50 Hz loop's budget (checked at G0).
 - Bystander rejection relies on position and motion only. In the closed-loop
   simulation with no appearance cue, a bystander crossing in front and one passing
   0.3 m beside the target kept the right person in 20/20 seeds each — simulation
