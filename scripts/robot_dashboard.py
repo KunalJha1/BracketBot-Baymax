@@ -18,11 +18,14 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import threading
 import time
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -31,9 +34,14 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "gesture_test.py"
 EFFECT_RUNNER = ROOT / "scripts" / "robot_effect.py"
 BASE_RUNNER = ROOT / "scripts" / "robot_base_mode.py"
+GREETER_ACTION_RUNNER = ROOT / "scripts" / "greeter_action.py"
+CAMERA_POINT_RUNNER = ROOT / "scripts" / "camera_point_motion.py"
+TABLE_REST_RUNNER = ROOT / "scripts" / "table_rest.py"
 REMOTE_RUNNER = "/tmp/gesture_test.py"
 REMOTE_EFFECT_RUNNER = "/tmp/robot_effect.py"
 REMOTE_BASE_RUNNER = "/tmp/robot_base_mode.py"
+REMOTE_GREETER_ACTION_RUNNER = "/tmp/greeter_action.py"
+REMOTE_TABLE_REST_RUNNER = "/tmp/table_rest.py"
 SSH_OPTIONS = (
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=3",
@@ -61,6 +69,10 @@ DEFAULT_SSH_HOSTS = (
     "bracketbot@bracketbot-184.local",
     "bot",
 )
+
+
+class RobotConnectionError(RuntimeError):
+    """The SSH transport failed, as opposed to an action being safely rejected."""
 
 @dataclass(frozen=True)
 class ActionSpec:
@@ -119,9 +131,18 @@ ACTION_LIST = (
             channels=("right-arm",), key="3", resource="fist bump.json", risk="contact-motion"),
     _action("hug", "Hug", "Open both arms for a hug", "Gestures", "gesture",
             channels=("left-arm", "right-arm"), key="4", resource="hug.json", risk="contact-motion"),
+    _action("salute", "Salute", "Extend the left hand, salute, then wave", "Gestures", "gesture",
+            channels=("left-arm",), key="s", resource="salute.json", risk="motion"),
+    _action("point-person", "Point at person", "Use the camera to point at the primary visible person",
+            "Gestures", "camera-gesture", channels=("camera", "left-arm", "right-arm"),
+            key="o", resource="point", risk="motion"),
     _action("dance", "Dance", "Recorded two-arm dance", "Gestures", "gesture",
             channels=("left-arm", "right-arm"), key="d", resource="dance.json",
             source="bbapps/mimic/recordings/dance.json", risk="motion"),
+    _action("table-rest", "Place arms on table",
+            "Detect the tabletop, raise both arms, and rest them on its surface",
+            "Positioning", "table-rest", channels=("depth-camera", "left-arm", "right-arm"),
+            key="r", risk="contact-motion"),
     _action("light-calm", "Calm light", "Slow cyan breathing light", "Lights", "led",
             channels=("led",), key="5", rgb=(72, 205, 220), pattern="pulse", duration=4.0),
     _action("light-ready", "Ready light", "Steady green ready signal", "Lights", "led",
@@ -173,14 +194,16 @@ def validate_catalog():
     for action in ACTION_LIST:
         if not action.channels:
             raise RuntimeError(f"{action.id} must declare at least one robot channel")
-        if action.executor in {"gesture", "sound"} and not action.resource:
+        if action.executor in {"gesture", "sound", "camera-gesture"} and not action.resource:
             raise RuntimeError(f"{action.id} requires an allowlisted resource")
         if action.executor == "led" and (
             action.rgb is None or action.pattern not in {"solid", "pulse", "blink"}
             or action.duration is None
         ):
             raise RuntimeError(f"{action.id} requires RGB, pattern, and duration")
-        if action.executor not in {"gesture", "sound", "led"}:
+        if action.executor not in {
+            "gesture", "sound", "led", "camera-gesture", "table-rest"
+        }:
             raise RuntimeError(f"{action.id} has unsupported executor {action.executor}")
 
 
@@ -199,7 +222,14 @@ def action_resource_path(info):
 
 def action_bundle_paths():
     """Files preloaded once per connection to keep button dispatch fast."""
-    paths = [RUNNER, EFFECT_RUNNER, BASE_RUNNER]
+    paths = [
+        RUNNER,
+        EFFECT_RUNNER,
+        BASE_RUNNER,
+        GREETER_ACTION_RUNNER,
+        CAMERA_POINT_RUNNER,
+        TABLE_REST_RUNNER,
+    ]
     paths.extend(
         action_resource_path(action)
         for action in ACTION_LIST
@@ -246,6 +276,8 @@ class DashboardState:
         self.lean_phase = "Balance mode"
         self.lean_process = None
         self.lean_pid_file = None
+        self.stop_lean_after_action = False
+        self.server_id = uuid.uuid4().hex
 
     def snapshot(self):
         with self.lock:
@@ -260,9 +292,10 @@ class DashboardState:
                 "last_dispatch_ms": self.last_dispatch_ms,
                 "phase": self.phase,
                 "error": self.error,
-                "log": list(self.log[-24:]),
+                "log": list(self.log[-240:]),
                 "candidates": list(self.ssh_hosts),
                 "mode": "simulation" if self.simulate else "robot",
+                "server_id": self.server_id,
                 "actions": [action.public() for action in ACTION_LIST],
                 "routines": [routine.public() for routine in ROUTINE_LIST],
                 "lean_enabled": self.lean_enabled,
@@ -276,7 +309,7 @@ class DashboardState:
             return
         with self.lock:
             self.log.append(line)
-            del self.log[:-80]
+            del self.log[:-500]
             self.phase = line
 
     def add_lean_log(self, line):
@@ -285,7 +318,7 @@ class DashboardState:
             return
         with self.lock:
             self.log.append(f"[lean] {line}")
-            del self.log[:-80]
+            del self.log[:-500]
             self.lean_phase = line
 
 
@@ -316,6 +349,29 @@ class RobotController:
             return result.returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             return False
+
+    def _restore_orphaned_base(self, host):
+        """Return an unowned lean runner to balance after a dashboard restart."""
+        pattern = r"^[^ ]*python[^ ]* /tmp/robot_base_mode\.py( |$)"
+        remote = (
+            f"if pgrep -f '{pattern}' >/dev/null; then "
+            f"pkill -INT -f '{pattern}'; "
+            "for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do "
+            f"pgrep -f '{pattern}' >/dev/null || "
+            "{ echo '[base] restored orphaned lean to balance'; exit 0; }; "
+            "sleep 0.25; done; exit 1; fi"
+        )
+        result = subprocess.run(
+            ["ssh", *SSH_OPTIONS, host, remote],
+            capture_output=True,
+            text=True,
+            timeout=6,
+        )
+        if result.returncode != 0:
+            error_type = RobotConnectionError if result.returncode == 255 else RuntimeError
+            raise error_type("Could not safely restore an orphaned lean process")
+        if result.stdout.strip():
+            self.state.add_lean_log(result.stdout)
 
     def discover(self):
         if self.state.simulate:
@@ -351,10 +407,11 @@ class RobotController:
             if selected:
                 with self.state.lock:
                     self.state.host = selected
-                    self.state.phase = f"Connected through {selected} — preloading actions…"
+                    self.state.phase = f"Connected through {selected} — checking base state…"
                 self._invalidate_deploy_cache(selected)
                 started = time.monotonic()
                 try:
+                    self._restore_orphaned_base(selected)
                     self._deploy(selected, *action_bundle_paths())
                 except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
                     with self.state.lock:
@@ -473,12 +530,16 @@ class RobotController:
             with self.state.lock:
                 self.state.error = str(exc)
                 self.state.phase = "Command failed"
-                if not self.state.simulate:
+                if not self.state.simulate and isinstance(
+                    exc,
+                    (OSError, subprocess.TimeoutExpired, RobotConnectionError),
+                ):
                     disconnected_host = self.state.host
                     self.state.host = None
             if disconnected_host is not None:
                 self._invalidate_deploy_cache(disconnected_host)
         finally:
+            restore_balance = False
             with self.state.lock:
                 self.state.running = False
                 self.state.action = None
@@ -488,6 +549,10 @@ class RobotController:
                 self.state.process = None
                 self.state.cancel_requested = False
                 self.state.pid_file = None
+                restore_balance = self.state.stop_lean_after_action
+                self.state.stop_lean_after_action = False
+            if restore_balance:
+                self.set_lean(False)
 
     def _execute_action(self, host, info):
         if self.state.simulate:
@@ -496,6 +561,10 @@ class RobotController:
 
         if info.executor == "gesture":
             self._execute_gesture(host, info)
+        elif info.executor == "camera-gesture":
+            self._execute_camera_gesture(host, info)
+        elif info.executor == "table-rest":
+            self._execute_table_rest(host)
         elif info.executor == "sound":
             self._execute_sound(host, info)
         elif info.executor == "led":
@@ -531,6 +600,8 @@ class RobotController:
 
         assert process.stdout is not None
         first_line = True
+        output_tail = []
+        reported_failure = False
         for line in process.stdout:
             if first_line:
                 with self.state.lock:
@@ -545,13 +616,35 @@ class RobotController:
                 if dispatch_ms is not None:
                     self.state.add_log(f"[latency] runner ready in {dispatch_ms} ms")
                 first_line = False
+            stripped = line.strip()
+            if stripped:
+                output_tail.append(stripped)
+                del output_tail[:-12]
+                if (
+                    "Traceback (most recent call last)" in stripped
+                    or "NOT SAFE TO RUN" in stripped
+                    or "[table][fatal]" in stripped
+                ):
+                    reported_failure = True
             self.state.add_log(line)
         return_code = process.wait()
         with self.state.lock:
             stopped = self.state.cancel_requested
             self.state.process = None
-        if return_code != 0 and not stopped:
-            raise RuntimeError(f"Robot command exited with status {return_code}")
+        self.state.add_log(f"[remote] runner exited status={return_code}")
+        if (return_code != 0 or reported_failure) and not stopped:
+            error_type = RobotConnectionError if return_code == 255 else RuntimeError
+            detail = next(
+                (
+                    line
+                    for line in reversed(output_tail)
+                    if "[fatal]" in line or "NOT SAFE TO RUN" in line
+                ),
+                output_tail[-1] if output_tail else "no runner output",
+            )
+            raise error_type(
+                f"Robot command failed (status {return_code}): {detail}"
+            )
 
     def _deploy(self, host, *paths):
         with self._deploy_lock:
@@ -573,7 +666,8 @@ class RobotController:
             )
             if deploy.returncode != 0:
                 detail = deploy.stderr.strip() or "copy failed"
-                raise RuntimeError(f"Could not preload action files: {detail}")
+                error_type = RobotConnectionError if deploy.returncode == 255 else RuntimeError
+                raise error_type(f"Could not preload action files: {detail}")
             self._deployed_files.update(signature for _, signature in signatures)
             return True
 
@@ -615,6 +709,33 @@ class RobotController:
         )
         self._run_remote_process(host, remote_command)
 
+    def _execute_camera_gesture(self, host, info):
+        self.state.add_log(f"Connecting to the robot camera through {host}")
+        self._deploy(host, GREETER_ACTION_RUNNER, CAMERA_POINT_RUNNER)
+        with self.state.lock:
+            if self.state.cancel_requested:
+                return
+            pid_file = self.state.pid_file
+        remote_command = remote_python_command(
+            REMOTE_GREETER_ACTION_RUNNER,
+            info.resource,
+            "--pid-file", pid_file,
+        )
+        self._run_remote_process(host, remote_command)
+
+    def _execute_table_rest(self, host):
+        self.state.add_log("Scanning for a reachable tabletop with the depth camera")
+        self._deploy(host, TABLE_REST_RUNNER)
+        with self.state.lock:
+            if self.state.cancel_requested:
+                return
+            pid_file = self.state.pid_file
+        remote_command = remote_python_command(
+            REMOTE_TABLE_REST_RUNNER,
+            "--pid-file", pid_file,
+        )
+        self._run_remote_process(host, remote_command)
+
     def _execute_led(self, host, info):
         self._deploy(host, EFFECT_RUNNER)
         with self.state.lock:
@@ -637,6 +758,8 @@ class RobotController:
         with self.state.lock:
             if self.state.host is None:
                 return False, "Robot is not connected; choose Reconnect"
+            if self.state.running:
+                return False, "Wait for the current arm action to finish"
             if self.state.lean_transition:
                 return False, "Lean mode is already changing"
             if enabled == self.state.lean_enabled:
@@ -762,10 +885,17 @@ class RobotController:
             host = self.state.host
             pid_file = self.state.pid_file
             lean_pid_file = self.state.lean_pid_file
+            table_rest_running = self.state.operation_id == "table-rest"
+            defer_lean_stop = action_running and table_rest_running and lean_running
             if action_running:
                 self.state.cancel_requested = True
                 self.state.phase = "Stop requested — finishing safely…"
-            if lean_running:
+            if defer_lean_stop:
+                # Keep the base geometry stable while table-rest retraces its
+                # checked arm path. _run_operation restores balance afterward.
+                self.state.stop_lean_after_action = True
+                self.state.lean_phase = "Lean held until arms return safely…"
+            elif lean_running:
                 self.state.lean_requested = False
                 self.state.lean_transition = not self.state.simulate
                 self.state.lean_phase = (
@@ -778,7 +908,7 @@ class RobotController:
         if not self.state.simulate:
             if action_running:
                 self._request_remote_stop(host, pid_file, "action-stop")
-            if lean_running:
+            if lean_running and not defer_lean_stop:
                 self._request_remote_stop(host, lean_pid_file, "lean-stop")
         return True, "Stop requested"
 
@@ -859,14 +989,21 @@ button:disabled { opacity:.48; cursor:not-allowed; filter:saturate(.4); }
 .desc { display:block; color:var(--muted); font-size:.79rem; line-height:1.4; margin-top:5px; }
 .key { float:right; border:1px solid #e8d9d9; border-radius:7px; padding:1px 7px;
   background:#faf5f4; color:#8b7b7c; font:800 .68rem/1.45 ui-monospace,SFMono-Regular,monospace; }
-.controls { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:18px; }
+.controls { display:grid; grid-template-columns:repeat(2,1fr); gap:12px; margin-top:18px; }
+.positioning { margin-top:24px; padding:20px; border:1px solid var(--line); border-radius:28px;
+  background:linear-gradient(145deg,rgba(255,255,255,.88),rgba(255,240,241,.72)); }
+.positioning h2 { display:flex; align-items:center; gap:10px; margin:0 0 5px; color:#4d484c;
+  font-size:.78rem; letter-spacing:.12em; text-transform:uppercase; }
+.positioning-copy { margin:0 0 14px 38px; color:var(--muted); font-size:.82rem; }
+.positioning-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+.positioning-grid button { min-height:112px; }
 .secondary,.stop { min-height:60px; border-radius:18px; text-align:center; font-size:.9rem; font-weight:800; }
 .lean-active { background:#eaf8f2; border-color:#7dccac; color:#14744d; }
 .stop { background:var(--red); border-color:var(--red); color:#fff; }
 .stop .key { background:rgba(255,255,255,.14); border-color:rgba(255,255,255,.32); color:#fff; }
 .log-wrap { margin-top:24px; border-top:1px solid var(--line); padding-top:18px; }
 .log-wrap summary { width:max-content; cursor:pointer; color:var(--muted); font-size:.82rem; font-weight:700; }
-pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:220px; overflow:auto;
+pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:560px; overflow:auto;
   background:#292629; padding:14px; border-radius:14px; color:#f7eeee; font-size:.75rem; }
 .error { color:var(--danger); font-weight:750; margin:8px 0 0 24px; }
 .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px;
@@ -882,7 +1019,7 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:220px; overflow:a
   .status-tag { width:max-content; margin-left:24px; }
   .group { padding:15px; border-radius:22px; }
   .grid { grid-template-columns:1fr; }
-  .controls { grid-template-columns:1fr; }
+  .controls,.positioning-grid { grid-template-columns:1fr; }
   button { min-height:92px; }
 }
 @media (prefers-reduced-motion:reduce) { * { transition:none!important; scroll-behavior:auto!important; }
@@ -912,9 +1049,16 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:220px; overflow:a
     <span class="status-tag">System status</span>
   </section>
   <div id="catalog" aria-live="polite"></div>
+  <section class="positioning" aria-labelledby="positioning-title">
+    <h2 id="positioning-title"><span class="group-icon" aria-hidden="true">↗</span>Positioning</h2>
+    <p class="positioning-copy">Set the base first, then place the arms using the live depth view.</p>
+    <div class="positioning-grid">
+      <button id="lean" class="secondary"><span class="key">Z</span><span class="label">Lean forward</span><span class="desc">Hold a bounded 4° forward lean</span></button>
+      <button id="table-rest" class="action-card" data-action="table-rest"><span class="key">R</span><span class="label">Place arms on table</span><span class="desc">Adapt both arm heights to the detected tabletop; Stop returns them</span></button>
+    </div>
+  </section>
   <div class="controls">
     <button id="reconnect" class="secondary">Reconnect</button>
-    <button id="lean" class="secondary"><span class="key">Z</span>Enable lean</button>
     <button id="stop" class="stop" disabled><span class="key">Esc</span>Stop action</button>
   </div>
   <details class="log-wrap"><summary>Technical details</summary><pre id="log">No activity yet.</pre></details>
@@ -924,9 +1068,11 @@ const statusEl=document.getElementById('status'), detail=document.getElementById
 const dot=document.getElementById('dot'), error=document.getElementById('error');
 const stop=document.getElementById('stop'), reconnect=document.getElementById('reconnect');
 const lean=document.getElementById('lean'), baseDetail=document.getElementById('base-detail');
+const tableRest=document.getElementById('table-rest');
 const latencyDetail=document.getElementById('latency-detail');
 const log=document.getElementById('log'), catalog=document.getElementById('catalog');
-let current={}, buttons=[], rendered=false, previewAudio=null;
+// A changed server ID means the Python process hot-reloaded; fetch the new page bundle.
+let current={}, buttons=[], rendered=false, previewAudio=null, loadedServerId=null;
 async function post(path, body={}) {
   const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   return response.json();
@@ -959,6 +1105,7 @@ function renderCatalog() {
   const groupIcons={Gestures:'✦',Lights:'◉',Sounds:'♫',Music:'♪',Routines:'＋'};
   const groups=new Map();
   for(const action of current.actions) {
+    if(action.category==='Positioning') continue;
     if(!groups.has(action.category)) groups.set(action.category,[]);
     groups.get(action.category).push(action);
   }
@@ -976,19 +1123,23 @@ function renderCatalog() {
   title.append(icon,document.createTextNode('Routines')); section.append(title);
   const grid=document.createElement('div'); grid.className='grid';
   current.routines.forEach(item=>grid.append(makeButton(item,'routine'))); section.append(grid); catalog.append(section);
-  buttons=[...catalog.querySelectorAll('button')]; rendered=true;
+  buttons=[...catalog.querySelectorAll('button'),tableRest]; rendered=true;
 }
 async function refresh() {
   try {
-    current=await (await fetch('/api/status',{cache:'no-store'})).json();
+    const next=await (await fetch('/api/status',{cache:'no-store'})).json();
+    if(loadedServerId&&next.server_id&&next.server_id!==loadedServerId) {
+      window.location.reload(); return;
+    }
+    current=next; loadedServerId=next.server_id||loadedServerId;
     renderCatalog();
     const ready=current.connected&&!current.running&&!current.checking;
     buttons.forEach(b=>b.disabled=!ready); stop.disabled=!(current.running||current.lean_enabled||current.lean_transition);
     reconnect.disabled=current.running||current.checking||current.lean_enabled||current.lean_transition;
-    lean.disabled=!current.connected||current.lean_transition;
+    lean.disabled=!current.connected||current.lean_transition||current.running;
     lean.className='secondary '+(current.lean_enabled?'lean-active':'');
     lean.setAttribute('aria-pressed',String(current.lean_enabled));
-    lean.innerHTML=`<span class="key">Z</span>${current.lean_transition?'Changing base mode…':current.lean_enabled?'Return to balance':'Enable lean'}`;
+    lean.innerHTML=`<span class="key">Z</span><span class="label">${current.lean_transition?'Changing base mode…':current.lean_enabled?'Return to balance':'Lean forward'}</span><span class="desc">${current.lean_enabled?'Restore upright balance mode':'Hold a bounded 4° forward lean'}</span>`;
     baseDetail.textContent=`Base: ${current.lean_phase}`;
     latencyDetail.textContent=current.last_dispatch_ms==null?'Dispatch: waiting for runner':`Dispatch: runner ready in ${current.last_dispatch_ms} ms`;
     dot.className='dot '+(current.connected?'good':current.checking?'':'bad');
@@ -1003,6 +1154,7 @@ async function refresh() {
 }
 reconnect.addEventListener('click',()=>post('/api/discover').then(refresh));
 lean.addEventListener('click',()=>post('/api/lean',{enabled:!current.lean_enabled}).then(refresh));
+tableRest.addEventListener('click',()=>post('/api/run',{action:'table-rest'}).then(refresh));
 stop.addEventListener('click',()=>{
   if(previewAudio){ previewAudio.pause(); previewAudio.currentTime=0; }
   post('/api/stop').then(refresh);
@@ -1096,6 +1248,59 @@ def parse_hosts(value):
     return hosts
 
 
+def file_signature(path):
+    """Return a reload signature without keeping the source file open."""
+    try:
+        stat = Path(path).stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
+def start_source_reloader(server, controller, source, reload_requested, stop_event):
+    """Restart the dashboard after an idle-safe source change.
+
+    A live robot pose is never interrupted for developer convenience. If an
+    action or lean mode is active, the restart remains pending until the robot
+    has returned to an idle/balance state.
+    """
+    initial = file_signature(source)
+
+    def watch():
+        pending = None
+        announced_wait = False
+        while not stop_event.wait(0.35):
+            signature = file_signature(source)
+            if signature is None or signature == initial:
+                continue
+            if pending != signature:
+                pending = signature
+                announced_wait = False
+                continue
+
+            state = controller.state.snapshot()
+            busy = (
+                state["running"]
+                or state["checking"]
+                or state["lean_enabled"]
+                or state["lean_transition"]
+            )
+            if busy:
+                if not announced_wait:
+                    print(
+                        "[reload] source changed; waiting for actions and lean mode to stop",
+                        flush=True,
+                    )
+                    announced_wait = True
+                continue
+            print("[reload] source changed; restarting dashboard", flush=True)
+            reload_requested.set()
+            server.shutdown()
+            return
+
+    threading.Thread(target=watch, name="dashboard-reloader", daemon=True).start()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Accessible local BracketBot command dashboard")
     parser.add_argument("--bind", default="127.0.0.1", help="listen address (default: localhost only)")
@@ -1114,13 +1319,33 @@ def main():
         action="store_true",
         help="exercise actions and routines locally without SSH or robot hardware",
     )
+    parser.add_argument(
+        "--no-reload",
+        dest="reload",
+        action="store_false",
+        help="disable automatic restart when robot_dashboard.py changes",
+    )
+    parser.set_defaults(reload=True)
     args = parser.parse_args()
 
     controller = RobotController(args.ssh_hosts, simulate=args.simulate)
     Handler.controller = controller
     server = ThreadingHTTPServer((args.bind, args.port), Handler)
+    server.daemon_threads = True
+    reload_requested = threading.Event()
+    reloader_stop = threading.Event()
+    if args.reload:
+        start_source_reloader(
+            server,
+            controller,
+            Path(__file__).resolve(),
+            reload_requested,
+            reloader_stop,
+        )
     controller.start_monitor()
     print(f"BracketBot dashboard: http://{args.bind}:{args.port}", flush=True)
+    if args.reload:
+        print(f"Hot reload: watching {Path(__file__).name}", flush=True)
     if args.simulate:
         print("Mode: local simulation (SSH and BBOS disabled)", flush=True)
     else:
@@ -1130,6 +1355,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        reloader_stop.set()
         controller._stop_monitor.set()
         controller.stop()
         deadline = time.monotonic() + 8.0
@@ -1139,6 +1365,8 @@ def main():
                 break
             time.sleep(0.1)
         server.server_close()
+    if reload_requested.is_set():
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 if __name__ == "__main__":

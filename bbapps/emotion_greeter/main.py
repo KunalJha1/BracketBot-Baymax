@@ -1,0 +1,1401 @@
+"""Robot-native YOLO person + facial-expression greeter.
+
+This app reads the left eye from ``camera.head.rgb``, runs the repository's
+YOLO11 pose model as a person detector, classifies the largest visible face,
+and plays a local prompt through ``speaker.audio`` after a sustained sadness
+cue. It intentionally needs no cloud service.
+
+On the robot:
+  python3 main.py --models-dir models
+  python3 main.py --models-dir models --speak-on-start --max-frames 1
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import threading
+import time
+import wave
+from typing import Any
+
+import cv2
+import numpy as np
+
+from ground_safety import (
+    GroundAlertTracker,
+    GroundAssessment,
+    Keypoint,
+    assess_ground_pose,
+    keypoints_in_base_frame,
+)
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parents[1]
+EMOTION_LABELS = (
+    "anger",
+    "contempt",
+    "disgust",
+    "fear",
+    "happiness",
+    "neutral",
+    "sadness",
+    "surprise",
+)
+
+
+@dataclass(frozen=True)
+class Detection:
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    confidence: float
+    keypoints: tuple[Keypoint, ...] = ()
+
+
+@dataclass(frozen=True)
+class Expression:
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    label: str
+    confidence: float
+
+
+@dataclass(frozen=True)
+class TrackedDetection:
+    track_id: int
+    detection: Detection
+
+
+def intersection_over_union(left: Detection, right: Detection) -> float:
+    x1 = max(left.x1, right.x1)
+    y1 = max(left.y1, right.y1)
+    x2 = min(left.x2, right.x2)
+    y2 = min(left.y2, right.y2)
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    left_area = max(0, left.x2 - left.x1) * max(0, left.y2 - left.y1)
+    right_area = max(0, right.x2 - right.x1) * max(0, right.y2 - right.y1)
+    union = left_area + right_area - intersection
+    return intersection / union if union else 0.0
+
+
+def tracking_similarity(left: Detection, right: Detection) -> float:
+    """Blend box overlap with center proximity for low-frame-rate tracking."""
+
+    left_center = ((left.x1 + left.x2) / 2, (left.y1 + left.y2) / 2)
+    right_center = ((right.x1 + right.x2) / 2, (right.y1 + right.y2) / 2)
+    distance = (
+        (left_center[0] - right_center[0]) ** 2
+        + (left_center[1] - right_center[1]) ** 2
+    ) ** 0.5
+    scale = max(
+        left.x2 - left.x1,
+        left.y2 - left.y1,
+        right.x2 - right.x1,
+        right.y2 - right.y1,
+        1,
+    )
+    proximity = max(0.0, 1.0 - distance / (2.0 * scale))
+    return max(intersection_over_union(left, right), proximity * 0.5)
+
+
+class PersonTracker:
+    """Assign short-lived, session-local IDs to overlapping person boxes."""
+
+    def __init__(self, minimum_iou: float = 0.15, max_missed: int = 2) -> None:
+        self.minimum_iou = minimum_iou
+        self.max_missed = max_missed
+        self.next_id = 1
+        self.tracks: dict[int, tuple[Detection, int]] = {}
+
+    def update(self, detections: list[Detection]) -> list[TrackedDetection]:
+        candidates = sorted(
+            (
+                (tracking_similarity(previous, detection), track_id, index)
+                for track_id, (previous, _) in self.tracks.items()
+                for index, detection in enumerate(detections)
+            ),
+            reverse=True,
+        )
+        assignments: dict[int, int] = {}
+        used_tracks: set[int] = set()
+        used_detections: set[int] = set()
+        for score, track_id, index in candidates:
+            if score < self.minimum_iou:
+                break
+            if track_id in used_tracks or index in used_detections:
+                continue
+            assignments[index] = track_id
+            used_tracks.add(track_id)
+            used_detections.add(index)
+
+        updated: dict[int, tuple[Detection, int]] = {}
+        tracked = []
+        for index, detection in enumerate(detections):
+            track_id = assignments.get(index)
+            if track_id is None:
+                track_id = self.next_id
+                self.next_id += 1
+            updated[track_id] = (detection, 0)
+            tracked.append(TrackedDetection(track_id, detection))
+
+        for track_id, (detection, missed) in self.tracks.items():
+            if track_id not in used_tracks and track_id not in updated:
+                missed += 1
+                if missed <= self.max_missed:
+                    updated[track_id] = (detection, missed)
+        self.tracks = updated
+        return tracked
+
+
+@dataclass
+class SadVoiceTrigger:
+    hold_seconds: float = 1.5
+    cooldown_seconds: float = 30.0
+    reset_seconds: float = 2.0
+    confidence: float = 0.6
+    first_sad_at: float | None = None
+    first_clear_at: float | None = None
+    last_triggered_at: float | None = None
+    armed: bool = True
+
+    def update(
+        self,
+        expression: Expression | None,
+        person_present: bool,
+        now: float,
+    ) -> bool:
+        sad_visible = (
+            person_present
+            and expression is not None
+            and expression.label in {"sad", "sadness"}
+            and expression.confidence >= self.confidence
+        )
+        if sad_visible:
+            self.first_clear_at = None
+            if self.first_sad_at is None:
+                self.first_sad_at = now
+            cooldown_over = (
+                self.last_triggered_at is None
+                or now - self.last_triggered_at >= self.cooldown_seconds
+            )
+            if (
+                self.armed
+                and cooldown_over
+                and now - self.first_sad_at >= self.hold_seconds
+            ):
+                self.armed = False
+                self.last_triggered_at = now
+                return True
+            return False
+
+        self.first_sad_at = None
+        if not self.armed:
+            if self.first_clear_at is None:
+                self.first_clear_at = now
+            elif now - self.first_clear_at >= self.reset_seconds:
+                self.armed = True
+                self.first_clear_at = None
+        return False
+
+
+def _letterbox(frame: np.ndarray, size: int) -> tuple[np.ndarray, float, int, int]:
+    height, width = frame.shape[:2]
+    scale = min(size / width, size / height)
+    resized_width = round(width * scale)
+    resized_height = round(height * scale)
+    resized = cv2.resize(frame, (resized_width, resized_height))
+    left = (size - resized_width) // 2
+    top = (size - resized_height) // 2
+    canvas = np.full((size, size, 3), 114, dtype=np.uint8)
+    canvas[top : top + resized_height, left : left + resized_width] = resized
+    return canvas, scale, left, top
+
+
+def yolo_detections(
+    output: Any,
+    scale: float,
+    pad_x: int,
+    pad_y: int,
+    frame_width: int,
+    frame_height: int,
+    confidence: float,
+    nms_threshold: float,
+) -> list[Detection]:
+    """Decode the one-class YOLO11 pose ONNX output into person boxes."""
+
+    predictions = np.asarray(output).squeeze()
+    if predictions.ndim != 2:
+        raise RuntimeError(f"Unexpected YOLO output shape: {np.asarray(output).shape}")
+    if predictions.shape[0] == 56:
+        predictions = predictions.T
+    if predictions.shape[1] != 56:
+        raise RuntimeError(f"Unexpected YOLO output shape: {np.asarray(output).shape}")
+
+    boxes: list[list[int]] = []
+    scores: list[float] = []
+    rows: list[np.ndarray] = []
+    for row in predictions:
+        score = float(row[4])
+        if score < confidence:
+            continue
+        center_x, center_y, width, height = (float(value) for value in row[:4])
+        boxes.append(
+            [
+                round(center_x - width / 2),
+                round(center_y - height / 2),
+                round(width),
+                round(height),
+            ]
+        )
+        scores.append(score)
+        rows.append(row)
+
+    if not boxes:
+        return []
+    kept = cv2.dnn.NMSBoxes(boxes, scores, confidence, nms_threshold)
+    detections = []
+    for index in np.asarray(kept).reshape(-1):
+        x, y, width, height = boxes[int(index)]
+        x1 = round((x - pad_x) / scale)
+        y1 = round((y - pad_y) / scale)
+        x2 = round((x + width - pad_x) / scale)
+        y2 = round((y + height - pad_y) / scale)
+        pose = rows[int(index)][5:].reshape(17, 3)
+        keypoints = tuple(
+            Keypoint(
+                keypoint_index,
+                (float(point[0]) - pad_x) / scale,
+                (float(point[1]) - pad_y) / scale,
+                float(point[2]),
+            )
+            for keypoint_index, point in enumerate(pose)
+            if float(point[2]) > 0.0
+        )
+        detections.append(
+            Detection(
+                max(0, min(frame_width, x1)),
+                max(0, min(frame_height, y1)),
+                max(0, min(frame_width, x2)),
+                max(0, min(frame_height, y2)),
+                scores[int(index)],
+                keypoints,
+            )
+        )
+    return detections
+
+
+class PersonDetector:
+    def __init__(self, model_path: Path, size: int = 320) -> None:
+        if not model_path.exists():
+            raise FileNotFoundError(f"YOLO ONNX model not found: {model_path}")
+        self.net = cv2.dnn.readNetFromONNX(str(model_path))
+        self.size = size
+
+    def detect(
+        self,
+        frame: np.ndarray,
+        confidence: float = 0.4,
+        nms_threshold: float = 0.45,
+    ) -> list[Detection]:
+        canvas, scale, pad_x, pad_y = _letterbox(frame, self.size)
+        blob = cv2.dnn.blobFromImage(
+            canvas,
+            scalefactor=1 / 255.0,
+            size=(self.size, self.size),
+            swapRB=True,
+            crop=False,
+        )
+        self.net.setInput(blob)
+        output = self.net.forward()
+        height, width = frame.shape[:2]
+        return yolo_detections(
+            output,
+            scale,
+            pad_x,
+            pad_y,
+            width,
+            height,
+            confidence,
+            nms_threshold,
+        )
+
+
+class ExpressionAnalyzer:
+    def __init__(
+        self,
+        face_model: Path,
+        expression_model: Path,
+        smoothing: float = 0.25,
+        face_confidence: float = 0.75,
+    ) -> None:
+        for path in (face_model, expression_model):
+            if not path.exists():
+                raise FileNotFoundError(f"Vision model not found: {path}")
+        self.face_detector = cv2.FaceDetectorYN.create(
+            str(face_model), "", (320, 320), face_confidence, 0.3, 50
+        )
+        self.expression_net = cv2.dnn.readNetFromONNX(str(expression_model))
+        self.smoothing = smoothing
+        self.scores: np.ndarray | None = None
+        self.missing_frames = 0
+
+    def missing(self) -> None:
+        self.missing_frames += 1
+        if self.missing_frames > 15:
+            self.scores = None
+
+    def analyze(
+        self,
+        frame: np.ndarray,
+        classify: bool = True,
+        offset_x: int = 0,
+        offset_y: int = 0,
+    ) -> Expression | None:
+        height, width = frame.shape[:2]
+        self.face_detector.setInputSize((width, height))
+        _, faces = self.face_detector.detect(frame)
+        if faces is None or len(faces) == 0:
+            self.missing()
+            return None
+
+        self.missing_frames = 0
+        face = max(faces, key=lambda row: float(row[2] * row[3]))
+        x, y, face_width, face_height = (float(value) for value in face[:4])
+        padding = 0.12 * max(face_width, face_height)
+        x1 = max(0, round(x - padding))
+        y1 = max(0, round(y - padding))
+        x2 = min(width, round(x + face_width + padding))
+        y2 = min(height, round(y + face_height + padding))
+
+        if classify or self.scores is None:
+            face_rgb = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
+            resized = cv2.resize(face_rgb, (224, 224)).astype(np.float32) / 255.0
+            resized -= np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
+            resized /= np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
+            blob = resized.transpose(2, 0, 1)[None, ...]
+            self.expression_net.setInput(blob)
+            logits = self.expression_net.forward().reshape(-1)[: len(EMOTION_LABELS)]
+            probabilities = np.exp(logits - logits.max())
+            probabilities /= probabilities.sum()
+            self.scores = (
+                probabilities
+                if self.scores is None
+                else (1 - self.smoothing) * self.scores
+                + self.smoothing * probabilities
+            )
+
+        best_index = int(np.argmax(self.scores))
+        return Expression(
+            x1 + offset_x,
+            y1 + offset_y,
+            x2 + offset_x,
+            y2 + offset_y,
+            EMOTION_LABELS[best_index],
+            float(self.scores[best_index]),
+        )
+
+
+def face_belongs_to_person(
+    expression: Expression | None,
+    detections: list[Detection],
+) -> bool:
+    if expression is None:
+        return False
+    center_x = (expression.x1 + expression.x2) / 2
+    center_y = (expression.y1 + expression.y2) / 2
+    return any(
+        detection.x1 <= center_x <= detection.x2
+        and detection.y1 <= center_y <= detection.y2
+        for detection in detections
+    )
+
+
+class DashboardState:
+    def __init__(self) -> None:
+        self.condition = threading.Condition()
+        self.sequence = 0
+        self.jpeg: bytes | None = None
+        self.targets: tuple[Detection, ...] = ()
+        self.targets_at = 0.0
+        self.frame_width = 0
+        self.frame_height = 0
+        self.metrics: dict[str, Any] = {
+            "ready": False,
+            "frame": 0,
+            "people": 0,
+            "track_ids": [],
+            "ground_status": "starting",
+            "ground_alerts": [],
+            "depth_aligned": False,
+            "map": {"ready": False},
+            "expression": None,
+            "expression_confidence": 0.0,
+            "pipeline_ms": 0.0,
+            "yolo_ms": 0.0,
+            "expression_ms": 0.0,
+            "camera_age_ms": 0.0,
+            "scan_fps": 0.0,
+        }
+
+    def publish(self, frame: np.ndarray, metrics: dict[str, Any]) -> None:
+        ok, encoded = cv2.imencode(
+            ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82]
+        )
+        if not ok:
+            return
+        with self.condition:
+            self.jpeg = encoded.tobytes()
+            self.metrics = {"ready": True, **metrics}
+            self.sequence += 1
+            self.condition.notify_all()
+
+    def wait_for_frame(
+        self,
+        previous_sequence: int,
+        timeout: float = 10.0,
+    ) -> tuple[int, bytes | None]:
+        with self.condition:
+            self.condition.wait_for(
+                lambda: self.sequence != previous_sequence,
+                timeout=timeout,
+            )
+            return self.sequence, self.jpeg
+
+    def status(self) -> dict[str, Any]:
+        with self.condition:
+            return dict(self.metrics)
+
+    def update_targets(
+        self,
+        detections: list[Detection],
+        frame_width: int,
+        frame_height: int,
+        observed_at: float,
+    ) -> None:
+        with self.condition:
+            self.targets = tuple(detections)
+            self.targets_at = observed_at
+            self.frame_width = frame_width
+            self.frame_height = frame_height
+
+    def select_target(self, preference: str, max_age: float = 1.0):
+        with self.condition:
+            if time.monotonic() - self.targets_at > max_age or not self.targets:
+                return None
+            targets = self.targets
+            width = self.frame_width
+            height = self.frame_height
+        if preference == "left":
+            target = min(targets, key=lambda item: item.x1 + item.x2)
+        elif preference == "right":
+            target = max(targets, key=lambda item: item.x1 + item.x2)
+        else:
+            target = max(
+                targets,
+                key=lambda item: (
+                    (item.x2 - item.x1) * (item.y2 - item.y1),
+                    item.confidence,
+                ),
+            )
+        return (
+            2.0 * (target.x1 + target.x2) / (2.0 * width) - 1.0,
+            2.0 * (target.y1 + target.y2) / (2.0 * height) - 1.0,
+        )
+
+
+class CameraActionController:
+    """Run at most one camera-selected motion in an isolated robot process."""
+
+    def __init__(self, runner=Path("/tmp/camera_point_motion.py")) -> None:
+        self.runner = runner
+        self.lock = threading.Lock()
+        self.process: subprocess.Popen | None = None
+        self.last_error: str | None = None
+        self.stage = "idle"
+        self.logs: list[str] = []
+
+    def _log(self, line: str) -> None:
+        line = line.strip()
+        if not line:
+            return
+        with self.lock:
+            self.logs.append(line)
+            del self.logs[:-80]
+        print(line, flush=True)
+
+    def status(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "movement_running": self.process is not None,
+                "movement_error": self.last_error,
+                "movement_stage": self.stage,
+                "movement_log": list(self.logs),
+            }
+
+    def running(self) -> bool:
+        with self.lock:
+            return self.process is not None
+
+    def error(self) -> str | None:
+        self.running()
+        with self.lock:
+            return self.last_error
+
+    def start(self, target: tuple[float, float]) -> tuple[bool, str]:
+        with self.lock:
+            if self.process is not None and self.process.poll() is None:
+                return False, "Another camera action is already running"
+            if not self.runner.is_file():
+                return False, "Pointing runner is not installed; reconnect the gesture dashboard"
+            x_offset, y_offset = target
+            self.last_error = None
+            self.stage = "launching"
+            self.logs = []
+            self.logs.append(
+                f"[vision-action] selected target x={x_offset:+.3f} y={y_offset:+.3f}"
+            )
+            self.process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(self.runner),
+                    "--x-offset", f"{x_offset:.6f}",
+                    "--y-offset", f"{y_offset:.6f}",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            process = self.process
+        threading.Thread(
+            target=self._monitor,
+            args=(process,),
+            name="camera-action-monitor",
+            daemon=True,
+        ).start()
+        return True, "Started camera-guided pointing"
+
+    def _monitor(self, process: subprocess.Popen) -> None:
+        lines = []
+        assert process.stdout is not None
+        for line in process.stdout:
+            line = line.strip()
+            if line:
+                lines.append(line)
+                self._log(line)
+                if "stage=" in line:
+                    with self.lock:
+                        self.stage = line.split("stage=", 1)[1].split()[0]
+        return_code = process.wait()
+        with self.lock:
+            if self.process is process:
+                if return_code:
+                    detail = lines[-1] if lines else f"exit status {return_code}"
+                    self.last_error = detail
+                    self.stage = "failed"
+                else:
+                    self.stage = "complete"
+                self.process = None
+
+    def stop(self) -> tuple[bool, str]:
+        with self.lock:
+            process = self.process
+            if process is None or process.poll() is not None:
+                return False, "No camera action is running"
+            process.send_signal(signal.SIGINT)
+        return True, "Stop requested; returning the arm safely"
+
+
+DASHBOARD_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>BracketBot Vision</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+    body { margin: 0; background: #090d12; color: #edf4fa; }
+    main { width: min(1200px, 96vw); margin: 24px auto; }
+    h1 { margin: 0 0 4px; font-size: clamp(24px, 4vw, 40px); }
+    .note { color: #9fb0bf; margin: 0 0 18px; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit,minmax(145px,1fr)); gap: 10px; margin-bottom: 14px; }
+    .card { background: #131c25; border: 1px solid #263746; border-radius: 12px; padding: 12px 14px; }
+    .label { color: #8fa4b5; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+    .value { margin-top: 4px; font-size: 24px; font-variant-numeric: tabular-nums; }
+    .feed { display: block; width: 100%; background: #000; border: 1px solid #263746; border-radius: 14px; }
+    .ok { color: #63e6a5; }
+    .warn { color: #ffca58; }
+    .alert { color: #ff6262; }
+  </style>
+</head>
+<body><main>
+  <h1>Robot vision</h1>
+  <p class="note">Live left-eye view. Person numbers are temporary tracking IDs, not face recognition.</p>
+  <section class="stats">
+    <div class="card"><div class="label">Status</div><div class="value ok" id="status">Starting</div></div>
+    <div class="card"><div class="label">People</div><div class="value" id="people">0</div></div>
+    <div class="card"><div class="label">Ground safety</div><div class="value" id="ground">Starting</div></div>
+    <div class="card"><div class="label">SLAM map</div><div class="value" id="map">Starting</div></div>
+    <div class="card"><div class="label">Expression cue</div><div class="value" id="expression">—</div></div>
+    <div class="card"><div class="label">Pipeline</div><div class="value" id="pipeline">—</div></div>
+    <div class="card"><div class="label">YOLO</div><div class="value" id="yolo">—</div></div>
+    <div class="card"><div class="label">Face + expression</div><div class="value" id="face">—</div></div>
+    <div class="card"><div class="label">Camera age</div><div class="value" id="age">—</div></div>
+    <div class="card"><div class="label">Scan rate</div><div class="value" id="fps">—</div></div>
+  </section>
+  <img class="feed" src="/stream.mjpg" alt="Annotated robot head-camera stream">
+</main>
+<script>
+// An MJPEG <img> never reconnects on its own: after the app restarts it keeps
+// showing its last frame while the stats below stay live.
+const feed = document.querySelector('.feed');
+let lastFrame = 0, wasDown = false;
+function reconnectFeed() { feed.src = `/stream.mjpg?t=${Date.now()}`; }
+feed.onerror = () => setTimeout(reconnectFeed, 1000);
+async function refresh() {
+  try {
+    const response = await fetch('/api/status', {cache: 'no-store'});
+    const s = await response.json();
+    if (wasDown || s.frame < lastFrame) reconnectFeed();
+    wasDown = false;
+    lastFrame = s.frame;
+    document.getElementById('status').textContent = s.ready ? `Live · frame ${s.frame}` : 'Starting';
+    document.getElementById('people').textContent = s.track_ids?.length ? `${s.people} · #${s.track_ids.join(', #')}` : s.people;
+    const ground = document.getElementById('ground');
+    ground.textContent = s.ground_status === 'alert' ? `STOP · possible person on ground (#${s.ground_alerts.map(a => a.track_id).join(', #')})` :
+      s.ground_status === 'checking' ? 'Checking low pose…' : s.depth_aligned ? 'Clear' : 'Depth unavailable';
+    ground.className = `value ${s.ground_status === 'alert' ? 'alert' : s.ground_status === 'checking' ? 'warn' : 'ok'}`;
+    const map = s.map || {};
+    document.getElementById('map').textContent = map.ready ? `${map.known_area_m2.toFixed(1)} m² known` : 'Unavailable';
+    document.getElementById('expression').textContent = s.expression ? `${s.expression} ${Math.round(s.expression_confidence * 100)}%` : 'none';
+    document.getElementById('pipeline').textContent = `${Math.round(s.pipeline_ms)} ms`;
+    document.getElementById('yolo').textContent = `${Math.round(s.yolo_ms)} ms`;
+    document.getElementById('face').textContent = `${Math.round(s.expression_ms)} ms`;
+    document.getElementById('age').textContent = `${Math.round(s.camera_age_ms)} ms`;
+    document.getElementById('fps').textContent = `${s.scan_fps.toFixed(2)} FPS`;
+  } catch (_) { wasDown = true; document.getElementById('status').textContent = 'Disconnected'; }
+}
+setInterval(refresh, 750); refresh();
+</script></body></html>"""
+
+
+def dashboard_handler(
+    state: DashboardState,
+    actions: CameraActionController,
+) -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path == "/":
+                self._send(DASHBOARD_HTML.encode(), "text/html; charset=utf-8")
+            elif self.path == "/api/status":
+                status = state.status()
+                status.update(actions.status())
+                target = state.select_target("primary")
+                status["point_target"] = (
+                    None
+                    if target is None
+                    else {"x_offset": target[0], "y_offset": target[1]}
+                )
+                self._send(
+                    json.dumps(status).encode(),
+                    "application/json",
+                )
+            elif self.path == "/healthz":
+                self._send(b"ok\n", "text/plain; charset=utf-8")
+            elif self.path.split("?", 1)[0] == "/stream.mjpg":
+                self._stream()
+            else:
+                self.send_error(404)
+
+        def do_POST(self) -> None:
+            if self.client_address[0] not in {"127.0.0.1", "::1"}:
+                self._json(403, False, "Camera actions are robot-local only")
+                return
+            if self.path == "/api/action/stop":
+                ok, message = actions.stop()
+                self._json(200 if ok else 409, ok, message)
+                return
+            if self.path != "/api/action":
+                self.send_error(404)
+                return
+            try:
+                length = min(int(self.headers.get("Content-Length", "0")), 4096)
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, json.JSONDecodeError):
+                self._json(400, False, "Invalid JSON body")
+                return
+            action = str(body.get("action", ""))
+            preferences = {
+                "point": "primary",
+                "point-left": "left",
+                "point-right": "right",
+            }
+            if action not in preferences:
+                self._json(404, False, "Unknown camera action")
+                return
+            target = state.select_target(preferences[action])
+            if target is None:
+                self._json(409, False, "No fresh person detection is available")
+                return
+            ok, message = actions.start(target)
+            self._json(202 if ok else 409, ok, message)
+
+        def _json(self, status: int, ok: bool, message: str) -> None:
+            body = json.dumps({"ok": ok, "message": message}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send(self, body: bytes, content_type: str) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _stream(self) -> None:
+            self.send_response(200)
+            self.send_header(
+                "Content-Type", "multipart/x-mixed-replace; boundary=frame"
+            )
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            sequence = -1
+            try:
+                while True:
+                    sequence, jpeg = state.wait_for_frame(sequence)
+                    if jpeg is None:
+                        continue
+                    self.wfile.write(
+                        b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                        + str(len(jpeg)).encode()
+                        + b"\r\n\r\n"
+                        + jpeg
+                        + b"\r\n"
+                    )
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+    return Handler
+
+
+def start_dashboard(
+    state: DashboardState,
+    actions: CameraActionController,
+    host: str,
+    port: int,
+) -> ThreadingHTTPServer:
+    server = ThreadingHTTPServer((host, port), dashboard_handler(state, actions))
+    server.daemon_threads = True
+    threading.Thread(
+        target=server.serve_forever,
+        name="vision-dashboard",
+        daemon=True,
+    ).start()
+    print(f"[dashboard] http://{host}:{port}", flush=True)
+    return server
+
+
+def camera_age_ms(timestamp: Any) -> float:
+    try:
+        captured_ns = int(np.datetime64(timestamp, "ns").astype(np.int64))
+        return max(0.0, (time.time_ns() - captured_ns) / 1_000_000)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def timestamp_ns(timestamp: Any) -> int:
+    try:
+        return int(np.datetime64(timestamp, "ns").astype(np.int64))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def planar_yaw(quaternion: Any) -> float:
+    quaternion = np.asarray(quaternion, dtype=np.float64).reshape(-1)
+    if len(quaternion) < 4:
+        raise ValueError("SLAM quaternion must contain XYZW")
+    return 2.0 * np.arctan2(quaternion[2], quaternion[3])
+
+
+def publish_ground_safety_file(
+    path: Path,
+    status: str,
+    alerts: list[dict[str, Any]],
+    *,
+    camera_timestamp_ns: int,
+    map_epoch: int | None,
+) -> None:
+    """Atomically publish a small interlock state for the navigation owner."""
+
+    payload = {
+        "schema_version": 1,
+        "status": status,
+        "possible_person_on_ground": status == "alert",
+        "alerts": alerts,
+        "camera_timestamp_ns": camera_timestamp_ns,
+        "map_epoch": map_epoch,
+        "published_at": time.time(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
+    temporary.replace(path)
+
+
+def draw_overlay(
+    frame: np.ndarray,
+    detections: list[TrackedDetection],
+    ground_assessments: dict[int, GroundAssessment],
+    ground_statuses: dict[int, str],
+    expression: Expression | None,
+    pipeline_ms: float,
+    end_to_end_ms: float,
+    scan_fps: float,
+) -> None:
+    for tracked in detections:
+        detection = tracked.detection
+        ground_status = ground_statuses.get(tracked.track_id, "unknown")
+        color = (
+            (40, 40, 255)
+            if ground_status == "alert"
+            else (0, 190, 255)
+            if ground_status == "checking"
+            else (0, 220, 80)
+        )
+        cv2.rectangle(
+            frame,
+            (detection.x1, detection.y1),
+            (detection.x2, detection.y2),
+            color,
+            2,
+        )
+        cv2.putText(
+            frame,
+            (
+                f"STOP: possible person on ground #{tracked.track_id}"
+                if ground_status == "alert"
+                else f"Checking ground pose #{tracked.track_id}"
+                if ground_status == "checking"
+                else f"Person #{tracked.track_id} {detection.confidence:.0%}"
+            ),
+            (detection.x1, max(20, detection.y1 - 7)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+        assessment = ground_assessments.get(tracked.track_id)
+        if assessment is not None and assessment.map_position is not None:
+            cv2.putText(
+                frame,
+                f"map ({assessment.map_position[0]:+.2f}, {assessment.map_position[1]:+.2f})",
+                (detection.x1, min(frame.shape[0] - 8, detection.y2 + 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+    cv2.rectangle(frame, (0, 0), (frame.shape[1], 42), (10, 15, 20), -1)
+    cv2.putText(
+        frame,
+        f"pipeline {pipeline_ms:.0f} ms  camera-to-screen {end_to_end_ms:.0f} ms  scan {scan_fps:.2f} FPS",
+        (12, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    if expression is not None:
+        cv2.rectangle(
+            frame,
+            (expression.x1, expression.y1),
+            (expression.x2, expression.y2),
+            (255, 80, 220),
+            2,
+        )
+        cv2.putText(
+            frame,
+            f"{expression.label} {expression.confidence:.0%}",
+            (expression.x1, min(frame.shape[0] - 8, expression.y2 + 22)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 80, 220),
+            2,
+            cv2.LINE_AA,
+        )
+
+
+def _load_bbos() -> tuple[Any, Any, Any, Any]:
+    """Bridge Jetson system OpenCV with the bot's existing BBOS install."""
+
+    bbos_root = Path.home() / "bbos"
+    venv_packages = bbos_root / ".venv/lib/python3.10/site-packages"
+    if str(bbos_root) not in sys.path:
+        sys.path.insert(0, str(bbos_root))
+    if str(venv_packages) not in sys.path:
+        # Append after system packages so OpenCV keeps its NumPy 1.x ABI.
+        sys.path.append(str(venv_packages))
+    from bbos import Config, Reader, Type, Writer
+
+    return Config, Reader, Type, Writer
+
+
+class RobotSpeaker:
+    def __init__(self, wav_path: Path) -> None:
+        if not wav_path.exists():
+            raise FileNotFoundError(f"Voice prompt not found: {wav_path}")
+        self.wav_path = wav_path
+        self.lock = threading.Lock()
+
+    def play(self) -> None:
+        if not self.lock.acquire(blocking=False):
+            return
+        try:
+            Config, _, Type, Writer = _load_bbos()
+            config = Config("speaker")
+            with wave.open(str(self.wav_path), "rb") as source:
+                if (
+                    source.getsampwidth() != 2
+                    or source.getnchannels() != config.channels
+                    or source.getframerate() != config.sample_rate
+                ):
+                    raise RuntimeError(
+                        "Voice prompt must be uncompressed 16-bit PCM matching "
+                        f"the robot speaker ({config.sample_rate} Hz, "
+                        f"{config.channels} channel(s))"
+                    )
+                with Writer("speaker.audio", Type("speaker_audio")) as speaker:
+                    time.sleep(0.25)
+                    while raw := source.readframes(config.chunk_size):
+                        samples = np.frombuffer(raw, dtype="<i2")
+                        if len(samples) < config.chunk_size:
+                            samples = np.pad(
+                                samples, (0, config.chunk_size - len(samples))
+                            )
+                        with speaker.buf() as frame:
+                            frame["audio"] = samples.reshape(-1, config.channels)
+            print("[speaker] Finished sadness prompt", flush=True)
+        finally:
+            self.lock.release()
+
+    def play_async(self) -> None:
+        threading.Thread(target=self.play, name="sad-voice", daemon=True).start()
+
+
+def model_path(models_dir: Path, filename: str) -> Path:
+    candidates = (
+        models_dir / filename,
+        PROJECT_ROOT / "assets/models" / filename,
+        PROJECT_ROOT / filename,
+    )
+    return next((path for path in candidates if path.exists()), candidates[0])
+
+
+def run(args: argparse.Namespace) -> int:
+    Config, Reader, _, _ = _load_bbos()
+    detector = PersonDetector(model_path(args.models_dir, "yolo11n-pose.onnx"))
+    analyzer = ExpressionAnalyzer(
+        model_path(args.models_dir, "face_detection_yunet_2026may.onnx"),
+        model_path(args.models_dir, "enet_b0_8_best_afew.onnx"),
+        smoothing=args.expression_smoothing,
+        face_confidence=args.face_confidence,
+    )
+    speaker = RobotSpeaker(args.voice_prompt)
+    trigger = SadVoiceTrigger(
+        hold_seconds=args.sad_hold_seconds,
+        cooldown_seconds=args.sad_cooldown,
+        reset_seconds=args.sad_reset_seconds,
+        confidence=args.sad_confidence,
+    )
+    tracker = PersonTracker()
+    ground_tracker = GroundAlertTracker(
+        hold_seconds=args.ground_hold_seconds,
+        clear_seconds=args.ground_clear_seconds,
+    )
+    dashboard = DashboardState()
+    actions = CameraActionController()
+    server = start_dashboard(dashboard, actions, args.dashboard_host, args.dashboard_port)
+
+    if args.speak_on_start:
+        print("[speaker] Playing startup speaker test", flush=True)
+        speaker.play()
+
+    try:
+        map_resolution = float(Config("mapping").voxel_size_m)
+    except Exception:
+        map_resolution = 0.05
+    map_metrics: dict[str, Any] = {"ready": False}
+    last_map_scan = 0.0
+    last_safety_publish = 0.0
+    last_safety_status = None
+    last_ground_assessments: dict[int, GroundAssessment] = {}
+
+    print(
+        "[vision] Reading camera.rect + timestamp-aligned camera.points; "
+        "map pose from slam.pose",
+        flush=True,
+    )
+    frame_count = 0
+    last_frame = None
+    last_log_at = 0.0
+    previous_started = None
+    try:
+        with Reader("camera.rect", keeptime=False) as camera, \
+             Reader("camera.points", keeptime=False) as point_reader, \
+             Reader("slam.pose", keeptime=False) as slam_reader, \
+             Reader("mapping.grid2d", keeptime=False) as map_reader:
+            while not camera.ready():
+                time.sleep(0.02)
+            while not args.max_frames or frame_count < args.max_frames:
+                if not camera.ready():
+                    time.sleep(0.005)
+                    continue
+                rect_rgb = camera.data["left"].copy()
+                timestamp = camera.data["timestamp"].copy()
+                frame = cv2.cvtColor(rect_rgb, cv2.COLOR_RGB2BGR)
+                started = time.monotonic()
+                scan_fps = (
+                    0.0
+                    if previous_started is None
+                    else 1.0 / max(started - previous_started, 1e-9)
+                )
+                previous_started = started
+                detections = detector.detect(frame, confidence=args.yolo_confidence)
+                yolo_finished = time.monotonic()
+                dashboard.update_targets(
+                    detections,
+                    frame.shape[1],
+                    frame.shape[0],
+                    yolo_finished,
+                )
+                tracked = tracker.update(detections)
+                ground_assessments: dict[int, GroundAssessment] = {}
+                depth_aligned = False
+                point_timestamp_ns = 0
+                camera_timestamp_ns = timestamp_ns(timestamp)
+                robot_position = None
+                robot_yaw = None
+                map_epoch = None
+                if slam_reader.ready():
+                    robot_position = slam_reader.data["pos"].copy()
+                    robot_yaw = float(planar_yaw(slam_reader.data["quat"]))
+                    map_epoch = int(slam_reader.data["pgo_count"])
+                if point_reader.ready():
+                    point_timestamp_ns = timestamp_ns(point_reader.data["timestamp"])
+                    depth_aligned = (
+                        camera_timestamp_ns > 0
+                        and point_timestamp_ns == camera_timestamp_ns
+                    )
+                if depth_aligned:
+                    point_count = int(point_reader.data["num_points"])
+                    point_indices = point_reader.data["idx_2d"][:point_count].copy()
+                    depth_points = point_reader.data["points"][:point_count].copy()
+                    for item in tracked:
+                        pose_3d = keypoints_in_base_frame(
+                            item.detection.keypoints,
+                            point_indices,
+                            depth_points,
+                            frame.shape[1],
+                            frame.shape[0],
+                            keypoint_confidence=args.pose_confidence,
+                            search_radius_px=args.depth_search_radius,
+                        )
+                        assessment = assess_ground_pose(
+                            pose_3d,
+                            robot_position=robot_position,
+                            robot_yaw=robot_yaw,
+                        )
+                        ground_assessments[item.track_id] = assessment
+                        if assessment.state != "unknown":
+                            last_ground_assessments[item.track_id] = assessment
+                else:
+                    ground_assessments = {
+                        item.track_id: GroundAssessment(
+                            "unknown", 0.0, "camera/depth timestamps are not aligned", 0
+                        )
+                        for item in tracked
+                    }
+                ground_statuses = ground_tracker.update(
+                    ground_assessments, time.monotonic()
+                )
+                if any(status == "alert" for status in ground_statuses.values()):
+                    ground_status = "alert"
+                elif any(status == "checking" for status in ground_statuses.values()):
+                    ground_status = "checking"
+                else:
+                    ground_status = "clear" if depth_aligned else "unavailable"
+                ground_alerts = []
+                for track_id, status in ground_statuses.items():
+                    if status != "alert":
+                        continue
+                    assessment = ground_assessments.get(
+                        track_id, last_ground_assessments.get(track_id)
+                    )
+                    alert = {"track_id": track_id}
+                    if assessment is not None:
+                        alert.update(
+                            {
+                                "confidence": assessment.confidence,
+                                "reason": assessment.reason,
+                                "torso_height_m": assessment.torso_height_m,
+                                "map_position": assessment.map_position,
+                            }
+                        )
+                    ground_alerts.append(alert)
+
+                now = time.monotonic()
+                if now - last_map_scan >= 5.0 and map_reader.ready():
+                    grid = map_reader.data["grid"]
+                    floor_cells = int(np.count_nonzero(grid == 1))
+                    obstacle_cells = int(np.count_nonzero(grid == 2))
+                    map_metrics = {
+                        "ready": True,
+                        "known_area_m2": round(
+                            (floor_cells + obstacle_cells) * map_resolution**2, 2
+                        ),
+                        "floor_area_m2": round(floor_cells * map_resolution**2, 2),
+                        "obstacle_cells": obstacle_cells,
+                        "robot_position": [
+                            round(float(value), 3)
+                            for value in map_reader.data["robot_pos"]
+                        ],
+                        "robot_heading": round(
+                            float(map_reader.data["robot_heading"]), 4
+                        ),
+                        "map_epoch": map_epoch,
+                    }
+                    last_map_scan = now
+
+                if (
+                    ground_status != last_safety_status
+                    or now - last_safety_publish >= 0.5
+                ):
+                    publish_ground_safety_file(
+                        args.ground_alert_file,
+                        ground_status,
+                        ground_alerts,
+                        camera_timestamp_ns=camera_timestamp_ns,
+                        map_epoch=map_epoch,
+                    )
+                    last_safety_status = ground_status
+                    last_safety_publish = now
+                expression = None
+                if detections:
+                    primary = max(
+                        detections,
+                        key=lambda item: (item.x2 - item.x1)
+                        * (item.y2 - item.y1),
+                    )
+                    person_crop = frame[
+                        primary.y1 : primary.y2,
+                        primary.x1 : primary.x2,
+                    ]
+                    if person_crop.size:
+                        expression = analyzer.analyze(
+                            person_crop,
+                            classify=frame_count % args.expression_interval == 0,
+                            offset_x=primary.x1,
+                            offset_y=primary.y1,
+                        )
+                    else:
+                        analyzer.missing()
+                else:
+                    analyzer.missing()
+                expression_finished = time.monotonic()
+                associated = face_belongs_to_person(expression, detections)
+                if trigger.update(expression, associated, time.monotonic()):
+                    print("[emotion] Sustained sadness cue; playing prompt", flush=True)
+                    speaker.play_async()
+
+                elapsed = time.monotonic() - started
+                age_ms = camera_age_ms(timestamp)
+                draw_overlay(
+                    frame,
+                    tracked,
+                    ground_assessments,
+                    ground_statuses,
+                    expression,
+                    pipeline_ms=elapsed * 1000,
+                    end_to_end_ms=age_ms,
+                    scan_fps=scan_fps,
+                )
+                metrics = {
+                    "frame": frame_count + 1,
+                    "people": len(tracked),
+                    "track_ids": [item.track_id for item in tracked],
+                    "ground_status": ground_status,
+                    "ground_alerts": ground_alerts,
+                    "depth_aligned": depth_aligned,
+                    "map": map_metrics,
+                    "expression": None if expression is None else expression.label,
+                    "expression_confidence": (
+                        0.0 if expression is None else expression.confidence
+                    ),
+                    "pipeline_ms": elapsed * 1000,
+                    "yolo_ms": (yolo_finished - started) * 1000,
+                    "expression_ms": (expression_finished - yolo_finished) * 1000,
+                    "camera_age_ms": age_ms,
+                    "scan_fps": scan_fps,
+                }
+                dashboard.publish(frame, metrics)
+                label = (
+                    "none"
+                    if expression is None
+                    else f"{expression.label} {expression.confidence:.0%}"
+                )
+                now = time.monotonic()
+                if args.max_frames or now - last_log_at >= args.log_interval:
+                    ids = ",".join(str(item.track_id) for item in tracked) or "none"
+                    print(
+                        f"[vision] frame={frame_count + 1} people={len(tracked)} "
+                        f"ids={ids} expression={label} associated={associated} "
+                        f"ground={ground_status} depth_aligned={depth_aligned} "
+                        f"pipeline={elapsed:.3f}s "
+                        f"yolo={(yolo_finished - started) * 1000:.0f}ms "
+                        f"face={(expression_finished - yolo_finished) * 1000:.0f}ms "
+                        f"age={age_ms:.0f}ms",
+                        flush=True,
+                    )
+                    last_log_at = now
+                frame_count += 1
+                last_frame = frame
+                time.sleep(max(0.0, args.scan_interval - elapsed))
+    finally:
+        actions.stop()
+        server.shutdown()
+        server.server_close()
+
+    if args.snapshot is not None and last_frame is not None:
+        args.snapshot.parent.mkdir(parents=True, exist_ok=True)
+        if not cv2.imwrite(str(args.snapshot), last_frame):
+            raise RuntimeError(f"Could not write snapshot: {args.snapshot}")
+        print(f"[vision] Saved {args.snapshot}", flush=True)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run YOLO and visible-expression cues on the robot head camera"
+    )
+    parser.add_argument("--models-dir", type=Path, default=SCRIPT_DIR / "models")
+    parser.add_argument(
+        "--voice-prompt",
+        type=Path,
+        default=SCRIPT_DIR / "sad_prompt.wav",
+    )
+    parser.add_argument("--yolo-confidence", type=float, default=0.4)
+    parser.add_argument("--face-confidence", type=float, default=0.75)
+    parser.add_argument("--expression-smoothing", type=float, default=0.25)
+    parser.add_argument("--expression-interval", type=int, default=3)
+    parser.add_argument(
+        "--pose-confidence",
+        type=float,
+        default=0.35,
+        help="minimum YOLO confidence for a keypoint used with depth",
+    )
+    parser.add_argument(
+        "--depth-search-radius",
+        type=int,
+        default=5,
+        help="pixel radius used to associate sparse aligned depth to a pose joint",
+    )
+    parser.add_argument(
+        "--ground-hold-seconds",
+        type=float,
+        default=2.0,
+        help="sustained low 3D pose evidence required before raising an alert",
+    )
+    parser.add_argument(
+        "--ground-clear-seconds",
+        type=float,
+        default=2.0,
+        help="sustained clear 3D pose evidence required to release an alert",
+    )
+    parser.add_argument(
+        "--ground-alert-file",
+        type=Path,
+        default=Path("/tmp/bracketbot_ground_alert.json"),
+        help="atomic safety observation consumed by the navigation app",
+    )
+    parser.add_argument("--sad-confidence", type=float, default=0.6)
+    parser.add_argument("--sad-hold-seconds", type=float, default=1.5)
+    parser.add_argument("--sad-cooldown", type=float, default=30.0)
+    parser.add_argument("--sad-reset-seconds", type=float, default=2.0)
+    parser.add_argument("--speak-on-start", action="store_true")
+    parser.add_argument("--dashboard-host", default="0.0.0.0")
+    parser.add_argument("--dashboard-port", type=int, default=8018)
+    parser.add_argument(
+        "--scan-interval",
+        type=float,
+        default=0.25,
+        help="minimum seconds between frame-processing starts",
+    )
+    parser.add_argument(
+        "--log-interval",
+        type=float,
+        default=5.0,
+        help="seconds between status lines in continuous mode",
+    )
+    parser.add_argument("--max-frames", type=int, default=0)
+    parser.add_argument("--snapshot", type=Path)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    for name in (
+        "yolo_confidence",
+        "face_confidence",
+        "sad_confidence",
+        "pose_confidence",
+    ):
+        if not 0 <= getattr(args, name) <= 1:
+            raise SystemExit(f"--{name.replace('_', '-')} must be between 0 and 1")
+    if args.expression_interval < 1:
+        raise SystemExit("--expression-interval must be at least 1")
+    if not 0 < args.expression_smoothing <= 1:
+        raise SystemExit("--expression-smoothing must be greater than 0 and at most 1")
+    for name in ("sad_hold_seconds", "sad_cooldown", "sad_reset_seconds"):
+        if getattr(args, name) < 0:
+            raise SystemExit(f"--{name.replace('_', '-')} cannot be negative")
+    for name in ("ground_hold_seconds", "ground_clear_seconds"):
+        if getattr(args, name) < 0:
+            raise SystemExit(f"--{name.replace('_', '-')} cannot be negative")
+    if args.depth_search_radius < 0 or args.depth_search_radius > 30:
+        raise SystemExit("--depth-search-radius must be between 0 and 30")
+    if args.log_interval <= 0:
+        raise SystemExit("--log-interval must be greater than zero")
+    if args.scan_interval <= 0:
+        raise SystemExit("--scan-interval must be greater than zero")
+    if not 1 <= args.dashboard_port <= 65535:
+        raise SystemExit("--dashboard-port must be between 1 and 65535")
+    try:
+        return run(args)
+    except (FileNotFoundError, RuntimeError) as exc:
+        raise SystemExit(f"error: {exc}") from exc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

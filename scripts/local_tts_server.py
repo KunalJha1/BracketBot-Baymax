@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Natural local TTS bridge bound only to BracketBot's private USB link."""
+
+from __future__ import annotations
+
+import argparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+from pathlib import Path
+import subprocess
+import tempfile
+
+
+MAX_TEXT_LENGTH = 4096
+
+
+class TtsHandler(BaseHTTPRequestHandler):
+    server_version = "BracketBotTTS/1.0"
+
+    def do_POST(self) -> None:
+        if self.path != "/tts":
+            self.send_error(404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 16_384:
+                raise ValueError("invalid request size")
+            body = json.loads(self.rfile.read(length))
+            text = str(body.get("text", "")).strip()
+            if not text or len(text) > MAX_TEXT_LENGTH:
+                raise ValueError("text must contain 1 to 4096 characters")
+            audio = self.server.synthesize(text)
+        except (ValueError, json.JSONDecodeError) as exc:
+            self.send_error(400, str(exc))
+            return
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.send_error(503, f"speech generation failed: {exc}")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(audio)))
+        self.end_headers()
+        self.wfile.write(audio)
+
+    def log_message(self, format: str, *args) -> None:
+        print(f"[tts] {self.address_string()} {format % args}", flush=True)
+
+
+class TtsServer(ThreadingHTTPServer):
+    def __init__(self, address, voice: str, rate: int):
+        super().__init__(address, TtsHandler)
+        self.voice = voice
+        self.rate = rate
+
+    def synthesize(self, text: str) -> bytes:
+        with tempfile.TemporaryDirectory(prefix="bracketbot-tts-") as temp_dir:
+            source = Path(temp_dir) / "speech.aiff"
+            output = Path(temp_dir) / "speech.wav"
+            subprocess.run(
+                ["say", "-v", self.voice, "-r", str(self.rate), "-o", source, text],
+                check=True,
+                capture_output=True,
+                timeout=20,
+            )
+            subprocess.run(
+                [
+                    "afconvert",
+                    "-f",
+                    "WAVE",
+                    "-d",
+                    "LEI16@16000",
+                    "-c",
+                    "1",
+                    source,
+                    output,
+                ],
+                check=True,
+                capture_output=True,
+                timeout=10,
+            )
+            return output.read_bytes()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="BracketBot private-link TTS bridge")
+    parser.add_argument("--host", default="192.168.55.100")
+    parser.add_argument("--port", type=int, default=8900)
+    parser.add_argument("--voice", default="Samantha")
+    parser.add_argument("--rate", type=int, default=175)
+    args = parser.parse_args()
+
+    server = TtsServer((args.host, args.port), args.voice, args.rate)
+    print(
+        f"Natural voice ready on http://{args.host}:{args.port}/tts "
+        f"(voice={args.voice}, rate={args.rate})",
+        flush=True,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

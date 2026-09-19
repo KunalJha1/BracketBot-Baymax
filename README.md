@@ -11,14 +11,23 @@ or replace qualified care.
 
 ## What works today
 
-- An accessible local dashboard with a typed allowlist of 15 primitive actions:
-  five gestures, five light expressions, three sound cues, and two original
-  instrumental music cues.
+- An accessible local dashboard with a typed allowlist of 18 primitive actions:
+  seven gestures, adaptive two-arm table positioning, five light expressions,
+  three sound cues, and two original instrumental music cues.
 - Seven deterministic multi-step routines, including **welcome**,
   **double wave**, **calm moment**, and **dance party**, built from the same
   primitives future assistant plans will use.
 - A stateful 4° **Lean / Balance** toggle with continuous BBOS refresh,
   upright gating, disconnect fallback, and explicit balance restoration.
+- **Place arms on table** uses fresh depth points to detect a broad reachable
+  tabletop, validates both hand locations and the complete IK path, then holds
+  the pose until Stop returns the arms along the checked path.
+  Its Technical details log includes camera-to-arm frame conversion, point and
+  surface counts, rejection gates, per-hand support, IK waypoints, calibration
+  bounds, motion progress, measured arrival, and cleanup. For perception-only
+  diagnosis on the robot, run `python /tmp/table_rest.py --scan-only`; this
+  opens no arm writers. Use `--plan-only` to also validate live arm-state IK
+  paths and calibration bounds without opening control/torque writers.
 - A local simulation mode that exercises dashboard actions, routines,
   cancellation, progress, and APIs without SSH or robot hardware.
 - Automatic selection between the `botwifi` and USB `bot` SSH aliases.
@@ -32,8 +41,8 @@ or replace qualified care.
   localization, and smoothed EmotiEffLib visible-expression estimates.
 - An existing Gemini-powered greeter and provider-ready inference code with
   OpenAI and Google client dependencies.
-- Deterministic greeter voice commands for **wave**, **handshake**, **fist
-  bump**, and **hug**, with non-action speech routed to OpenRouter when
+- Deterministic greeter voice commands for **wave**, **salute**, **handshake**,
+  **fist bump**, and **hug**, with non-action speech routed to OpenRouter when
   configured.
 
 ## Start the gesture dashboard
@@ -44,6 +53,7 @@ Requirements:
 - An SSH alias named `botwifi` and/or `bot`, or the robot reachable as
   `bracketbot-184.local` over mDNS.
 - BBOS installed on the robot at `~/bbos` with `uv` at `~/.local/bin/uv`.
+- The robot depth daemon publishing `camera.points` for adaptive table placement.
 - A person beside the physical e-stop whenever the robot moves.
 
 Run:
@@ -55,6 +65,11 @@ python3 scripts/robot_dashboard.py
 Open <http://127.0.0.1:8020>. The page is intentionally bound to localhost;
 it should not be exposed to a network without authentication and transport
 security.
+
+Dashboard hot reload is enabled by default. Saving
+`scripts/robot_dashboard.py` restarts the server once robot actions and lean
+mode are safely idle, and an already-open page reloads itself. Pass
+`--no-reload` only when automatic development reloads are undesirable.
 
 The dashboard checks the configured Wi-Fi alias first, then automatically
 tries the robot's mDNS hostname (`bracketbot-184.local`) so hotspot address
@@ -86,12 +101,13 @@ Controls:
 
 | Family | Actions | Keyboard |
 | --- | --- | --- |
-| Gestures | Wave, handshake, fist bump, hug, dance | `1`–`4`, `D` |
+| Gestures | Wave, handshake, fist bump, hug, salute, point at person, dance | `1`–`4`, `S`, `O`, `D` |
 | Lights | Calm, ready, thinking, celebrate, off | `5`–`9` |
 | Sounds | Processing, birthday, battery reminder | `P`, `B`, `L` |
 | Music | Original calm and upbeat instrumentals | `M`, `U` |
 | Routines | Welcome, thinking, celebrate, goodbye, double wave, calm moment, dance party | `W`, `T`, `C`, `G`, `V`, `K`, `X` |
 | Base mode | Toggle 4° lean / balance | `Z` |
+| Positioning | Detect table and place both arms | `R` |
 | Cancellation | Stop the current action/routine safely | `Esc` |
 
 The dashboard uploads only the selected allowlisted asset and its small runner
@@ -115,7 +131,11 @@ uv run --extra vision python people_detector.py
 ```
 
 The preview draws green person boxes and a magenta box around the primary face
-with a smoothed visible-expression label. Press **Q** or **Esc** to quit.
+with a smoothed visible-expression label. If a confidently sad-looking
+expression persists for 1.5 seconds, the computer asks, “Hey, you look a little
+sad. Are you okay?” through the system text-to-speech voice. The cue must clear
+before it can fire again and has a 30-second cooldown. Press **Q** or **Esc** to
+quit.
 
 Useful variants:
 
@@ -129,6 +149,11 @@ uv run --extra vision python people_detector.py \
 
 # Apple Silicon acceleration (CPU is the most portable default)
 uv run --extra vision python people_detector.py --device mps
+
+# Change the prompt or disable speech
+uv run --extra vision python people_detector.py \
+  --sad-voice-text "Hey, how are you feeling?"
+uv run --extra vision python people_detector.py --no-sad-voice
 ```
 
 The pipeline runs locally; camera frames are not sent to an API. Its expression
@@ -138,6 +163,17 @@ occlusion, pose, disability, culture, or ordinary individual variation. Do not
 use this signal for diagnosis, access control, risk scoring, or autonomous
 decisions about a person. A future assistant may use it only as a low-confidence
 conversation cue and should ask rather than assume how someone feels.
+
+### Run the same pipeline on the robot
+
+[`bbapps/emotion_greeter`](bbapps/emotion_greeter) reads the left eye directly
+from the robot's `camera.head.rgb` BBOS topic, runs an OpenCV-compatible YOLO11
+export plus the same YuNet and expression models, and sends its local voice
+prompt to `speaker.audio`. It does not need Gemini or another cloud service.
+Its port 8018 dashboard shows the annotated robot view, temporary person
+tracking IDs, expression confidence, processing time, camera-frame age, and
+scan rate. See the app README for model export, deployment, smoke-test, and
+autostart instructions.
 
 The repository includes the small model files needed for deterministic offline
 startup. Their sources and checksums are documented in
@@ -228,9 +264,9 @@ the machine that runs the relevant app:
 cp .env.example .env
 ```
 
-The existing `bbapps/greeter/main.py` uses `GEMINI_API_KEY`. The inference
-folder already contains Google and OpenAI client dependencies and is the best
-reference for future provider adapters.
+The greeter defaults to local `whisper.cpp` transcription and `espeak-ng`
+speech when `GEMINI_API_KEY` is absent. Gemini Live remains an optional voice
+transport, not a requirement for GPT-OSS or Browserbase.
 
 ### Voice commands and OpenRouter
 
@@ -241,19 +277,49 @@ happens; a model-authored tool argument cannot independently authorize motion:
 
 1. An exact, normalized phrase from the local allowlist starts one installed
    gesture. Examples include “Baymax, give me a hug”, “Baymax, fist bump me”,
-   “shake my hand”, and “wave at me”. Only one movement can run at a time.
-2. Questions and other conversation are sent as text to OpenRouter. The LLM
-   never receives a robot-action tool and cannot create a motion.
+   “shake my hand”, “give me a salute”, “wave at me”, and “point at a person”.
+   Only one movement can run at a time.
+2. Questions and other conversation are sent as text to OpenRouter. When a
+   question needs current information (for example, weather), GPT-OSS calls the
+   read-only Browserbase Search tool and formats the returned sources as a short
+   spoken answer. The LLM never receives a robot-action tool and cannot create a
+   motion.
 3. Similar but unapproved text, such as “tell me about fist bumps”, cannot
    trigger a gesture. Add new voice authority deliberately in
    `ACTION_ALIASES`, not in an LLM prompt.
 
-Configure both parts in `.env` on the robot:
+The point gesture combines the greeter's live head-camera detections with one
+arm. “Point at a person” selects the largest visible person; “point at the
+person on the left/right” selects the leftmost/rightmost detection. The camera
+feed labels the current **Point target**. A call is rejected if no detection is
+fresh (within one second). The matching arm follows a short, fixed-radius,
+collision-aware IK target, holds for one second, returns to its measured start,
+and switches torque off. Monocular box size is not treated as a depth estimate,
+so the hand never tries to reach the person.
+
+The same gesture appears as **Point at person** in the local gesture dashboard
+with keyboard shortcut `O`. The robot-side greeter must be running because it
+owns the live detector and target snapshot. The deployed configuration uses
+`bbapps/emotion_greeter` on robot-local port 8018. Dashboard Stop/Esc requests
+a safe return through the traversed pointing path before torque is disabled.
+The dashboard activity log mirrors the robot stages (`state`, `planning`,
+`planned`, `torque-enable`, `pointing`, `returning`, and `complete`) and reports
+the exact safety rejection instead of treating a failed plan as completion.
+
+Configure the services used by the greeter in `.env` on the robot:
 
 ```sh
-GEMINI_API_KEY=...
 OPENROUTER_API_KEY=...
 OPENROUTER_MODEL=openai/gpt-oss-20b
+BROWSERBASE_API_KEY=...
+BAYMAX_VOICE_BACKEND=local
+```
+
+Install the key-free local speech runtime once on the robot:
+
+```sh
+cd bbapps/greeter
+./setup_local_voice.sh
 ```
 
 Then run the existing app as usual:
@@ -263,11 +329,31 @@ cd bbapps/greeter
 uv run main.py
 ```
 
+For the lightweight weather/question assistant without YOLO or Gemini, connect
+the robot over USB and run this from the development machine:
+
+```sh
+./scripts/run_robot_local_voice.sh
+```
+
+The script starts an HTTPS CONNECT proxy bound only to the private
+`192.168.55.100` USB interface, then launches `local_assistant.py` on the robot.
+This is necessary when the robot is running its own hotspot and has no direct
+internet route. Stop the script with Ctrl-C to stop both the assistant and the
+proxy.
+
 `OPENROUTER_MODEL` is optional and defaults to `openai/gpt-oss-20b`, which is
-well suited to the assistant's short, simple spoken queries. Without an
-OpenRouter key, allowlisted gestures still work and questions receive a short
-configuration message. Run all gesture tests in simulation/dry-run first and
-keep a person beside the physical e-stop when voice motion is enabled.
+well suited to the assistant's short, simple spoken queries. Browserbase is
+optional for ordinary conversation but required for live web answers. Without
+an OpenRouter key, allowlisted gestures still work and questions receive a
+short configuration message. Run all gesture tests in simulation/dry-run first
+and keep a person beside the physical e-stop when voice motion is enabled.
+
+Local voice waits for the installed “Hey BracketBot” wake-word daemon, records
+until roughly one second of silence, transcribes with the English Whisper base
+model, and speaks the routed answer with eSpeak. For microphone debugging only,
+`uv run main.py --voice-backend local --local-always-listen` bypasses the wake
+word and starts on any speech; do not use that mode in a noisy public space.
 
 ## Repository layout
 
@@ -277,7 +363,10 @@ keep a person beside the physical e-stop when voice motion is enabled.
 | `scripts/gesture_test.py` | Generic safe robot-side gesture runner |
 | `scripts/robot_effect.py` | Bounded, cancellable robot-side sound/LED runner |
 | `scripts/robot_base_mode.py` | Bounded 4° lean hold with balance restoration |
+| `scripts/table_rest.py` | Depth-adaptive, bounded two-arm tabletop positioning |
+| `scripts/greeter_action.py` | Dashboard bridge for robot-local camera gestures |
 | `scripts/generate_music_assets.py` | Deterministically regenerates original PCM music cues |
+| `scripts/generate_salute_asset.py` | Rebuilds the salute from the recorded wave lift |
 | `scripts/check_yolo_runtime.py` | Camera-free YOLO runtime compatibility smoke test |
 | `scripts/handshake_test.py` | Focused standalone handshake runner |
 | `scripts/wave_test.py` | Focused standalone wave runner |
@@ -319,7 +408,7 @@ button or keyboard action.
 
 ```sh
 python3 -m py_compile scripts/robot_dashboard.py scripts/gesture_test.py \
-  scripts/robot_effect.py scripts/robot_base_mode.py \
+  scripts/robot_effect.py scripts/robot_base_mode.py scripts/table_rest.py \
   scripts/check_yolo_runtime.py people_detector.py
 uv run --extra vision --extra dev pytest
 uv run --extra vision python scripts/check_yolo_runtime.py

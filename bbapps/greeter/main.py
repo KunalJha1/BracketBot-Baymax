@@ -20,9 +20,10 @@
 """
 Greeter: person detection + Gemini Live audio + deterministic voice actions.
 
-Detects people via YOLO26 TensorRT, triggers Gemini to say hello and plays
-the 'wave' arm movement when a face is detected. Human speech is sent through
-the local action allowlist; non-action conversation can use OpenRouter.
+Detects people via YOLO26 TensorRT and plays the 'wave' arm movement when a
+face is detected. Human speech can use Gemini Live or fully local Whisper and
+eSpeak I/O. It is sent through the local action allowlist; non-action
+conversation can use OpenRouter and Browserbase.
 
 Usage:
   uv run main.py
@@ -54,8 +55,15 @@ from bbos import Reader, Writer, Type, Config
 
 try:
     from .voice_router import OpenRouterClient, RouteKind, VoiceRouter, utterances_match
+    from .pointing import (
+        PersonTargetTracker,
+        pointing_goal,
+        quaternion_from_z,
+        quaternion_slerp,
+    )
 except ImportError:  # ``uv run main.py`` executes this as a standalone script.
     from voice_router import OpenRouterClient, RouteKind, VoiceRouter, utterances_match
+    from pointing import PersonTargetTracker, pointing_goal, quaternion_from_z, quaternion_slerp
 
 load_dotenv()
 
@@ -80,7 +88,16 @@ DOF = 8
 _arm_shm = {}
 _arm_lock = threading.Lock()
 _movement_playback_lock = threading.Lock()
+_movement_cancel_event = threading.Event()
 _saved_movements = {}
+_person_targets = PersonTargetTracker(max_age=1.0)
+
+POINT_RAMP_SECONDS = 2.0
+POINT_HOLD_SECONDS = 1.0
+POINT_MAX_ENTRY_TURNS = 0.45
+POINT_UPRIGHT_DEGREES = 25.0
+POINT_IK_SAMPLES = 40
+POINT_MAX_STEP_TURNS = 0.08
 
 
 def _load_movements():
@@ -199,6 +216,168 @@ def start_movement(name):
             _movement_playback_lock.release()
 
     threading.Thread(target=run, name=f"voice-movement-{name}", daemon=True).start()
+    return True, f"Started {name}"
+
+
+def _fresh(reader, timeout=2.0):
+    started = time.monotonic()
+    while not reader.ready():
+        if time.monotonic() - started >= timeout:
+            raise RuntimeError("No fresh robot state is available")
+        time.sleep(0.005)
+    return reader.data
+
+
+def _smoothstep(value):
+    value = float(np.clip(value, 0.0, 1.0))
+    return value * value * (3.0 - 2.0 * value)
+
+
+def _play_arm_path(writer, path, duration, cancel_event=None):
+    """Play a collision-checked motor path and return progress when cancelled."""
+    began = time.monotonic()
+    last_pose = np.asarray(path[0], dtype=np.float64)
+    last_position = 0.0
+    while not stop_event.is_set() and not (cancel_event and cancel_event.is_set()):
+        alpha = min((time.monotonic() - began) / duration, 1.0)
+        eased = _smoothstep(alpha)
+        path_position = eased * (len(path) - 1)
+        lower = min(int(path_position), len(path) - 1)
+        upper = min(lower + 1, len(path) - 1)
+        fraction = path_position - lower
+        pose = (1.0 - fraction) * path[lower] + fraction * path[upper]
+        writer["pos"] = pose.astype(np.float32)
+        last_pose = pose
+        last_position = path_position
+        if alpha >= 1.0:
+            break
+        time.sleep(0.015)
+    return last_pose, last_position
+
+
+def _plan_point_path(cfg, start, position, quaternion):
+    """Solve the entire Cartesian route, rejecting discontinuous IK branches."""
+    current_urdf = np.asarray(cfg.q2urdf(start.copy()), dtype=np.float64)
+    cfg.ik.reset(list(current_urdf[:7]))
+    start_position, start_quaternion = cfg.ik.fk(list(current_urdf[:7]))
+    start_position = np.asarray(start_position, dtype=np.float64)
+    start_quaternion = np.asarray(start_quaternion, dtype=np.float64)
+    path = [start.copy()]
+
+    for index in range(1, POINT_IK_SAMPLES + 1):
+        alpha = index / POINT_IK_SAMPLES
+        waypoint = (1.0 - alpha) * start_position + alpha * position
+        orientation = quaternion_slerp(start_quaternion, quaternion, alpha)
+        solution = cfg.ik.solve(waypoint.tolist(), orientation.tolist())
+        if solution is None or len(solution) < 7:
+            raise RuntimeError(
+                f"Collision-aware IK missed pointing waypoint {index}/{POINT_IK_SAMPLES}"
+            )
+        solved_urdf = current_urdf.copy()
+        solved_urdf[:7] = np.asarray(solution[:7], dtype=np.float64)
+        pose = np.asarray(cfg.urdf2q(solved_urdf), dtype=np.float64)
+        pose[7:] = start[7:]
+        if not np.isfinite(pose).all():
+            raise RuntimeError("Pointing IK returned a non-finite arm pose")
+        step = float(np.max(np.abs(pose - path[-1])))
+        if step > POINT_MAX_STEP_TURNS:
+            raise RuntimeError(
+                f"Pointing path rejected at waypoint {index}: "
+                f"{step:.3f}-turn IK branch jump"
+            )
+        path.append(pose)
+
+    entry = float(np.max(np.abs(np.asarray(path) - start)))
+    if entry > POINT_MAX_ENTRY_TURNS:
+        raise RuntimeError(
+            f"Pointing path rejected: largest joint move is {entry:.3f} turns"
+        )
+    return path, entry
+
+
+def play_pointing_gesture(target):
+    """Aim one arm at a camera-selected person, hold briefly, then return."""
+    side = target.arm
+    cfg = Config(f"arm_{side}")
+    shm = _get_arm_shm()
+    reader = shm[f"r_{side}"]
+    control = shm[f"w_{side}"]
+    torque = shm[f"w_torque_{side}"]
+    torque_enabled = False
+
+    with Reader("imu.orientation", keeptime=False) as imu:
+        rpy = np.asarray(_fresh(imu)["rpy"], dtype=np.float64)
+        if abs(rpy[0]) >= POINT_UPRIGHT_DEGREES or abs(rpy[1]) >= POINT_UPRIGHT_DEGREES:
+            raise RuntimeError("Pointing cancelled because the robot is not upright")
+
+        start = np.asarray(_fresh(reader)["pos"], dtype=np.float64).copy()
+        cfg.ik.init()
+        shoulder_height = float(Config("quest").robot_shoulder_height)
+        position, direction = pointing_goal(target, shoulder_height)
+        quaternion = quaternion_from_z(direction)
+        path, entry = _plan_point_path(cfg, start, position, quaternion)
+
+        print(
+            f"[point] {side} arm -> image x={target.x_offset:+.2f}, "
+            f"goal={np.round(position, 3)}, entry={entry:.3f} turns",
+            flush=True,
+        )
+        try:
+            # Seed the controller at the measured pose before enabling torque.
+            control["pos"] = start.astype(np.float32)
+            time.sleep(0.10)
+            torque_enabled = True
+            torque["enable"] = np.ones(DOF, dtype=np.bool_)
+            time.sleep(0.70)
+            last_pose, path_position = _play_arm_path(
+                control,
+                path,
+                POINT_RAMP_SECONDS,
+                cancel_event=_movement_cancel_event,
+            )
+            _movement_cancel_event.wait(POINT_HOLD_SECONDS)
+            # Return only through the portion actually traversed. If Stop was
+            # pressed halfway out, jumping to the full endpoint would be unsafe.
+            reached_index = min(int(path_position), len(path) - 1)
+            return_path = [last_pose, *reversed(path[: reached_index + 1])]
+            _play_arm_path(control, return_path, POINT_RAMP_SECONDS)
+        finally:
+            if torque_enabled:
+                # The arm is back at its measured start before becoming limp.
+                control["pos"] = start.astype(np.float32)
+                time.sleep(0.10)
+                torque["enable"] = np.zeros(DOF, dtype=np.bool_)
+        print("[point] gesture complete; arm returned and torque is off", flush=True)
+
+
+def start_robot_action(name):
+    """Dispatch either a recorded movement or the camera-guided point gesture."""
+    point_preferences = {
+        "point": "primary",
+        "point-left": "left",
+        "point-right": "right",
+    }
+    if name not in point_preferences:
+        return start_movement(name)
+
+    target = _person_targets.select(point_preferences[name])
+    if target is None:
+        return False, "I cannot see a person clearly enough to point at right now."
+    if not _movement_playback_lock.acquire(blocking=False):
+        return False, "Another movement is already running"
+    _movement_cancel_event.clear()
+    _debug["movement_running"] = True
+
+    def run():
+        try:
+            play_pointing_gesture(target)
+        except Exception as exc:
+            print(f"[point] Gesture failed safely: {exc}", flush=True)
+        finally:
+            _debug["movement_running"] = False
+            _movement_playback_lock.release()
+
+    threading.Thread(target=run, name=f"voice-{name}", daemon=True).start()
     return True, f"Started {name}"
 
 
@@ -335,6 +514,11 @@ _debug = {
     "current_detections": 0,
     "last_voice_route": "",
     "openrouter_configured": False,
+    "browserbase_configured": False,
+    "voice_backend": "",
+    "last_transcript": "",
+    "point_target": "none",
+    "movement_running": False,
 }
 
 # ── MJPEG feed queue ─────────────────────────────────────────────────
@@ -484,6 +668,19 @@ def detector_loop():
 
             num_dets = len(detections)
             _debug["current_detections"] = num_dets
+            observed_at = time.monotonic()
+            _person_targets.update(
+                detections,
+                orig_w,
+                orig_h,
+                observed_at=observed_at,
+            )
+            primary_target = _person_targets.select("primary", now=observed_at)
+            _debug["point_target"] = (
+                "none"
+                if primary_target is None
+                else f"{primary_target.arm} arm, x={primary_target.x_offset:+.2f}"
+            )
 
             has_face_this_frame = False
 
@@ -507,6 +704,16 @@ def detector_loop():
                 else:
                     color = COLOR_NO_FACE
                     label = f"Person {conf:.0%}"
+
+                if primary_target is not None and (
+                    x1, y1, x2, y2
+                ) == (
+                    primary_target.x1,
+                    primary_target.y1,
+                    primary_target.x2,
+                    primary_target.y2,
+                ):
+                    label = f"Point target | {label}"
 
                 cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 2)
                 font = cv2.FONT_HERSHEY_SIMPLEX
@@ -894,6 +1101,49 @@ async def api_drive(request: Request):
         _wasd_cmd['gain'] = body.get('gain', 1.0)
     return JSONResponse({"status": "ok"})
 
+
+def _robot_local_request(request: Request):
+    return request.client is not None and request.client.host in {"127.0.0.1", "::1"}
+
+
+@web_app.post("/api/action")
+async def api_action(request: Request):
+    """Start one camera-backed action for trusted robot-local callers."""
+    if not _robot_local_request(request):
+        return JSONResponse(
+            {"ok": False, "message": "Camera actions are robot-local only"},
+            status_code=403,
+        )
+    body = await request.json()
+    action = str(body.get("action", ""))
+    if action not in {"point", "point-left", "point-right"}:
+        return JSONResponse(
+            {"ok": False, "message": "Unknown camera action"},
+            status_code=404,
+        )
+    started, message = start_robot_action(action)
+    return JSONResponse(
+        {"ok": started, "message": message},
+        status_code=202 if started else 409,
+    )
+
+
+@web_app.post("/api/action/stop")
+def api_action_stop(request: Request):
+    """Ask a camera-backed gesture to return safely to its start pose."""
+    if not _robot_local_request(request):
+        return JSONResponse(
+            {"ok": False, "message": "Camera actions are robot-local only"},
+            status_code=403,
+        )
+    if not _movement_playback_lock.locked():
+        return JSONResponse(
+            {"ok": False, "message": "No camera action is running"},
+            status_code=409,
+        )
+    _movement_cancel_event.set()
+    return {"ok": True, "message": "Stop requested"}
+
 async def _generate_frames():
     while not stop_event.is_set():
         try:
@@ -1002,6 +1252,136 @@ def audio_io_loop(volume):
                 time.sleep(0.001)
 
 
+def _queue_local_speech(synthesizer, text, args):
+    """Synthesize one reply and feed it through the existing BBOS speaker queue."""
+    try:
+        from .local_voice import speaker_chunks
+    except ImportError:
+        from local_voice import speaker_chunks
+
+    pcm = synthesizer.synthesize(text, BBOS_RATE)
+    volume = _debug.get("volume", args.volume)
+    pcm = (pcm.astype(np.float32) * volume).clip(-32768, 32767).astype(np.int16)
+    chunks = speaker_chunks(pcm, CHUNK, CFG.channels)
+    for chunk in chunks:
+        while not stop_event.is_set():
+            try:
+                speaker_queue.put(chunk, timeout=0.1)
+                break
+            except queue.Full:
+                continue
+    # Avoid feeding the robot's own reply straight back into transcription.
+    stop_event.wait(len(pcm) / BBOS_RATE + 0.5)
+    while not mic_queue.empty():
+        try:
+            mic_queue.get_nowait()
+        except queue.Empty:
+            break
+
+
+def local_voice_session(args):
+    """Wake word -> whisper.cpp -> VoiceRouter -> espeak-ng, with no Gemini."""
+    try:
+        from .local_voice import (
+            EspeakSynthesizer,
+            LocalVoiceError,
+            SpeechSegmenter,
+            WhisperCppTranscriber,
+        )
+    except ImportError:
+        from local_voice import (
+            EspeakSynthesizer,
+            LocalVoiceError,
+            SpeechSegmenter,
+            WhisperCppTranscriber,
+        )
+
+    llm = OpenRouterClient(
+        model=args.openrouter_model,
+        timeout=args.openrouter_timeout,
+    )
+    voice_router = VoiceRouter(llm)
+    _debug["openrouter_configured"] = llm.configured
+    _debug["browserbase_configured"] = llm.web_search.configured
+    _debug["voice_backend"] = "local"
+
+    transcriber = WhisperCppTranscriber(
+        args.whisper_bin,
+        args.whisper_model,
+        threads=args.whisper_threads,
+    )
+    synthesizer = EspeakSynthesizer(
+        args.espeak_bin,
+        voice=args.espeak_voice,
+        words_per_minute=args.espeak_speed,
+    )
+    transcriber.validate()
+    synthesizer.validate()
+    segmenter = SpeechSegmenter(
+        BBOS_RATE,
+        threshold_db=args.vad_threshold_db,
+        pre_roll_s=args.pre_roll,
+        trailing_silence_s=args.trailing_silence,
+        max_utterance_s=args.max_utterance,
+    )
+
+    print(
+        "[local-voice] Ready: say the configured wake phrase, then your question",
+        flush=True,
+    )
+    last_wake_active = False
+    with Reader("wakeword.state", keeptime=False) as wakeword:
+        while not stop_event.is_set():
+            triggered = False
+            if wakeword.ready():
+                active = bool(wakeword.data["active"])
+                triggered = active and not last_wake_active
+                last_wake_active = active
+                if triggered:
+                    print("[local-voice] Wake phrase detected; recording...", flush=True)
+
+            try:
+                audio = mic_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            flat = audio.reshape(-1)
+            gain = _debug.get("mic_gain", args.mic_gain)
+            boosted = (
+                flat.astype(np.float32) * gain
+            ).clip(-32768, 32767).astype(np.int16)
+            if args.local_always_listen and not segmenter.recording:
+                rms = max(1.0, float(np.sqrt(np.mean(boosted.astype(np.float64) ** 2))))
+                dbfs = 20.0 * np.log10(rms / 32768.0)
+                triggered = dbfs >= args.vad_threshold_db
+
+            utterance_audio = segmenter.push(boosted, triggered=triggered)
+            if utterance_audio is None:
+                continue
+
+            try:
+                transcript = transcriber.transcribe(utterance_audio, BBOS_RATE)
+                _debug["last_transcript"] = transcript
+                if not transcript:
+                    print("[local-voice] No speech recognized", flush=True)
+                    segmenter.reset()
+                    continue
+                print(f"[local-voice] Heard: {transcript}", flush=True)
+                decision = voice_router.route(transcript)
+                _debug["last_voice_route"] = decision.kind.value
+                if decision.kind == RouteKind.ACTION:
+                    started, status = start_robot_action(decision.action)
+                    reply = decision.reply if started else status
+                else:
+                    reply = decision.reply or "I did not understand that."
+                print(f"[local-voice] Reply: {reply}", flush=True)
+                _queue_local_speech(synthesizer, reply, args)
+                _debug["turns_completed"] += 1
+            except LocalVoiceError as exc:
+                print(f"[local-voice] {exc}", flush=True)
+            finally:
+                segmenter.reset()
+
+
 # ── Gemini session ────────────────────────────────────────────────────
 async def gemini_session(args):
     global _gemini_session, _gemini_loop
@@ -1018,6 +1398,7 @@ async def gemini_session(args):
     )
     voice_router = VoiceRouter(llm)
     _debug["openrouter_configured"] = llm.configured
+    _debug["browserbase_configured"] = llm.web_search.configured
 
     tools = [
         types.FunctionDeclaration(
@@ -1132,7 +1513,7 @@ async def gemini_session(args):
                                 )
                                 _debug["last_voice_route"] = decision.kind.value
                                 if decision.kind == RouteKind.ACTION:
-                                    started, status = start_movement(decision.action)
+                                    started, status = start_robot_action(decision.action)
                                     if not started:
                                         result = {
                                             "kind": "error",
@@ -1294,7 +1675,13 @@ async def gemini_session(args):
 
 # ── Main ──────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Greeter: YOLO + Gemini greeting robot")
+    parser = argparse.ArgumentParser(description="Greeter: YOLO + local or Gemini voice")
+    parser.add_argument(
+        "--voice-backend",
+        choices=("auto", "local", "gemini"),
+        default=os.environ.get("BAYMAX_VOICE_BACKEND", "auto"),
+        help="voice transport; auto uses Gemini only when GEMINI_API_KEY is set",
+    )
     parser.add_argument("--model", default="gemini-2.5-flash-native-audio-preview-12-2025")
     parser.add_argument("--voice", default="Iapetus",
                         help="Gemini voice (Aoede, Charon, Fenrir, Iapetus, Kore, Orus, Puck, etc.)")
@@ -1306,6 +1693,33 @@ def main():
         help="OpenRouter model slug used for non-action speech",
     )
     parser.add_argument("--openrouter-timeout", type=float, default=20.0)
+    parser.add_argument(
+        "--whisper-bin",
+        default=os.environ.get(
+            "WHISPER_CPP_BIN",
+            "/home/bracketbot/.local/share/whisper.cpp/build/bin/whisper-cli",
+        ),
+    )
+    parser.add_argument(
+        "--whisper-model",
+        default=os.environ.get(
+            "WHISPER_CPP_MODEL",
+            "/home/bracketbot/.local/share/whisper.cpp/models/ggml-base.en.bin",
+        ),
+    )
+    parser.add_argument("--whisper-threads", type=int, default=4)
+    parser.add_argument("--espeak-bin", default="espeak-ng")
+    parser.add_argument("--espeak-voice", default="en-us")
+    parser.add_argument("--espeak-speed", type=int, default=165)
+    parser.add_argument("--vad-threshold-db", type=float, default=-38.0)
+    parser.add_argument("--pre-roll", type=float, default=1.5)
+    parser.add_argument("--trailing-silence", type=float, default=0.9)
+    parser.add_argument("--max-utterance", type=float, default=8.0)
+    parser.add_argument(
+        "--local-always-listen",
+        action="store_true",
+        help="start on any speech instead of requiring wakeword.state",
+    )
     parser.add_argument("--system-prompt", default=(
         "You are the speech interface for a friendly robot called Baymax. "
         "For EVERY human utterance, call route_utterance exactly once with the "
@@ -1315,6 +1729,8 @@ def main():
         "application input: respond to that directly without calling the tool."
     ))
     args = parser.parse_args()
+    if args.voice_backend == "auto":
+        args.voice_backend = "gemini" if os.environ.get("GEMINI_API_KEY") else "local"
 
     # Pre-import so pycuda.autoinit's context lives on the main thread
     import pycuda.autoinit  # noqa: F401
@@ -1324,13 +1740,20 @@ def main():
 
     print("=" * 50, flush=True)
     print("  BracketBot Greeter", flush=True)
-    print(f"  Model: {args.model}", flush=True)
-    print(f"  Voice: {args.voice}", flush=True)
+    print(f"  Voice backend: {args.voice_backend}", flush=True)
+    if args.voice_backend == "gemini":
+        print(f"  Model: {args.model}", flush=True)
+        print(f"  Voice: {args.voice}", flush=True)
     print(f"  Volume: {args.volume}", flush=True)
     print(f"  Mic gain: {args.mic_gain}x", flush=True)
     print(f"  OpenRouter model: {args.openrouter_model}", flush=True)
     print(
         f"  OpenRouter: {'configured' if os.environ.get('OPENROUTER_API_KEY') else 'not configured'}",
+        flush=True,
+    )
+    print(
+        f"  Browserbase search: "
+        f"{'configured' if os.environ.get('BROWSERBASE_API_KEY') else 'not configured'}",
         flush=True,
     )
     print(f"  Movements: {len(_saved_movements)} loaded", flush=True)
@@ -1361,7 +1784,10 @@ def main():
     wasd_thread.start()
 
     try:
-        asyncio.run(gemini_session(args))
+        if args.voice_backend == "local":
+            local_voice_session(args)
+        else:
+            asyncio.run(gemini_session(args))
     except KeyboardInterrupt:
         print("\n[+] Stopping...", flush=True)
     finally:

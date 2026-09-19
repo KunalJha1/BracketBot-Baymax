@@ -12,6 +12,8 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 import platform
+import shutil
+import subprocess
 import time
 from typing import Any
 
@@ -37,6 +39,111 @@ class Expression:
     y2: int
     label: str
     confidence: float
+
+
+@dataclass
+class SadVoiceTrigger:
+    """Debounce a visible-sadness cue before asking a friendly question.
+
+    A cue must remain present for ``hold_seconds`` before it triggers. After
+    speaking, it must clear for ``reset_seconds`` and the cooldown must expire
+    before another cue can trigger. This keeps noisy frame-level predictions
+    from repeatedly talking to the same person.
+    """
+
+    hold_seconds: float
+    cooldown_seconds: float
+    reset_seconds: float
+    confidence: float
+    first_sad_at: float | None = None
+    first_clear_at: float | None = None
+    last_triggered_at: float | None = None
+    armed: bool = True
+
+    def update(
+        self,
+        expression: Expression | None,
+        person_present: bool,
+        now: float,
+    ) -> bool:
+        sad_visible = (
+            person_present
+            and expression is not None
+            and expression.label in {"sad", "sadness"}
+            and expression.confidence >= self.confidence
+        )
+
+        if sad_visible:
+            self.first_clear_at = None
+            if self.first_sad_at is None:
+                self.first_sad_at = now
+            cooldown_over = (
+                self.last_triggered_at is None
+                or now - self.last_triggered_at >= self.cooldown_seconds
+            )
+            if (
+                self.armed
+                and cooldown_over
+                and now - self.first_sad_at >= self.hold_seconds
+            ):
+                self.armed = False
+                self.last_triggered_at = now
+                return True
+            return False
+
+        self.first_sad_at = None
+        if not self.armed:
+            if self.first_clear_at is None:
+                self.first_clear_at = now
+            elif now - self.first_clear_at >= self.reset_seconds:
+                self.armed = True
+                self.first_clear_at = None
+        return False
+
+
+class SystemSpeaker:
+    """Speak text asynchronously through an installed system TTS command."""
+
+    def __init__(self, command: str) -> None:
+        self.command = command
+        self.process: subprocess.Popen[bytes] | None = None
+
+    @classmethod
+    def create(cls) -> SystemSpeaker:
+        candidates = (
+            ("say", "spd-say", "espeak-ng", "espeak")
+            if platform.system() == "Darwin"
+            else ("spd-say", "espeak-ng", "espeak", "say")
+        )
+        command = next((path for name in candidates if (path := shutil.which(name))), None)
+        if command is None:
+            raise RuntimeError(
+                "Sad-voice response is enabled, but no supported text-to-speech "
+                "command was found (say, spd-say, espeak-ng, or espeak). Use "
+                "--no-sad-voice to run without speech."
+            )
+        return cls(command)
+
+    def speak(self, text: str) -> bool:
+        """Start speaking unless an earlier utterance is still playing."""
+
+        if self.process is not None and self.process.poll() is None:
+            return False
+        self.process = subprocess.Popen(
+            [self.command, text],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+
+    def close(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
 
 
 def smooth_scores(previous: Any, current: Any, alpha: float) -> Any:
@@ -281,6 +388,8 @@ def run(args: argparse.Namespace) -> int:
     print(f"Loading {args.model} ...", flush=True)
     model = YOLO(str(args.model))
     expression_analyzer = None
+    sad_trigger = None
+    speaker = None
     if not args.no_expression:
         print("Loading YuNet + EmotiEffLib expression models ...", flush=True)
         expression_analyzer = ExpressionAnalyzer(
@@ -289,6 +398,18 @@ def run(args: argparse.Namespace) -> int:
             args.expression_smoothing,
             args.face_confidence,
         )
+        if not args.no_sad_voice:
+            speaker = SystemSpeaker.create()
+            sad_trigger = SadVoiceTrigger(
+                hold_seconds=args.sad_hold_seconds,
+                cooldown_seconds=args.sad_cooldown,
+                reset_seconds=args.sad_reset_seconds,
+                confidence=args.sad_confidence,
+            )
+            print(
+                f"Sad-expression voice cue enabled via {speaker.command!r}.",
+                flush=True,
+            )
     source = parse_source(args.source)
     capture = open_capture(source, args.width, args.height)
     writer = None
@@ -320,6 +441,17 @@ def run(args: argparse.Namespace) -> int:
                     frame,
                     classify=frame_count % args.expression_interval == 0,
                 )
+
+            if (
+                sad_trigger is not None
+                and speaker is not None
+                and sad_trigger.update(expression, bool(detections), time.monotonic())
+            ):
+                if speaker.speak(args.sad_voice_text):
+                    print(
+                        f"Sad expression persisted; speaking: {args.sad_voice_text!r}",
+                        flush=True,
+                    )
 
             now = time.perf_counter()
             instantaneous_fps = 1.0 / max(now - previous_time, 1e-9)
@@ -361,6 +493,8 @@ def run(args: argparse.Namespace) -> int:
             writer.release()
         if not args.no_display:
             cv2.destroyAllWindows()
+        if speaker is not None:
+            speaker.close()
 
     print(f"Processed {frame_count} frame(s).", flush=True)
     if args.output is not None:
@@ -412,6 +546,40 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run only YOLO person detection",
     )
+    parser.add_argument(
+        "--no-sad-voice",
+        action="store_true",
+        help="disable the spoken response to a sustained sad expression",
+    )
+    parser.add_argument(
+        "--sad-voice-text",
+        default="Hey, you look a little sad. Are you okay?",
+        help="text spoken after a sustained sad-expression cue",
+    )
+    parser.add_argument(
+        "--sad-confidence",
+        type=float,
+        default=0.6,
+        help="minimum smoothed sad-expression confidence before speaking",
+    )
+    parser.add_argument(
+        "--sad-hold-seconds",
+        type=float,
+        default=1.5,
+        help="how long a sad expression must persist before speaking",
+    )
+    parser.add_argument(
+        "--sad-cooldown",
+        type=float,
+        default=30.0,
+        help="minimum seconds between sad-expression voice responses",
+    )
+    parser.add_argument(
+        "--sad-reset-seconds",
+        type=float,
+        default=2.0,
+        help="how long the cue must clear before it can trigger again",
+    )
     parser.add_argument("--width", type=int, default=1280, help="requested camera width")
     parser.add_argument("--height", type=int, default=720, help="requested camera height")
     parser.add_argument("--output", type=Path, help="optional annotated .mp4 recording")
@@ -426,10 +594,20 @@ def main() -> int:
         raise SystemExit("--confidence must be between 0 and 1")
     if not 0 <= args.face_confidence <= 1:
         raise SystemExit("--face-confidence must be between 0 and 1")
+    if not 0 <= args.sad_confidence <= 1:
+        raise SystemExit("--sad-confidence must be between 0 and 1")
     if not 0 < args.expression_smoothing <= 1:
         raise SystemExit("--expression-smoothing must be greater than 0 and at most 1")
     if args.expression_interval < 1:
         raise SystemExit("--expression-interval must be at least 1")
+    if args.sad_hold_seconds < 0:
+        raise SystemExit("--sad-hold-seconds cannot be negative")
+    if args.sad_cooldown < 0:
+        raise SystemExit("--sad-cooldown cannot be negative")
+    if args.sad_reset_seconds < 0:
+        raise SystemExit("--sad-reset-seconds cannot be negative")
+    if not args.sad_voice_text.strip():
+        raise SystemExit("--sad-voice-text cannot be empty")
     if args.no_display and not args.max_frames and isinstance(parse_source(args.source), int):
         print("Headless camera mode runs until Ctrl-C.", flush=True)
     try:
