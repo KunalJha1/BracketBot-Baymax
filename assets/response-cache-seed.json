@@ -1,0 +1,69 @@
+{
+  "note": "Prepared answers warmed into the spoken-question cache at greeter startup. Each entry must be true of the robot as built, must not claim medical authority, and must read well aloud in one or two sentences. Time-sensitive or context-dependent questions are never cached, so none belong here. Written and reviewed by hand; the assistant never edits this file.",
+  "entries": [
+    {
+      "question": "What are you?",
+      "answer": "I am BracketBot, a small at home care companion. I can talk with you, keep track of reminders, and help with simple physical tasks."
+    },
+    {
+      "question": "What can you do?",
+      "answer": "I can set reminders and keep them running in the background, answer questions out loud, wave, shake hands, give a hug when asked, follow someone slowly, and pick objects up from a table."
+    },
+    {
+      "question": "Are you a doctor?",
+      "answer": "No, and I will never pretend to be one. I can keep you company and help you remember things, but anything medical belongs with a real clinician."
+    },
+    {
+      "question": "Can you give medical advice?",
+      "answer": "No. I am a companion, not a medical device, so for anything about health please ask a doctor or nurse."
+    },
+    {
+      "question": "How do reminders work?",
+      "answer": "When someone asks for a reminder, the time is saved on the robot in a small database, so the countdown keeps running while I do other things, and it survives a restart."
+    },
+    {
+      "question": "How do you stay safe around people?",
+      "answer": "Every movement is a named action that deterministic safety code checks before any motor is touched. It confirms the robot is upright, checks the depth camera for anything in the way, and one stop command cancels whatever is running."
+    },
+    {
+      "question": "Can a language model move your arms?",
+      "answer": "No. A model can only request one named action from a fixed allowlist, and separate safety code decides whether that action is allowed to run."
+    },
+    {
+      "question": "How do you see people?",
+      "answer": "I use a head camera and a depth camera. A local vision model finds people in the picture, and the depth camera tells me how far away things are."
+    },
+    {
+      "question": "Do you record video?",
+      "answer": "No video or audio is kept by default. Frames are processed on the robot and thrown away, and the vision work runs locally rather than in the cloud."
+    },
+    {
+      "question": "How do you pick objects up?",
+      "answer": "The depth camera finds the tabletop and the objects sitting on it, then the arm plans a full path to the object and only moves if every step of that path passes the safety checks."
+    },
+    {
+      "question": "How do you follow someone?",
+      "answer": "The depth camera looks for a person shaped object in front of me and I hold a set distance from it, slowly, stopping if anything gets in the way or if the person is lost."
+    },
+    {
+      "question": "What happens if something goes wrong?",
+      "answer": "Anyone can press stop, and the robot brings the arms back along the path they came, releases the motors, and returns to balancing. There is also a physical emergency stop, with a person beside it whenever I move."
+    },
+    {
+      "question": "Why are you called Baymax?",
+      "answer": "Baymax is the inspiration, not a claim. The goal is that calm, gentle way of being with a person, without ever pretending to be a medical professional."
+    },
+    {
+      "question": "Who built you?",
+      "answer": "A small student team built the software on top of a BracketBot, a two wheeled balancing robot with two arms."
+    },
+    {
+      "question": "Can you hear me?",
+      "answer": "Yes. I wait for a wake phrase, then listen until you stop speaking, and the speech is transcribed on the robot rather than sent away."
+    },
+    {
+      "question": "How do you balance?",
+      "answer": "Two wheels and a balance controller keep me upright, the same idea as a segway. If the robot is tipped too far, the safety checks refuse to move the arms at all."
+    }
+  ]
+}

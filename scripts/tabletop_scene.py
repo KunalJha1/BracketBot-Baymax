@@ -38,6 +38,22 @@ class TablePlane:
     inliers: int
     tilt_degrees: float
     near_edge: float
+    edge_samples: np.ndarray = None  # (N, 2) subsampled inlier x, y
+
+    def near_edge_at(self, y: float, half_width: float = 0.12) -> float:
+        """Nearest table edge in the strip around lateral ``y``.
+
+        A round table's edge is much closer in front of the robot's centre
+        than out where an arm hangs, so a single global edge is wrong for
+        clearance checks at a particular lateral offset.
+        """
+
+        if self.edge_samples is None or not len(self.edge_samples):
+            return self.near_edge
+        strip = self.edge_samples[np.abs(self.edge_samples[:, 1] - y) <= half_width]
+        if len(strip) < 30:
+            return self.near_edge
+        return float(np.quantile(strip[:, 0], 0.03))
 
     def height_at(self, x: float, y: float) -> float:
         """Table surface height (arm z) below arm-frame ``(x, y)``."""
@@ -120,6 +136,7 @@ def fit_table_plane(arm_points, iterations=300, seed=0) -> TablePlane:
         int(len(inliers)),
         float(math.degrees(math.acos(float(np.clip(normal[2], -1.0, 1.0))))),
         float(np.quantile(inliers[:, 0], 0.03)),
+        inliers[:: max(1, len(inliers) // 4000), :2].astype(np.float32).copy(),
     )
 
 
@@ -261,3 +278,42 @@ def object_near(arm_points, plane: TablePlane, xy, radius=0.06):
         0.0,
         int(np.count_nonzero(local)),
     )
+
+
+def find_box(arm_points, plane: TablePlane, objects, exclude=None, side_of=None,
+             min_length=0.15, max_length=0.60, max_reach=0.60):
+    """The open container on the table: a broad rim with a hollow middle.
+
+    Depth sees a box as its walls; the floor inside sits at table level. So a
+    real container has points around its edge and almost nothing standing in
+    the middle, which is what separates it from a laptop or a pile of clutter.
+    """
+
+    arm = np.asarray(arm_points, dtype=np.float64).reshape(-1, 3)
+    arm = arm[np.isfinite(arm).all(axis=1)]
+    height = plane.height_above(arm)
+    best = None
+    for item in objects:
+        if exclude is not None and math.dist(item.center[:2], exclude.center[:2]) < 0.05:
+            continue
+        if not min_length <= item.length <= max_length or not 0.03 <= item.top <= 0.22:
+            continue
+        reach = min(math.hypot(item.center[0], item.center[1] - 0.0975),
+                    math.hypot(item.center[0], item.center[1] + 0.0975))
+        if reach > max_reach:
+            continue
+        if side_of is not None and exclude is not None:
+            if side_of * (item.center[1] - exclude.center[1]) <= 0:
+                continue
+        half = np.array([item.length, item.width]) / 2.0
+        offset = np.abs(arm[:, :2] - np.asarray(item.center[:2]))
+        inside = np.all(offset <= half * 0.45, axis=1)
+        around = np.all(offset <= half * 1.05, axis=1) & ~inside
+        standing_inside = np.count_nonzero(inside & (height > 0.03))
+        rim = np.count_nonzero(around & (height > 0.03))
+        if rim < 40 or standing_inside > 0.55 * rim:
+            continue
+        score = (rim, -math.dist(item.center[:2], exclude.center[:2]) if exclude else 0)
+        if best is None or score > best[0]:
+            best = (score, item)
+    return None if best is None else best[1]

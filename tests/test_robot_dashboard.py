@@ -32,9 +32,11 @@ from scripts.robot_dashboard import (
     RobotConnectionError,
     RobotController,
     PAGE,
+    LINE_ACTIONS,
     action_bundle_paths,
     action_resource_path,
     file_signature,
+    missing_action_asset,
     parse_hosts,
     remote_python_command,
     start_source_reloader,
@@ -68,7 +70,7 @@ def test_catalog_ids_keys_and_routine_steps_are_valid():
     assert len(keys) == len(set(keys))
     assert len(ACTIONS) >= 17
     assert {item.category for item in ACTION_LIST} == {
-        "Gestures", "Lights", "Sounds", "Music", "Positioning"
+        "Gestures", "Lights", "Sounds", "Music", "Lines", "Positioning"
     }
     assert all(set(routine.steps) <= ACTIONS.keys() for routine in ROUTINE_LIST)
     point = ACTIONS["point-person"]
@@ -79,6 +81,56 @@ def test_catalog_ids_keys_and_routine_steps_are_valid():
     assert table.executor == "table-rest"
     assert table.channels == ("depth-camera", "left-arm", "right-arm")
     assert table.risk == "contact-motion"
+
+
+def test_canned_lines_are_rendered_speaker_only_actions():
+    assert LINE_ACTIONS, "the spoken line family must not be empty"
+    for action in LINE_ACTIONS:
+        assert action.category == "Lines"
+        assert action.executor == "sound"
+        # A fixed line must never be able to move the robot.
+        assert action.channels == ("speaker",)
+        assert action.risk == "low"
+        assert action_resource_path(action).is_file(), action.id
+        assert action.public()["preview_url"] == f"/api/audio/{action.id}"
+    for routine_id in ("introduce", "sign-off"):
+        steps = ROUTINES[routine_id].steps
+        assert any(step.startswith("line-") for step in steps)
+
+
+def test_unrendered_line_is_rejected_with_render_instructions(tmp_path, monkeypatch):
+    import scripts.robot_dashboard as dashboard
+
+    line = LINE_ACTIONS[0]
+    monkeypatch.setattr(dashboard, "ROOT", tmp_path)
+    assert "generate_line_assets.py" in dashboard.missing_action_asset(line)
+
+    controller = RobotController(("not-used",), simulate=True)
+    ok, message = controller.run_action(line.id)
+    assert ok is False
+    assert "generate_line_assets.py" in message
+    ok, message = controller.run_routine("introduce")
+    assert ok is False
+    assert "generate_line_assets.py" in message
+    assert controller.state.snapshot()["running"] is False
+
+
+def test_bundle_skips_unrendered_assets_but_keeps_the_rest(tmp_path, monkeypatch):
+    import scripts.robot_dashboard as dashboard
+
+    monkeypatch.setattr(dashboard, "ROOT", tmp_path)
+    paths = action_bundle_paths()
+    assert not any(path.name.startswith("line-") for path in paths)
+    assert RUNNER in paths
+
+
+def test_rendered_lines_are_ready_to_play():
+    for action in LINE_ACTIONS:
+        assert missing_action_asset(action) is None
+        with wave.open(str(action_resource_path(action))) as audio:
+            assert audio.getnchannels() == 1
+            assert audio.getframerate() == 16_000
+            assert 1.0 < audio.getnframes() / audio.getframerate() < 40.0
 
 
 def test_all_catalog_resources_exist():

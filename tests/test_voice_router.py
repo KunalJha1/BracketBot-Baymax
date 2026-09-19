@@ -1,19 +1,24 @@
 import json
+import sqlite3
 from http.client import RemoteDisconnected
 
 from bbapps.greeter.voice_router import (
+    DEFAULT_SEED_PATH,
     BrowserbaseSearchClient,
     OpenRouterClient,
     QuestionResponseCache,
     RouteKind,
     VoiceRouter,
     authorize_gesture_tool,
+    cache_normalize,
     is_cacheable_question,
     is_question,
+    load_seed_pairs,
     match_action,
     match_health_request,
     match_reminder_request,
     normalize_utterance,
+    question_similarity,
     utterances_match,
 )
 
@@ -457,6 +462,163 @@ def test_question_cache_expires_entries(tmp_path):
     assert cache.get("Why is the sky blue?", "model", "prompt") is None
 
 
+def test_cache_key_ignores_filler_politeness_and_contractions():
+    assert cache_normalize("Hey BracketBot, so, um, what's a robot, please?") == (
+        "what is a robot"
+    )
+    assert cache_normalize("Could you tell me how gravity works, thanks") == (
+        "how gravity works"
+    )
+    assert cache_normalize("I was wondering what you can do for me") == (
+        "what you can do"
+    )
+
+
+def test_reworded_question_hits_the_same_cache_entry(tmp_path):
+    cache = QuestionResponseCache(tmp_path / "cache.sqlite3")
+    cache.put("What can you do?", "Quite a lot.", "model", "prompt")
+
+    for probe in (
+        "what can you do",
+        "Hey BracketBot, what can you do?",
+        "So, um, what can you do for me?",
+        "Could you tell me what you can do?",
+    ):
+        assert cache.get(probe, "model", "prompt") == "Quite a lot.", probe
+
+
+def test_near_match_needs_the_same_topic_words(tmp_path):
+    cache = QuestionResponseCache(tmp_path / "cache.sqlite3")
+    cache.put("Are you a doctor?", "No, and never will be.", "model", "prompt")
+    cache.put(
+        "How do you pick objects up from a table?",
+        "With the depth camera and a planned path.",
+        "model",
+        "prompt",
+    )
+
+    assert cache.get("How do you pick up objects from a table?", "model", "prompt") == (
+        "With the depth camera and a planned path."
+    )
+    # One different topic word is a different question.
+    assert cache.get("Are you a nurse?", "model", "prompt") is None
+    assert cache.get("How do you put objects down on a table?", "model", "prompt") is None
+    assert question_similarity("Is coffee good for you", "Is coffee bad for you") < 0.85
+
+
+def test_single_topic_word_questions_are_only_matched_exactly(tmp_path):
+    cache = QuestionResponseCache(tmp_path / "cache.sqlite3")
+    cache.put("What is a hug?", "A gentle squeeze.", "model", "prompt")
+
+    assert cache.get("What is a hug?", "model", "prompt") == "A gentle squeeze."
+    assert cache.get("What is a handshake?", "model", "prompt") is None
+
+
+def test_near_match_never_crosses_model_or_prompt(tmp_path):
+    cache = QuestionResponseCache(tmp_path / "cache.sqlite3")
+    cache.put("How do you keep people safe?", "Deterministic gates.", "model", "prompt")
+
+    assert cache.get("How do you keep people safe?", "other-model", "prompt") is None
+    assert cache.get("How do you keep people safe?", "model", "other-prompt") is None
+
+
+def test_expired_entries_are_not_reused_as_near_matches(tmp_path):
+    now = [100.0]
+    cache = QuestionResponseCache(
+        tmp_path / "cache.sqlite3", ttl_seconds=10, clock=lambda: now[0]
+    )
+    cache.put("How do the reminders work?", "They persist.", "model", "prompt")
+    now[0] = 200.0
+    assert cache.get("How do reminders work?", "model", "prompt") is None
+
+
+def test_seeding_warms_the_cache_without_overwriting_a_real_answer(tmp_path):
+    cache = QuestionResponseCache(tmp_path / "cache.sqlite3")
+    cache.put("What are you?", "A live answer.", "model", "prompt")
+
+    stored = cache.seed(
+        [
+            ("What are you?", "A prepared answer."),
+            ("Who built you?", "A student team."),
+            ("", "ignored"),
+            ("Ignored too?", "   "),
+        ],
+        "model",
+        "prompt",
+    )
+
+    assert stored == 1
+    assert cache.get("What are you?", "model", "prompt") == "A live answer."
+    assert cache.get("Who built you?", "model", "prompt") == "A student team."
+
+
+def test_seeded_answers_are_served_without_openrouter(tmp_path):
+    def opener(api_request, timeout):
+        raise AssertionError("a seeded answer must not call OpenRouter")
+
+    client = OpenRouterClient(
+        api_key="test-key",
+        opener=opener,
+        response_cache=QuestionResponseCache(tmp_path / "cache.sqlite3"),
+        seed_pairs=(("What can you do?", "Quite a lot, actually."),),
+    )
+
+    assert client.ask("So what can you do?") == "Quite a lot, actually."
+
+
+def test_seed_file_loading_tolerates_missing_and_malformed_files(tmp_path):
+    assert load_seed_pairs(tmp_path / "absent.json") == ()
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json", encoding="utf-8")
+    assert load_seed_pairs(broken) == ()
+    wrong_shape = tmp_path / "wrong.json"
+    wrong_shape.write_text(json.dumps({"entries": {"a": "b"}}), encoding="utf-8")
+    assert load_seed_pairs(wrong_shape) == ()
+    good = tmp_path / "good.json"
+    good.write_text(
+        json.dumps(
+            {
+                "note": "ignored",
+                "entries": [
+                    {"question": "What are you?", "answer": "A robot."},
+                    {"question": "", "answer": "dropped"},
+                    {"nonsense": True},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert load_seed_pairs(good) == (("What are you?", "A robot."),)
+
+
+def test_repository_seed_entries_are_all_actually_cacheable():
+    pairs = load_seed_pairs(DEFAULT_SEED_PATH)
+    assert len(pairs) >= 10
+    for question, answer in pairs:
+        # A seeded question the router would never look up is dead weight.
+        assert is_cacheable_question(question), question
+        assert answer
+
+
+def test_legacy_cache_database_is_migrated_in_place(tmp_path):
+    path = tmp_path / "cache.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE question_responses ("
+            "cache_key TEXT PRIMARY KEY, answer TEXT NOT NULL, created_at REAL NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO question_responses VALUES ('old-key', 'Old answer.', 100.0)"
+        )
+
+    cache = QuestionResponseCache(path, clock=lambda: 100.0)
+    # The legacy row has no stored question, so it can never near-match, but
+    # the database keeps working and new entries gain the new behavior.
+    assert cache.get("Why is the sky blue?", "model", "prompt") is None
+    cache.put("Why is the sky blue?", "Scattering.", "model", "prompt")
+    assert cache.get("So why is the sky blue?", "model", "prompt") == "Scattering."
+
+
 def test_openrouter_retries_one_transient_disconnect():
     attempts = 0
 
@@ -866,3 +1028,69 @@ def test_heart_rate_request_routes_to_executor_without_llm():
     assert decision.kind == RouteKind.ACTION
     assert "hold still" in decision.reply
     assert router.route("give me a checkup").action == "checkup"
+
+
+def test_openrouter_answers_in_text_when_tool_rounds_are_exhausted():
+    """A garbled transcript can make the model search every round.
+
+    The tool-round budget is then spent entirely on tool calls and the model
+    never gets a turn to answer, which used to surface to the speaker as
+    "I'm having trouble connecting right now". It should instead be asked
+    once more with no tools offered so it has to reply in text.
+    """
+    tool_round = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_search",
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": json.dumps({"query": "gemmadang"}),
+                            },
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+    final_text = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "Sorry, I didn't catch that. Could you say it again?",
+                }
+            }
+        ]
+    }
+    # One more tool round than the budget allows, then the forced text turn.
+    replies = iter([tool_round, tool_round, tool_round, final_text])
+    requests = []
+
+    def opener(api_request, timeout):
+        requests.append(json.loads(api_request.data))
+        return FakeResponse(next(replies))
+
+    class StubSearch:
+        configured = True
+
+        def search(self, query):
+            return {"query": query, "results": []}
+
+    client = OpenRouterClient(
+        api_key="openrouter-test-key",
+        opener=opener,
+        web_search=StubSearch(),
+    )
+
+    reply = client.ask("Watch two times two. He's using GemmaDang.")
+
+    assert reply == "Sorry, I didn't catch that. Could you say it again?"
+    # The forced final turn must offer no tools, or the model can loop again.
+    assert "tools" not in requests[-1]
+    assert requests[0]["tools"][0]["function"]["name"] == "web_search"

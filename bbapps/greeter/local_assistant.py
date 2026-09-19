@@ -41,6 +41,7 @@ try:
         RouteKind,
         VoiceRouter,
         default_question_response_cache,
+        default_seed_pairs,
     )
     from .voice_actions import SILENT_ACTIONS, RppgScanner, VoiceActionController
     from .reminders import default_reminder_db_path, default_timezone_name
@@ -62,6 +63,7 @@ except ImportError:
         RouteKind,
         VoiceRouter,
         default_question_response_cache,
+        default_seed_pairs,
     )
     from voice_actions import SILENT_ACTIONS, RppgScanner, VoiceActionController
     from reminders import default_reminder_db_path, default_timezone_name
@@ -443,7 +445,10 @@ def main() -> None:
         reminder_timezone=args.timezone or default_timezone_name(),
     )
     router = VoiceRouter(
-        OpenRouterClient(response_cache=default_question_response_cache()),
+        OpenRouterClient(
+            response_cache=default_question_response_cache(),
+            seed_pairs=default_seed_pairs(),
+        ),
         action_executor=action_controller.start,
         stop_executor=action_controller.stop,
         reminder_executor=action_controller.schedule_reminder,

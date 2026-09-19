@@ -32,6 +32,9 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from canned_lines import LINES as CANNED_LINES  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "gesture_test.py"
 EFFECT_RUNNER = ROOT / "scripts" / "robot_effect.py"
@@ -196,6 +199,18 @@ def _action(action_id, label, description, category, executor, **kwargs):
     return ActionSpec(action_id, label, description, category, executor, **kwargs)
 
 
+# Fixed spoken lines, rendered ahead of time by
+# ``scripts/generate_line_assets.py``. They reuse the ordinary allowlisted
+# sound path, so a scripted sentence costs one WAV playback instead of a wake
+# word, a transcription, a model round trip, and live speech synthesis.
+LINE_ACTIONS = tuple(
+    _action(line.id, line.label, line.summary, "Lines", "sound",
+            channels=("speaker",), key=line.key, resource=line.filename,
+            source=f"assets/lines/{line.filename}")
+    for line in CANNED_LINES
+)
+
+
 # This catalog is deliberately data, not arbitrary commands. It is the shared
 # vocabulary for buttons today and assistant-generated routines later.
 ACTION_LIST = (
@@ -241,6 +256,7 @@ ACTION_LIST = (
             channels=("speaker",), key="m", resource="baymax_calm.wav"),
     _action("music-celebration", "Upbeat melody", "Play an original upbeat instrumental", "Music", "sound",
             channels=("speaker",), key="u", resource="baymax_celebration.wav"),
+    *LINE_ACTIONS,
 )
 ACTIONS = {action.id: action for action in ACTION_LIST}
 
@@ -256,6 +272,10 @@ ROUTINE_LIST = (
                 ("light-calm", "music-calm"), "k"),
     RoutineSpec("dance-party", "Dance party", "Celebration light, upbeat melody, then dance",
                 ("light-celebrate", "music-celebration", "dance"), "x"),
+    RoutineSpec("introduce", "Introduce Baymax", "Ready light, spoken introduction, then a wave",
+                ("light-ready", "line-intro", "wave"), "h"),
+    RoutineSpec("sign-off", "Sign off", "Calm light, spoken farewell, then a wave",
+                ("light-calm", "line-farewell", "wave"), "j"),
 )
 ROUTINES = {routine.id: routine for routine in ROUTINE_LIST}
 
@@ -298,6 +318,21 @@ def action_resource_path(info):
     raise ValueError(f"{info.id} does not have a file resource")
 
 
+def missing_action_asset(info):
+    """Explain a missing file resource, or return None when it is ready."""
+    if info.executor not in {"gesture", "sound"}:
+        return None
+    path = action_resource_path(info)
+    if path.is_file():
+        return None
+    if info.category == "Lines":
+        return (
+            f"{info.label} has not been rendered yet. "
+            "Run python3 scripts/generate_line_assets.py"
+        )
+    return f"{info.label} is missing its asset {path.name}"
+
+
 def action_bundle_paths():
     """Files preloaded once per connection to keep button dispatch fast."""
     paths = [
@@ -310,10 +345,14 @@ def action_bundle_paths():
         FOLLOW_RUNNER,
         *FOLLOW_MODULES,
     ]
+    # A line that has not been rendered yet is skipped here so it fails on its
+    # own button with a clear message, rather than breaking every connection.
     paths.extend(
-        action_resource_path(action)
+        path
         for action in ACTION_LIST
         if action.executor in {"gesture", "sound"}
+        for path in (action_resource_path(action),)
+        if path.is_file()
     )
     return tuple(dict.fromkeys(paths))
 
@@ -638,6 +677,10 @@ class RobotController:
         if action not in ACTIONS:
             return False, "Unknown command"
 
+        missing = missing_action_asset(ACTIONS[action])
+        if missing:
+            return False, missing
+
         conflict = self._demo_resource_conflict((action,))
         if conflict:
             return False, conflict
@@ -648,6 +691,10 @@ class RobotController:
         if routine not in ROUTINES:
             return False, "Unknown routine"
         info = ROUTINES[routine]
+        for step in info.steps:
+            missing = missing_action_asset(ACTIONS[step])
+            if missing:
+                return False, missing
         conflict = self._demo_resource_conflict(info.steps)
         if conflict:
             return False, conflict
@@ -1828,7 +1875,7 @@ function makeButton(item, type) {
 }
 function renderCatalog() {
   if(rendered) return;
-  const groupIcons={Gestures:'✦',Lights:'◉',Sounds:'♫',Music:'♪',Routines:'＋'};
+  const groupIcons={Gestures:'✦',Lights:'◉',Sounds:'♫',Music:'♪',Lines:'❝',Routines:'＋'};
   const groups=new Map();
   for(const action of current.actions) {
     if(action.category==='Positioning') continue;

@@ -600,10 +600,106 @@ _CONTEXT_DEPENDENT_CACHE_PREFIX = re.compile(
 )
 
 
+# Spoken questions arrive with filler, politeness, and contractions that
+# change the transcript without changing the question. These are stripped only
+# for the cache key; the model still receives the person's real words.
+_CACHE_CONTRACTIONS = (
+    (re.compile(r"\bwhat's\b|\bwhats\b"), "what is"),
+    (re.compile(r"\bwho's\b|\bwhos\b"), "who is"),
+    (re.compile(r"\bhow's\b|\bhows\b"), "how is"),
+    (re.compile(r"\bwhere's\b|\bwheres\b"), "where is"),
+    (re.compile(r"\bthat's\b|\bthats\b"), "that is"),
+    (re.compile(r"\bit's\b"), "it is"),
+    (re.compile(r"\byou're\b|\byoure\b"), "you are"),
+    (re.compile(r"\bi'm\b|\bim\b"), "i am"),
+    (re.compile(r"\bcan't\b|\bcant\b"), "cannot"),
+    (re.compile(r"\bdon't\b|\bdont\b"), "do not"),
+    (re.compile(r"\bdoesn't\b|\bdoesnt\b"), "does not"),
+)
+_CACHE_LEAD_INS = re.compile(
+    r"^(?:"
+    r"(?:so|and|but|well|okay|ok|hey|um|uh|erm|hmm)\s+"
+    r"|(?:i (?:was )?wonder(?:ing|ed)?(?: if)?\s+)"
+    r"|(?:i (?:would like|want|wanna|need) to know\s+)"
+    r"|(?:(?:can|could|would) you (?:please )?(?:tell me|explain to me|say)\s+)"
+    r"|(?:(?:do|did) you know\s+)"
+    r"|(?:tell me\s+)"
+    r")+"
+)
+_CACHE_FILLER = re.compile(
+    r"\b(?:um|uh|erm|hmm|uhh|like|basically|actually|literally|honestly|"
+    r"really|just|sort of|kind of|you know|i mean|or something|anyway)\b"
+)
+_CACHE_TRAILERS = re.compile(
+    r"\s+(?:for me|to me|real quick|quickly|in short|briefly|"
+    r"if you (?:can|could|know)|thanks|thank you)$"
+)
+# Tokens that carry no topic on their own, so they must not prop up a
+# near-match between two different questions.
+_CACHE_STOPWORDS = frozenset(
+    """
+    a an the and or but if then than that this these those of in on at to for
+    with about from by as is are was were be been being am do does did done
+    have has had can could would should will shall may might must me my mine
+    you your yours i we us our it its they them their he she him her there
+    here what which who whom whose when where why how much many very please
+    tell say explain know thing things some any all not no yes s t
+    """.split()
+)
+
+
+def cache_normalize(text: str) -> str:
+    """Normalize a spoken question down to the part that identifies it."""
+    normalized = normalize_utterance(text)
+    for pattern, replacement in _CACHE_CONTRACTIONS:
+        normalized = pattern.sub(replacement, normalized)
+    normalized = _CACHE_LEAD_INS.sub("", normalized)
+    normalized = _CACHE_FILLER.sub(" ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    normalized = _CACHE_TRAILERS.sub("", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def cache_tokens(text: str) -> frozenset[str]:
+    """The topic words of a question, used only for conservative near-matching."""
+    return frozenset(
+        token
+        for token in cache_normalize(text).split()
+        if token and token not in _CACHE_STOPWORDS
+    )
+
+
+def same_words(left: str, right: str) -> bool:
+    """Whether two questions use exactly the same words in any order."""
+    normalized = cache_normalize(left)
+    return bool(normalized) and sorted(normalized.split()) == sorted(
+        cache_normalize(right).split()
+    )
+
+
+def question_similarity(left: str, right: str) -> float:
+    """Jaccard overlap of two questions' topic words, or 0.0 when unusable."""
+    if same_words(left, right):
+        # "what can you do" and "what you can do" carry no topic words at all,
+        # so word order and filler are all that separate them.
+        return 1.0
+    first, second = cache_tokens(left), cache_tokens(right)
+    # One topic word is the whole question's meaning ("hug", "reminders"), so
+    # a single-token question is only ever matched exactly.
+    if len(first) < 2 or len(second) < 2:
+        return 0.0
+    union = first | second
+    return len(first & second) / len(union) if union else 0.0
+
+
 def is_cacheable_question(text: str) -> bool:
     """Return whether a spoken question is safe to reuse without fresh context."""
     normalized = normalize_utterance(text)
-    if not normalized or not is_question(text):
+    # "I was wondering what you can do" asks the same thing as "what can you
+    # do", so the opener is looked for after the lead-in is stripped too.
+    keyed = cache_normalize(text)
+    opener = keyed.split(" ", 1)[0] if keyed else ""
+    if not normalized or not (is_question(text) or opener in _QUESTION_OPENERS):
         return False
     if _TIME_SENSITIVE_CACHE_TERMS.search(normalized):
         return False
@@ -620,8 +716,19 @@ class BrowserbaseSearchError(RuntimeError):
     """A user-safe wrapper for Browserbase Search API failures."""
 
 
+# Two questions must share the same topic words this closely before a saved
+# answer is reused. Small sets make Jaccard strict: one differing topic word
+# out of three already fails, so this only forgives filler and phrasing.
+NEAR_MATCH_SIMILARITY = 0.85
+
+
 class QuestionResponseCache:
-    """Persistent exact-question cache that safely degrades if SQLite fails."""
+    """Persistent question cache that safely degrades if SQLite fails.
+
+    A key is the normalized question, so filler and phrasing differences hit
+    the same entry. On an exact miss it tries one conservative near-match
+    within the same model and system prompt.
+    """
 
     def __init__(
         self,
@@ -629,10 +736,14 @@ class QuestionResponseCache:
         *,
         ttl_seconds: float = 30 * 24 * 60 * 60,
         clock: Callable[[], float] = time.time,
+        similarity: float = NEAR_MATCH_SIMILARITY,
+        near_match_scan: int = 400,
     ):
         self.path = Path(path).expanduser()
         self.ttl_seconds = max(0.0, float(ttl_seconds))
         self._clock = clock
+        self.similarity = min(1.0, max(0.0, float(similarity)))
+        self.near_match_scan = max(0, int(near_match_scan))
         self._lock = threading.Lock()
         self._enabled = self.ttl_seconds > 0
         if self._enabled:
@@ -641,9 +752,16 @@ class QuestionResponseCache:
     @staticmethod
     def _key(question: str, model: str, system_prompt: str) -> str:
         identity = json.dumps(
-            [normalize_utterance(question), model, system_prompt],
+            [cache_normalize(question), model, system_prompt],
             ensure_ascii=False,
             separators=(",", ":"),
+        )
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _scope(model: str, system_prompt: str) -> str:
+        identity = json.dumps(
+            [model, system_prompt], ensure_ascii=False, separators=(",", ":")
         )
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
@@ -668,6 +786,24 @@ class QuestionResponseCache:
                     )
                     """
                 )
+                # Older databases only stored the key, so near-matching columns
+                # are added in place. Rows without them simply never near-match.
+                columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(question_responses)"
+                    )
+                }
+                for column in ("question", "scope"):
+                    if column not in columns:
+                        connection.execute(
+                            "ALTER TABLE question_responses "
+                            f"ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                        )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS question_responses_scope "
+                    "ON question_responses(scope)"
+                )
         except (OSError, sqlite3.Error) as exc:
             self._disable(exc)
 
@@ -681,18 +817,44 @@ class QuestionResponseCache:
                     "SELECT answer, created_at FROM question_responses WHERE cache_key = ?",
                     (cache_key,),
                 ).fetchone()
-                if row is None:
-                    return None
-                if self._clock() - float(row[1]) > self.ttl_seconds:
+                if row is not None:
+                    if self._clock() - float(row[1]) <= self.ttl_seconds:
+                        return str(row[0])
                     connection.execute(
                         "DELETE FROM question_responses WHERE cache_key = ?",
                         (cache_key,),
                     )
-                    return None
-                return str(row[0])
+                return self._near_match(connection, question, model, system_prompt)
         except (OSError, sqlite3.Error) as exc:
             self._disable(exc)
             return None
+
+    def _near_match(
+        self, connection, question: str, model: str, system_prompt: str
+    ) -> str | None:
+        """Reuse an answer to a differently-worded but same-topic question."""
+        if self.similarity >= 1.0 or not self.near_match_scan:
+            return None
+        oldest = self._clock() - self.ttl_seconds
+        rows = connection.execute(
+            "SELECT question, answer FROM question_responses "
+            "WHERE scope = ? AND question <> '' AND created_at >= ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (self._scope(model, system_prompt), oldest, self.near_match_scan),
+        ).fetchall()
+        best_score = 0.0
+        best_answer = None
+        for stored_question, answer in rows:
+            score = question_similarity(question, str(stored_question))
+            if score > best_score:
+                best_score, best_answer = score, str(answer)
+        if best_answer is None or best_score < self.similarity:
+            return None
+        print(
+            f"[voice-router] Reused a near-matching answer (overlap {best_score:.2f}).",
+            flush=True,
+        )
+        return best_answer
 
     def put(
         self,
@@ -708,16 +870,87 @@ class QuestionResponseCache:
             with self._lock, self._connect() as connection:
                 connection.execute(
                     """
-                    INSERT INTO question_responses(cache_key, answer, created_at)
-                    VALUES (?, ?, ?)
+                    INSERT INTO question_responses(
+                        cache_key, answer, created_at, question, scope)
+                    VALUES (?, ?, ?, ?, ?)
                     ON CONFLICT(cache_key) DO UPDATE SET
                         answer = excluded.answer,
-                        created_at = excluded.created_at
+                        created_at = excluded.created_at,
+                        question = excluded.question,
+                        scope = excluded.scope
                     """,
-                    (cache_key, answer.strip(), self._clock()),
+                    (
+                        cache_key,
+                        answer.strip(),
+                        self._clock(),
+                        cache_normalize(question),
+                        self._scope(model, system_prompt),
+                    ),
                 )
         except (OSError, sqlite3.Error) as exc:
             self._disable(exc)
+
+    def seed(
+        self,
+        pairs,
+        model: str,
+        system_prompt: str,
+    ) -> int:
+        """Warm the cache with prepared answers, never overwriting a real one."""
+        stored = 0
+        for question, answer in pairs:
+            question, answer = str(question).strip(), str(answer).strip()
+            if not question or not answer:
+                continue
+            if self.get(question, model, system_prompt) is not None:
+                continue
+            self.put(question, answer, model, system_prompt)
+            stored += 1
+        return stored
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_SEED_PATH = REPOSITORY_ROOT / "assets" / "response-cache-seed.json"
+
+
+def load_seed_pairs(path: str | Path) -> tuple[tuple[str, str], ...]:
+    """Read prepared question/answer pairs, tolerating a missing or bad file."""
+    try:
+        document = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ()
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[voice-router] Cache seed unavailable: {exc}", flush=True)
+        return ()
+    entries = document.get("entries") if isinstance(document, dict) else document
+    if not isinstance(entries, list):
+        print("[voice-router] Cache seed has no entries list.", flush=True)
+        return ()
+    pairs = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        question = str(entry.get("question", "")).strip()
+        answer = str(entry.get("answer", "")).strip()
+        if question and answer:
+            pairs.append((question, answer))
+    return tuple(pairs)
+
+
+def default_seed_path() -> Path | None:
+    """The configured seed file, or the repository's own if it is present."""
+    configured = os.environ.get("BAYMAX_RESPONSE_CACHE_SEED", "").strip()
+    if configured.lower() in {"off", "none", "disabled"}:
+        return None
+    if configured:
+        return Path(configured).expanduser()
+    return DEFAULT_SEED_PATH if DEFAULT_SEED_PATH.is_file() else None
+
+
+def default_seed_pairs() -> tuple[tuple[str, str], ...]:
+    """Prepared answers to warm the cache with, from the configured seed file."""
+    path = default_seed_path()
+    return load_seed_pairs(path) if path is not None else ()
 
 
 def default_question_response_cache() -> QuestionResponseCache | None:
@@ -830,6 +1063,7 @@ class OpenRouterClient:
         retry_delays: tuple[float, ...] = (0.25, 0.75, 1.5),
         sleep: Callable[[float], None] = time.sleep,
         response_cache: QuestionResponseCache | None = None,
+        seed_pairs: tuple[tuple[str, str], ...] = (),
     ):
         self.api_key = (
             os.environ.get("OPENROUTER_API_KEY", "") if api_key is None else api_key
@@ -846,6 +1080,15 @@ class OpenRouterClient:
         self.response_cache = response_cache
         self._history: list[dict[str, str]] = []
         self._lock = threading.Lock()
+        if self.response_cache is not None and seed_pairs:
+            stored = self.response_cache.seed(
+                seed_pairs, self.model, self.system_prompt
+            )
+            if stored:
+                print(
+                    f"[voice-router] Warmed {stored} prepared answer(s) into the cache.",
+                    flush=True,
+                )
 
     @property
     def configured(self) -> bool:
@@ -1047,6 +1290,17 @@ class OpenRouterClient:
                             "content": json.dumps(result),
                         }
                     )
+            if not reply and used_tools and action_message is None:
+                # The tool-round budget can be spent entirely on tool calls --
+                # a garbled transcript makes the model search over and over --
+                # which leaves it no turn to actually answer. Ask once more
+                # with no tools offered so it has to reply in text. A gesture
+                # turn is excluded on purpose: action_message is the executor's
+                # real result and is reported verbatim rather than paraphrased.
+                try:
+                    reply = self._message_text(self._completion(messages, None))
+                except OpenRouterError:
+                    reply = ""
             if not reply:
                 if action_message:
                     reply = action_message

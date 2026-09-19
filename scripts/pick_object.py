@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import table_rest as tr  # noqa: E402
 from tabletop_scene import (  # noqa: E402
     TableObject,
+    find_box,
     find_objects,
     fit_table_plane,
     object_near,
@@ -56,7 +57,7 @@ PREGRASP_BACKOFF_METRES = 0.10
 # The IK end-effector point is at the fingertips; the jaws pivot 9 cm behind
 # it and the pads meet ~4 cm behind it (URDF). Push the tips this far past
 # the object's axis so the pad centre, not the tips, lands on the object.
-GRASP_TIP_PAST_AXIS_METRES = 0.04
+GRASP_TIP_PAST_AXIS_METRES = 0.045  # past the axis so the pads, not the tips, hold it
 PREGRASP_RAISE_METRES = 0.03
 LIFT_METRES = 0.10
 GRIPPER_OPEN_RADIANS = 0.80
@@ -65,7 +66,7 @@ GRIPPER_HOLD_SQUEEZE_RADIANS = 0.06
 # Force grip: the arm daemon relieves current on a stalled position target, so a
 # held grasp fades. Teleop's full-trigger grasp is 0.70 Nm (~3.4 A at kt=0.204)
 # and its comments cap a held grasp near 2.0 Nm.
-GRIP_CLOSE_TORQUE_NM = 0.70
+GRIP_CLOSE_TORQUE_NM = 0.90
 GRIP_OPEN_TORQUE_NM = -0.45
 MAX_GRIP_TORQUE_NM = 1.50
 GRIP_SETTLE_SECONDS = 0.8
@@ -93,7 +94,15 @@ APRON_DEPTH_METRES = 0.20
 # waypoints pass within 7 mm of the strict guard). For that phase the rule is
 # just: stay behind the measured edge, or 3 cm clear above the surface. Moves
 # out over the table keep the full HAND_CLEARANCE_METRES.
-RAISE_EDGE_MARGIN_METRES = 0.0
+RAISE_EDGE_MARGIN_METRES = 0.03   # the hand is wider than its FK point; 0 let it clip the edge
+RAISE_BEHIND_EDGE_METRES = 0.07   # climb this far behind the measured edge
+MIN_TABLE_EDGE_METRES = 0.13      # closer than this the raise is cramped
+# Automatic spacing: back away from the table in short verified steps.
+SPACE_TARGET_EDGE_METRES = 0.17
+SPACE_SPEED_MPS = 0.05
+SPACE_STEP_METRES = 0.05
+SPACE_MAX_TOTAL_METRES = 0.22
+DRIVE_PERIOD_SECONDS = 0.01
 RAISE_CLEARANCE_METRES = 0.03
 # Hanging rest pose: joints straight, prismatic lift all the way down. The
 # lift sign differs per arm (docs/robot-facts.md).
@@ -111,6 +120,7 @@ GRIPPER_FIX_MAX_AMPS = 1.5
 # republished continuously (docs/robot-facts.md).
 SHOULDER_ABOVE_AXLE_METRES = 1.265
 MAX_LEAN_DEGREES = 10.0
+STABILITY_LEAN_DEGREES = 4.0
 LEAN_SETTLE_SECONDS = 3.0
 LEAN_PERIOD_SECONDS = 0.05
 LEAN_MODE, BALANCE_MODE = 1, 0
@@ -118,7 +128,13 @@ LEAN_MODE, BALANCE_MODE = 1, 0
 # shoulder and fail beyond ~0.52 m, where tipping the ~14 cm fingers down
 # costs horizontal reach.
 IK_CONVERGED_METRES = 0.008
-MAX_REACH_METRES = 0.48
+MAX_REACH_METRES = 0.48      # empirical guide only: the IK decides
+HARD_REACH_METRES = 0.68     # beyond this no lean can help, so do not try
+LEAN_STEP_DEGREES = 2.0
+# Placing into a container: hold the object this far above its rim before
+# opening, so the jaws clear the walls and the drop is short.
+PLACE_ABOVE_RIM_METRES = 0.07
+CARRY_SECONDS = 5.0
 
 cancel_event = threading.Event()
 
@@ -318,7 +334,46 @@ def blend_to(cfg, path, goal, observation, samples=64, label="blend"):
         path.append(pose)
 
 
-def startup_raise(cfg, path, observation):
+def ladder_raise(cfg, path, side, observation, live_urdf, home_urdf, live_quaternion,
+                 home_quaternion):
+    """Climb behind the table edge: tuck back, rise through solved rungs, clear.
+
+    Each rung is an IK solution seeded from the one below, so neighbouring
+    rungs share a branch; joints are blended between rungs and every blended
+    pose is FK-checked against the edge. The first rung only pulls the hand
+    back, far below the tabletop where there is nothing to hit.
+    """
+
+    start_urdf = np.asarray(cfg.q2urdf(path[-1].copy()), dtype=np.float64)
+    start_xyz, _ = cfg.ik.fk(list(start_urdf[:7]))
+    lateral = SHOULDER_LATERAL_METRES if side == "left" else -SHOULDER_LATERAL_METRES
+    climb_x = min(float(start_xyz[0]), observation["near_edge"] - RAISE_BEHIND_EDGE_METRES)
+    top = observation["height"] + 0.10
+    heights = [float(start_xyz[2])]
+    while heights[-1] < top - 1e-6:
+        heights.append(min(top, heights[-1] + 0.08))
+    seed = start_urdf
+    for number, z in enumerate(heights):
+        target = np.array([climb_x, lateral, z])
+        # Fingertips-down beside the body is an impossible fold near table
+        # height, so turn toward the home orientation on the way up.
+        fraction = number / max(len(heights) - 1, 1)
+        config = None
+        for quaternion in (tr.quaternion_slerp(live_quaternion, home_quaternion, fraction),
+                           home_quaternion, live_quaternion):
+            config = solve_config(cfg, target, quaternion, [seed, live_urdf, home_urdf], home_urdf)
+            if config is not None:
+                break
+        if config is None:
+            raise RuntimeError(f"ladder raise: no IK solution at rung {number} {fmt(target)}")
+        config[GRIPPER_INDEX] = start_urdf[GRIPPER_INDEX]
+        blend_to(cfg, path, np.asarray(cfg.urdf2q(config), dtype=np.float64), observation,
+                 samples=24, label=f"ladder rung {number}")
+        seed = config
+    log("plan", f"ladder raise: {len(heights)} rungs at x={climb_x:.3f} up to z={top:.3f}")
+
+
+def startup_raise(cfg, path, observation, quiet=[False]):
     """Lift the arm to home along the robot's own calibrated startup waypoints.
 
     These are the vendor waypoints quest_teleop homes through: they rise close
@@ -330,23 +385,68 @@ def startup_raise(cfg, path, observation):
     waypoints.append(np.asarray(cfg.home, dtype=np.float64))
     for number, waypoint in enumerate(waypoints, start=1):
         blend_to(cfg, path, waypoint, observation, label=f"startup waypoint {number}")
-    log("plan", f"raised to home along {len(waypoints)} calibrated startup waypoints")
+    if not quiet[0]:
+        log("plan", f"raised to home along {len(waypoints)} calibrated startup waypoints")
+        quiet[0] = True
+
+
+def plan_place(cfg, side, lift_pose, place_point, quaternion, observation, low, high):
+    """Validated carry phase from the lift pose to above the container."""
+
+    home = np.asarray(cfg.home, dtype=np.float64).copy()
+    home[GRIPPER_INDEX] = lift_pose[GRIPPER_INDEX]
+    home_urdf = np.asarray(cfg.q2urdf(home.copy()), dtype=np.float64)
+    lift_urdf = np.asarray(cfg.q2urdf(np.asarray(lift_pose).copy()), dtype=np.float64)
+    config = solve_config(cfg, place_point, quaternion,
+                          [lift_urdf, *lift_seeds(home_urdf)], home_urdf)
+    if config is None:
+        raise RuntimeError(f"no converged IK configuration above the box {fmt(place_point)}")
+    path = [np.asarray(lift_pose, dtype=np.float64).copy()]
+    position, orientation = (np.asarray(v, dtype=np.float64)
+                             for v in cfg.ik.fk(list(lift_urdf[:7])))
+    cfg.ik.reset(list(lift_urdf[:7]))
+    nominal = config.copy()
+    nominal[GRIPPER_INDEX] = lift_urdf[GRIPPER_INDEX]
+    tr._append_segment(
+        cfg, nominal, path, position, orientation, place_point, quaternion,
+        f"{side}:carry-to-box", logger=lambda stage, message: None,
+        samples=ADJUST_IK_SAMPLES, endpoint_error_limit=tr.MAX_IK_ENDPOINT_ERROR_METRES,
+        clearance_observation=observation,
+    )
+    carry = np.asarray(densify(list(path)), dtype=np.float64)
+    carry[:, GRIPPER_INDEX] = lift_pose[GRIPPER_INDEX]
+    tr.validate_calibration(carry, low, high, f"{side}:carry", logger=lambda *_: None)
+    tr.validate_playback_clearance(carry, cfg, observation, f"{side}:carry", logger=lambda *_: None)
+    return carry
+
+
+def place_point_for(box, plane, item):
+    """Where the gripper should hold the object before opening over the box."""
+
+    x, y = box.center[0], box.center[1]
+    rim = plane.height_at(x, y) + box.top
+    return np.array([x, y, rim + PLACE_ABOVE_RIM_METRES + item.top * 0.5])
 
 
 def plan_pick(cfg, start, side, item, plane, pitch, yaw_fraction=1.0):
     """Full validated motor path plus the indices where each phase ends."""
 
+    lateral = SHOULDER_LATERAL_METRES if side == "left" else -SHOULDER_LATERAL_METRES
     observation = {
         # Conservative: the plane rises with forward distance, so use the
         # surface height just beyond the object for every clearance check.
         "height": plane.height_at(item.center[0] + 0.03, item.center[1]),
-        "near_edge": plane.near_edge,
+        "near_edge": plane.near_edge_at(item.center[1]),
     }
+    # The arm rises at its own lateral offset, where a round table's edge sits
+    # further from the robot than it does straight ahead.
+    raise_observation = dict(observation, near_edge=plane.near_edge_at(lateral))
     pregrasp, grasp, lift, grasp_quaternion = grasp_waypoints(
         item, side, pitch, plane.height_at, yaw_fraction)
     log(
         "plan",
-        f"side={side} pitch={pitch:.0f}deg yaw_fraction={yaw_fraction:.1f} pregrasp={fmt(pregrasp)} grasp={fmt(grasp)} "
+        f"side={side} raise_edge={raise_observation['near_edge']:.3f} "
+        f"pitch={pitch:.0f}deg yaw_fraction={yaw_fraction:.1f} pregrasp={fmt(pregrasp)} grasp={fmt(grasp)} "
         f"lift={fmt(lift)} clearance_height={observation['height']:.3f} "
         f"near_edge={observation['near_edge']:.3f}",
     )
@@ -360,14 +460,25 @@ def plan_pick(cfg, start, side, item, plane, pitch, yaw_fraction=1.0):
         np.asarray(v, dtype=np.float64)
         for v in cfg.ik.fk(list(np.asarray(cfg.q2urdf(home.copy()), dtype=np.float64)[:7]))
     )
-    lateral = SHOULDER_LATERAL_METRES if side == "left" else -SHOULDER_LATERAL_METRES
     escape = np.array([min(0.13, plane.near_edge - 0.05), lateral, observation["height"] + 0.08])
 
     path = [start.copy()]
     marks = {}
     startup_failure = None
     try:
-        startup_raise(cfg, path, observation)
+        home_cfg = np.asarray(cfg.q2urdf(np.asarray(cfg.home, dtype=np.float64).copy()),
+                              dtype=np.float64)
+        try:
+            ladder_raise(cfg, path, side, raise_observation, live_urdf, home_cfg, live_quaternion,
+                         home_quaternion)
+            blend_to(cfg, path, np.asarray(cfg.home, dtype=np.float64), raise_observation,
+                     label="ladder to home")
+        except RuntimeError as ladder_exc:
+            if not getattr(plan_pick, "_warned_ladder", False):
+                log("plan", f"ladder raise unavailable ({ladder_exc}); trying startup waypoints")
+                plan_pick._warned_ladder = True
+            path = [start.copy()]
+            startup_raise(cfg, path, raise_observation)
         marks["raise-behind-table"] = marks["move-home"] = len(path) - 1
         home_reached = np.asarray(cfg.q2urdf(path[-1].copy()), dtype=np.float64)
         cfg.ik.reset(list(home_reached[:7]))
@@ -375,7 +486,9 @@ def plan_pick(cfg, start, side, item, plane, pitch, yaw_fraction=1.0):
             np.asarray(v, dtype=np.float64) for v in cfg.ik.fk(list(home_reached[:7])))
     except RuntimeError as exc:
         startup_failure = str(exc)
-        log("plan", f"startup-waypoint raise unavailable ({exc}); using Cartesian escape")
+        if not getattr(plan_pick, "_warned_startup", False):
+            log("plan", f"startup-waypoint raise unavailable ({exc}); using Cartesian escape")
+            plan_pick._warned_startup = True
         path = [start.copy()]
         marks = {}
     # Same choice as table_rest: the right arm cannot raise behind the table
@@ -439,7 +552,7 @@ def plan_pick(cfg, start, side, item, plane, pitch, yaw_fraction=1.0):
             if name != "raise-behind-table":
                 raise RuntimeError("; ".join(errors))
             attempt = list(path)
-            joint_space_raise(cfg, attempt, target, options, observation,
+            joint_space_raise(cfg, attempt, target, options, raise_observation,
                               np.asarray(cfg.q2urdf(home.copy()), dtype=np.float64), live_urdf)
             path = attempt
         reached_urdf = np.asarray(cfg.q2urdf(path[-1].copy()), dtype=np.float64)
@@ -466,8 +579,11 @@ def split_dense(path, marks):
     """Densify each phase separately so phase boundaries stay addressable."""
 
     phases = {}
-    edges = [("approach", 0, marks["pregrasp"]), ("descend", marks["pregrasp"], marks["grasp"]),
-             ("lift", marks["grasp"], marks["lift"])]
+    # "raise" (rest pose up to home, right at the table edge) is validated by
+    # its own raise-phase rule while planning; the strict over-table clearance
+    # rule applies from home onward.
+    edges = [("raise", 0, marks["move-home"]), ("approach", marks["move-home"], marks["pregrasp"]),
+             ("descend", marks["pregrasp"], marks["grasp"]), ("lift", marks["grasp"], marks["lift"])]
     for name, first, last in edges:
         phases[name] = np.asarray(densify(list(path[first:last + 1])), dtype=np.float64)
     return phases
@@ -477,6 +593,7 @@ def scan(Reader, frames=5, timeout=8.0):
     """Fit the table and select a graspable object on fresh, consistent frames."""
 
     picks = []
+    near = scan.near
     last_stamp = None
     deadline = time.monotonic() + timeout
     with tr.nonsuppressing(Reader("camera.points", keeptime=False)) as reader:
@@ -499,12 +616,12 @@ def scan(Reader, frames=5, timeout=8.0):
             except RuntimeError as exc:
                 log("scan", f"frame rejected: {exc}")
                 continue
-            item = select_graspable(objects, near=scan.near, max_reach=1.0)
-            if scan.near is not None and (
+            item = select_graspable(objects, near=near, max_reach=1.0)
+            if near is not None and (
                 item is None
-                or math.hypot(item.center[0] - scan.near[0], item.center[1] - scan.near[1]) > 0.08
+                or math.hypot(item.center[0] - near[0], item.center[1] - near[1]) > 0.08
             ):
-                item = object_near(arm, plane, scan.near)
+                item = object_near(arm, plane, near)
                 if item is not None:
                     log("scan", "hinted object was merged with a neighbour; measured it locally")
             if item is not None and scan.virtual is not None:
@@ -519,7 +636,10 @@ def scan(Reader, frames=5, timeout=8.0):
                 f"width={0 if item is None else item.width:.3f}",
             )
             if item is not None:
+                if near is None:
+                    near = (item.center[0], item.center[1])  # lock on: no flip-flopping
                 picks.append((plane, item))
+                scan.last_box = find_box(arm, plane, objects, exclude=item, side_of=scan.box_side)
     if len(picks) < frames:
         raise RuntimeError(f"no graspable object seen on {frames} fresh depth frames")
     centres = np.asarray([item.center for _, item in picks])
@@ -545,6 +665,8 @@ def scan(Reader, frames=5, timeout=8.0):
 
 scan.near = None
 scan.virtual = None
+scan.last_box = None
+scan.box_side = None
 
 
 def check_reach(item):
@@ -552,11 +674,13 @@ def check_reach(item):
     reach = math.hypot(item.center[0], item.center[1] - shoulder_y)
     log("reach", f"object {reach:.3f} m from the {'left' if shoulder_y > 0 else 'right'} "
                  f"shoulder (limit {MAX_REACH_METRES:.2f})")
-    if reach > MAX_REACH_METRES:
+    if reach > HARD_REACH_METRES:
         raise RuntimeError(
-            f"object is out of reach: {reach:.2f} m from the shoulder; move it to within "
-            f"{MAX_REACH_METRES:.2f} m (about {item.center[0] - (reach - MAX_REACH_METRES) - 0.03:.2f} m forward)"
+            f"object is {reach:.2f} m from the shoulder, past anything leaning can reach "
+            f"({HARD_REACH_METRES:.2f} m); move it closer"
         )
+    if reach > MAX_REACH_METRES:
+        log("reach", "beyond the usual limit; letting IK decide, leaning further if it fails")
 
 
 def plan_adjusted(cfg, side, pregrasp_pose, grasp, lift, quaternion, observation, low, high):
@@ -627,7 +751,7 @@ class LeanHold:
         log("lean", "balance mode restored")
 
     def __enter__(self):
-        log("lean", f"holding {self.degrees:.1f} deg forward lean for extra reach")
+        log("lean", f"holding {self.degrees:.1f} deg lean to brace the base")
         self.thread = threading.Thread(target=self._run, name="lean-hold", daemon=True)
         self.thread.start()
         time.sleep(LEAN_SETTLE_SECONDS)
@@ -641,13 +765,16 @@ class LeanHold:
 
 
 def lean_for_reach(reach):
-    """Extra lean (deg) that would bring ``reach`` inside MAX_REACH_METRES."""
+    """Starting lean (deg) for an object near or beyond the usual reach limit.
 
-    shortfall = reach - MAX_REACH_METRES + 0.02
-    if shortfall <= 0:
+    Trigonometry alone does not predict the gain (tilting the torso also tilts
+    the arm frame), so this is only a starting point: execute() leans further
+    in LEAN_STEP_DEGREES steps whenever planning still fails.
+    """
+
+    if reach <= MAX_REACH_METRES - 0.02:
         return 0.0
-    needed = math.degrees(math.asin(min(1.0, shortfall / SHOULDER_ABOVE_AXLE_METRES)))
-    return min(MAX_LEAN_DEGREES, math.ceil(needed * 2) / 2)
+    return min(MAX_LEAN_DEGREES, 4.0)
 
 
 def fix_gripper(Config, Reader, Type, Writer, side):
@@ -709,6 +836,80 @@ def fix_gripper(Config, Reader, Type, Writer, side):
     healthy = GRIPPER_VALID_RADIANS[0] <= final <= GRIPPER_VALID_RADIANS[1]
     log("gripper", f"{side} now reads {final:.3f} rad; in range={healthy}")
     return healthy
+
+
+def measure_edge(Reader, frames=3):
+    """Median table near-edge distance over a few fresh depth frames."""
+
+    edges, last = [], None
+    deadline = time.monotonic() + 6.0
+    with tr.nonsuppressing(Reader("camera.points", keeptime=False)) as reader:
+        while len(edges) < frames and time.monotonic() < deadline:
+            if not reader.ready():
+                time.sleep(0.02)
+                continue
+            stamp = str(reader.data["timestamp"])
+            if stamp == last:
+                time.sleep(0.02)
+                continue
+            last = stamp
+            count = int(reader.data["num_points"])
+            arm = points_to_arm(np.asarray(reader.data["points"])[:count].astype(np.float64))
+            try:
+                edges.append(fit_table_plane(arm).near_edge)
+            except RuntimeError:
+                continue
+    if not edges:
+        raise RuntimeError("cannot see the table to measure spacing")
+    return float(np.median(edges))
+
+
+def auto_space(Reader, Type, Writer):
+    """Back the base away from the table until the edge is comfortably clear.
+
+    Open-loop bursts of at most SPACE_STEP_METRES at SPACE_SPEED_MPS, each
+    followed by a fresh depth measurement. Aborts if the edge does not move
+    the expected way (wrong sign, blocked wheel, someone pushing the robot).
+    """
+
+    edge = measure_edge(Reader)
+    log("space", f"table edge {edge:.3f} m from the arm base (target {SPACE_TARGET_EDGE_METRES:.2f})")
+    if edge >= MIN_TABLE_EDGE_METRES:
+        return edge
+    travelled = 0.0
+    with tr.nonsuppressing(Writer("drive.ctrl", Type("drive_ctrl"), keeptime=False)) as drive:
+
+        def twist(v):
+            with drive.buf() as frame:
+                frame["twist"] = np.array([v, 0.0], dtype=np.float32)
+
+        try:
+            while edge < SPACE_TARGET_EDGE_METRES and travelled < SPACE_MAX_TOTAL_METRES:
+                if cancel_event.is_set():
+                    raise RuntimeError("spacing cancelled")
+                step = min(SPACE_STEP_METRES, SPACE_TARGET_EDGE_METRES - edge + 0.01)
+                seconds = step / SPACE_SPEED_MPS
+                began = time.monotonic()
+                while time.monotonic() - began < seconds and not cancel_event.is_set():
+                    twist(-SPACE_SPEED_MPS)
+                    time.sleep(DRIVE_PERIOD_SECONDS)
+                for _ in range(40):
+                    twist(0.0)
+                    time.sleep(DRIVE_PERIOD_SECONDS)
+                time.sleep(1.2)  # let the balancer settle before trusting depth
+                measured = measure_edge(Reader)
+                travelled += step
+                log("space", f"backed {step * 100:.0f} cm; edge {edge:.3f} -> {measured:.3f} m")
+                if measured < edge - 0.015:
+                    raise RuntimeError(
+                        f"edge got closer while backing up ({edge:.3f} -> {measured:.3f} m); stopping")
+                edge = measured
+        finally:
+            for _ in range(30):
+                twist(0.0)
+                time.sleep(DRIVE_PERIOD_SECONDS)
+    log("space", f"spacing done: edge {edge:.3f} m after {travelled * 100:.0f} cm")
+    return edge
 
 
 def rest_arms(Config, Reader, Type, Writer, sides=("left", "right")):
@@ -784,7 +985,8 @@ def rest_arms(Config, Reader, Type, Writer, sides=("left", "right")):
 
 
 def execute(plan_only=True, pid_file=None, stop_at=None, adjust=False,
-            grip_torque=GRIP_CLOSE_TORQUE_NM, allow_lean=True):
+            grip_torque=GRIP_CLOSE_TORQUE_NM, allow_lean=True, place=False,
+            auto_space_enabled=False):
     bbos, Config, Reader, Type, Writer = tr._load_bbos()
     with tr.nonsuppressing(Reader("imu.orientation", keeptime=False)) as imu:
         rpy = np.asarray(tr.fresh(imu)["rpy"], dtype=np.float64)
@@ -792,19 +994,43 @@ def execute(plan_only=True, pid_file=None, stop_at=None, adjust=False,
     if abs(rpy[0]) >= UPRIGHT_DEGREES or abs(rpy[1]) >= UPRIGHT_DEGREES:
         raise RuntimeError("robot is not upright")
 
-    plane, item = scan(Reader)
-    lean = lean_for_reach(object_reach(item))
-    if lean and allow_lean:
-        with LeanHold(Type, Writer, lean):
-            # Leaning moves the shoulder and the whole depth frame, so the
-            # scene has to be measured again before anything is planned.
-            plane, item = scan(Reader)
-            log("lean", f"after leaning, object reach is {object_reach(item):.3f} m")
-            return pick_with(bbos, Config, Reader, Type, Writer, plane, item,
-                             plan_only, stop_at, adjust, grip_torque)
-    check_reach(item)
-    return pick_with(bbos, Config, Reader, Type, Writer, plane, item,
-                     plan_only, stop_at, adjust, grip_torque)
+    if auto_space_enabled:
+        auto_space(Reader, Type, Writer)
+    # A balancing base rocks as the arm extends, which moves the hand away from
+    # where depth measured the object. Lean mode braces the base, so hold it for
+    # the whole pick (both successful early picks ran with lean on; the miss
+    # without it). Skip our own hold if another process already publishes lean.
+    external = False
+    if allow_lean:
+        try:
+            with tr.nonsuppressing(Reader("base.mode", keeptime=False)) as mode_reader:
+                deadline = time.monotonic() + 0.6
+                while time.monotonic() < deadline and not external:
+                    if mode_reader.ready() and int(mode_reader.data["mode"]) == LEAN_MODE:
+                        external = True
+                    time.sleep(0.05)
+        except Exception:  # noqa: BLE001 - topic absent means nobody holds lean
+            external = False
+    if not allow_lean or external:
+        log("lean", "lean already held elsewhere" if external else "lean disabled by flag")
+        plane, item = scan(Reader)
+        return pick_with(bbos, Config, Reader, Type, Writer, plane, item,
+                         plan_only, stop_at, adjust, grip_torque, box_for(plane, item, place))
+    with LeanHold(Type, Writer, STABILITY_LEAN_DEGREES):
+        plane, item = scan(Reader)
+        return pick_with(bbos, Config, Reader, Type, Writer, plane, item,
+                         plan_only, stop_at, adjust, grip_torque, box_for(plane, item, place))
+
+
+def box_for(plane, item, place):
+    """Locate the container to place into, or None to put the object back."""
+
+    if not place:
+        return None
+    box = scan.last_box
+    if box is None:
+        log("place", "no container found near the object; it will be put back instead")
+    return box
 
 
 def object_reach(item):
@@ -813,7 +1039,10 @@ def object_reach(item):
 
 
 def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
-              plan_only, stop_at, adjust, grip_torque):
+              plan_only, stop_at, adjust, grip_torque, place_box=None):
+    if plane.near_edge < MIN_TABLE_EDGE_METRES:
+        log("plan", f"table edge is only {plane.near_edge * 100:.0f} cm from the arm base; "
+                    "the raise will climb behind it")
     check_reach(item)
     preferred = "left" if item.center[1] >= 0.0 else "right"
     rejected = []
@@ -830,7 +1059,8 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
             continue
         shoulder_y = SHOULDER_LATERAL_METRES if side == "left" else -SHOULDER_LATERAL_METRES
         reach = math.hypot(item.center[0], item.center[1] - shoulder_y)
-        if reach > MAX_REACH_METRES:
+        log("state", f"side={side} object reach {reach:.3f} m")
+        if reach > HARD_REACH_METRES:
             rejected.append(f"{side} arm would need {reach:.2f} m of reach")
             log("state", f"side={side} rejected: {rejected[-1]}")
             continue
@@ -847,13 +1077,19 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
             low, high = tr.calibration_limits(bbos, side, logger=log)
             for name, phase in phases.items():
                 tr.validate_calibration(phase, low, high, f"{side}:{name}", logger=log)
-                tr.validate_playback_clearance(phase, cfg, observation, f"{side}:{name}", logger=log)
+                if name != "raise":
+                    tr.validate_playback_clearance(phase, cfg, observation, f"{side}:{name}",
+                                                   logger=log)
+            phases["approach"] = np.vstack([phases.pop("raise"), phases["approach"][1:]])
             break
         except RuntimeError as exc:
             failures.append(f"pitch {pitch:.0f} yaw x{yaw_fraction:.1f}: {exc}")
             log("plan", f"pitch={pitch:.0f}deg yaw_fraction={yaw_fraction:.1f} rejected: {exc}")
     else:
         raise RuntimeError("no validated grasp: " + " | ".join(failures))
+    grasp_urdf = np.asarray(cfg.q2urdf(phases["descend"][-1].copy()), dtype=np.float64)
+    reached_xyz, _ = cfg.ik.fk(list(grasp_urdf[:7]))
+    log("plan", f"grasp pose reaches {fmt(reached_xyz)}")
     log("plan", f"accepted pitch={pitch:.0f}deg yaw_fraction={yaw_fraction:.1f} phases=" + ",".join(
         f"{name}:{len(phase)}" for name, phase in phases.items()))
     if plan_only:
@@ -883,12 +1119,23 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
             attempts.append((offset, descend, lifted))
         log("retry", f"{len(attempts)} validated attempts planned before moving")
 
+    carry = None
+    if place_box is not None and attempts:
+        target = place_point_for(place_box, plane, item)
+        try:
+            carry = plan_place(cfg, side, phases["lift"][-1], target, grasp_quaternion,
+                               observation, low, high)
+            log("place", f"box at {fmt(place_box.center)} rim={place_box.top:.3f}; "
+                         f"release above {fmt(target)} ({len(carry)} poses)")
+        except RuntimeError as exc:
+            log("place", f"cannot reach above the box ({exc}); the object will be put back")
+
     run_motion(Config, Reader, Type, Writer, cfg, side, start, phases, stop_at, attempts,
-               grip_torque)
+               grip_torque, carry)
 
 
 def run_motion(Config, Reader, Type, Writer, cfg, side, start, phases, stop_at=None,
-               attempts=None, grip_torque=GRIP_CLOSE_TORQUE_NM):
+               attempts=None, grip_torque=GRIP_CLOSE_TORQUE_NM, carry=None):
     with ExitStack() as stack:
         state = stack.enter_context(tr.nonsuppressing(Reader(f"arm_{side}.state", keeptime=False)))
         control = stack.enter_context(tr.nonsuppressing(
@@ -1033,9 +1280,24 @@ def run_motion(Config, Reader, Type, Writer, cfg, side, start, phases, stop_at=N
                         log("evidence", f"attempt={number} after lift holding={still} "
                                         f"current={float(np.asarray(data['current'])[GRIPPER_INDEX]):.2f}A")
                         cancel_event.wait(HOLD_SECONDS)
-                        stage = "put-back"
-                        play(with_gripper(lift[::-1], hold_turns), LIFT_SECONDS, False, "lower")
-                        holding = False
+                        if carry is not None and still:
+                            # Carrying is deliberately not cancellable: a Stop
+                            # mid-carry finishes over the box and releases there
+                            # rather than dropping the object anywhere.
+                            stage = "carry"
+                            play(with_gripper(carry, hold_turns), CARRY_SECONDS, False, "carry")
+                            release(with_gripper([carry[-1]], hold_turns)[0])
+                            holding = False
+                            result = "PLACED"
+                            log("place", "released above the box")
+                            play(with_gripper(carry[::-1], open_turns), CARRY_SECONDS, False,
+                                 "leave-box")
+                            play(with_gripper(lift[::-1], open_turns), LIFT_SECONDS, False,
+                                 "lower-empty")
+                        else:
+                            stage = "put-back"
+                            play(with_gripper(lift[::-1], hold_turns), LIFT_SECONDS, False, "lower")
+                            holding = False
                     open_pose = descend[-1].copy()
                     open_pose[GRIPPER_INDEX] = open_turns
                     release(open_pose)
@@ -1045,7 +1307,7 @@ def run_motion(Config, Reader, Type, Writer, cfg, side, start, phases, stop_at=N
                     stage = "approach"
                     reached = len(approach) - 1
                     log("retry", f"attempt={number} result={result}")
-                    if result == "PICKED":
+                    if result in {"PICKED", "PLACED"}:
                         break
                 return
             stage = "descend"
@@ -1053,8 +1315,15 @@ def run_motion(Config, Reader, Type, Writer, cfg, side, start, phases, stop_at=N
             if cancel_event.is_set():
                 return
             if stop_at == "grasp":
+                time.sleep(0.6)
+                measured = np.asarray(tr.fresh(state)["pos"], dtype=np.float64)
+                measured_xyz, _ = cfg.ik.fk(list(np.asarray(cfg.q2urdf(measured.copy()))[:7]))
+                planned_xyz, _ = cfg.ik.fk(list(np.asarray(cfg.q2urdf(descend[-1].copy()))[:7]))
+                log("staged", f"planned tip {fmt(planned_xyz)} measured tip {fmt(measured_xyz)} "
+                              f"error_mm={fmt((np.asarray(measured_xyz) - np.asarray(planned_xyz)) * 1000)} "
+                              f"joint_error_turns={fmt(measured - descend[-1])}")
                 log("staged", "gripper around the object, open; returning without closing")
-                cancel_event.wait(2.0 * HOLD_SECONDS)
+                cancel_event.wait(4.0 * HOLD_SECONDS)
                 return
             stage = "grip"
             holding, hold_turns = close_until_contact(descend[-1].copy())
@@ -1117,6 +1386,15 @@ def main():
     parser.add_argument("--virtual", type=float, nargs=3, metavar=("X", "Y", "TOP"),
                         help="plan-only: plan against a pretend object at arm-frame X,Y "
                              "with this height, on the live table plane")
+    parser.add_argument("--auto-space", action="store_true",
+                        help="back the base away from the table first if it is parked too close")
+    parser.add_argument("--space", action="store_true",
+                        help="only do the automatic spacing, then stop")
+    parser.add_argument("--place", action="store_true",
+                        help="carry the object to the container found beside it and release, "
+                             "instead of putting it back down")
+    parser.add_argument("--box-side", choices=("left", "right"),
+                        help="which side of the object the container is on")
     parser.add_argument("--fix-gripper", choices=("left", "right"),
                         help="drive that gripper back into its valid range and stop")
     parser.add_argument("--no-lean", action="store_true",
@@ -1133,6 +1411,7 @@ def main():
     if args.virtual and args.execute:
         parser.error("--virtual is for plan-only checks")
     scan.near = tuple(args.near) if args.near else None
+    scan.box_side = {"left": 1.0, "right": -1.0}.get(args.box_side)
     scan.virtual = tuple(args.virtual) if args.virtual else None
 
     def on_signal(signum, _frame):
@@ -1145,6 +1424,10 @@ def main():
     if args.pid_file:
         args.pid_file.write_text(f"{os.getpid()}\n")
     try:
+        if args.space:
+            _, Config, Reader, Type, Writer = tr._load_bbos()
+            auto_space(Reader, Type, Writer)
+            return 0
         if args.fix_gripper:
             _, Config, Reader, Type, Writer = tr._load_bbos()
             return 0 if fix_gripper(Config, Reader, Type, Writer, args.fix_gripper) else 1
@@ -1153,7 +1436,8 @@ def main():
             rest_arms(Config, Reader, Type, Writer)
             return 0
         execute(plan_only=not args.execute, stop_at=args.stop_at, adjust=args.adjust,
-                grip_torque=args.grip_torque, allow_lean=not args.no_lean)
+                grip_torque=args.grip_torque, allow_lean=not args.no_lean,
+                place=args.place, auto_space_enabled=args.auto_space)
         return 0
     except Exception as exc:  # noqa: BLE001 - report every failure as NOT SAFE
         log("fatal", f"NOT SAFE TO RUN: {type(exc).__name__}: {exc}")

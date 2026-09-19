@@ -299,9 +299,14 @@ class HttpTtsSynthesizer:
 
     def synthesize(self, text: str, target_rate: int) -> np.ndarray:
         self.validate()
+        # Ask the Mac to render at the speaker's own rate.  Rendering at 16 kHz
+        # and stretching it here threw away everything above 8 kHz and added
+        # interpolation aliasing, which is most of what made the robot sound
+        # synthetic.  An older bridge ignores the field and we resample as before.
+        payload = {"text": text, "sample_rate": int(target_rate)}
         http_request = request.Request(
             self.endpoint,
-            data=json.dumps({"text": text}).encode("utf-8"),
+            data=json.dumps(payload).encode("utf-8"),
             method="POST",
             headers={"Content-Type": "application/json"},
         )

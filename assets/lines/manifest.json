@@ -1,0 +1,38 @@
+{
+  "line-intro": {
+    "file": "line-intro.wav",
+    "text": "Hello. I am BracketBot, an at home care companion. I can talk with you, keep track of your reminders, and help with small tasks around the room. I am not a doctor, so for anything medical I will always point you to a real one.",
+    "voice": "Eddy (English (US))",
+    "rate": 178,
+    "pitch": 4,
+    "bytes": 515026,
+    "sha256": "b45d39d410d953b06e87d32188b4d411ff798ce40e070e73f5e820587fefd707"
+  },
+  "line-capabilities": {
+    "file": "line-capabilities.wav",
+    "text": "Here is what I can do. I can set a reminder and keep it running while I work on something else. I can answer questions out loud. I can wave, shake your hand, or give you a hug if you ask me for one. And I can pick things up from a table and put them away.",
+    "voice": "Eddy (English (US))",
+    "rate": 178,
+    "pitch": 4,
+    "bytes": 552402,
+    "sha256": "9aad943ac2ec41f91749e3289fea0dca37945ff5db7daf2ec05ec59a7fd7a63c"
+  },
+  "line-comfort": {
+    "file": "line-comfort.wav",
+    "text": "You seem a little quiet. I am right here with you, and I am happy to just keep you company for a while. If you would like a hug, ask me for one.",
+    "voice": "Eddy (English (US))",
+    "rate": 178,
+    "pitch": 4,
+    "bytes": 320466,
+    "sha256": "2a146389cccf5055f85d35c4b5d9c44444a0582bf367dfcfa83a6d2da688d421"
+  },
+  "line-farewell": {
+    "file": "line-farewell.wav",
+    "text": "Thank you for spending time with me today. Take good care of yourself, and do not forget your reminder. Goodbye for now.",
+    "voice": "Eddy (English (US))",
+    "rate": 178,
+    "pitch": 4,
+    "bytes": 269782,
+    "sha256": "7f093843a893e7bd16658e47c9a87372a7ac1fcf92a105bd7bfc203765f3807c"
+  }
+}

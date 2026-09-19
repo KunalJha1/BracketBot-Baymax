@@ -156,7 +156,10 @@ def test_http_tts_posts_text_and_decodes_wav():
 
     assert len(pcm) == 1600
     assert requests[0][1] == 3.0
-    assert json.loads(requests[0][0].data) == {"text": "Natural voice."}
+    assert json.loads(requests[0][0].data) == {
+        "text": "Natural voice.",
+        "sample_rate": 16000,
+    }
 
 
 def test_natural_voice_falls_back_when_service_is_unavailable():

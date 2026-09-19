@@ -67,6 +67,7 @@ try:
         RouteKind,
         VoiceRouter,
         default_question_response_cache,
+        default_seed_pairs,
         utterances_match,
     )
     from .pointing import (
@@ -89,6 +90,7 @@ except ImportError:  # ``uv run main.py`` executes this as a standalone script.
         RouteKind,
         VoiceRouter,
         default_question_response_cache,
+        default_seed_pairs,
         utterances_match,
     )
     from pointing import PersonTargetTracker, pointing_goal, quaternion_from_z, quaternion_slerp
@@ -1340,6 +1342,7 @@ def local_voice_session(args):
         model=args.openrouter_model,
         timeout=args.openrouter_timeout,
         response_cache=default_question_response_cache(),
+        seed_pairs=default_seed_pairs(),
     )
     voice_router = VoiceRouter(
         llm,
@@ -1376,6 +1379,7 @@ def local_voice_session(args):
         flush=True,
     )
     last_wake_active = False
+    pending_wake = False
     with Reader("wakeword.state", keeptime=False) as wakeword:
         while not stop_event.is_set():
             triggered = False
@@ -1384,6 +1388,7 @@ def local_voice_session(args):
                 triggered = active and not last_wake_active
                 last_wake_active = active
                 if triggered:
+                    pending_wake = True
                     print("[local-voice] Wake phrase detected; recording...", flush=True)
 
             try:
@@ -1395,6 +1400,12 @@ def local_voice_session(args):
             boosted = (
                 flat.astype(np.float32) * gain
             ).clip(-32768, 32767).astype(np.int16)
+            if pending_wake:
+                # A wake event and a mic frame are produced by independent
+                # daemons. Keep the wake latched until a real audio frame
+                # arrives instead of dropping it when the mic queue is empty.
+                triggered = True
+                pending_wake = False
             if args.local_always_listen and not segmenter.recording:
                 rms = max(1.0, float(np.sqrt(np.mean(boosted.astype(np.float64) ** 2))))
                 dbfs = 20.0 * np.log10(rms / 32768.0)
@@ -1442,6 +1453,7 @@ async def gemini_session(args):
         model=args.openrouter_model,
         timeout=args.openrouter_timeout,
         response_cache=default_question_response_cache(),
+        seed_pairs=default_seed_pairs(),
     )
     voice_router = VoiceRouter(
         llm,
