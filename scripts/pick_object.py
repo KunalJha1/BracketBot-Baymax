@@ -99,6 +99,10 @@ RAISE_CLEARANCE_METRES = 0.03
 # lift sign differs per arm (docs/robot-facts.md).
 REST_LIFT_TURNS = 1.0
 REST_SECONDS = 6.0
+# A healthy gripper reads within its URDF range (0..1 rad, a little slack each
+# side). bracketbot-184's right gripper reads ~2.26 rad, so its grasp feedback
+# is meaningless and that arm must not be trusted to report a hold.
+GRIPPER_VALID_RADIANS = (-0.30, 1.20)
 # Measured on bracketbot-184: grasps solve to 2-6 mm out to ~0.45 m from the
 # shoulder and fail beyond ~0.52 m, where tipping the ~14 cm fingers down
 # costs horizontal reach.
@@ -667,11 +671,28 @@ def execute(plan_only=True, pid_file=None, stop_at=None, adjust=False,
 
     plane, item = scan(Reader)
     check_reach(item)
-    side = "left" if item.center[1] >= 0.0 else "right"
-    cfg = Config(f"arm_{side}")
-    with tr.nonsuppressing(Reader(f"arm_{side}.state", keeptime=False)) as state_reader:
-        start = np.asarray(tr.fresh(state_reader)["pos"], dtype=np.float64).copy()
-    log("state", f"side={side} start={fmt(start)} gripper={gripper_radians(cfg, start):.3f}rad")
+    preferred = "left" if item.center[1] >= 0.0 else "right"
+    rejected = []
+    for side in (preferred, "right" if preferred == "left" else "left"):
+        cfg = Config(f"arm_{side}")
+        with tr.nonsuppressing(Reader(f"arm_{side}.state", keeptime=False)) as state_reader:
+            start = np.asarray(tr.fresh(state_reader)["pos"], dtype=np.float64).copy()
+        radians = gripper_radians(cfg, start)
+        log("state", f"side={side} start={fmt(start)} gripper={radians:.3f}rad")
+        if not GRIPPER_VALID_RADIANS[0] <= radians <= GRIPPER_VALID_RADIANS[1]:
+            rejected.append(f"{side} gripper reads {radians:.2f} rad, outside "
+                            f"{GRIPPER_VALID_RADIANS}; its grasp feedback cannot be trusted")
+            log("state", f"side={side} rejected: {rejected[-1]}")
+            continue
+        shoulder_y = SHOULDER_LATERAL_METRES if side == "left" else -SHOULDER_LATERAL_METRES
+        reach = math.hypot(item.center[0], item.center[1] - shoulder_y)
+        if reach > MAX_REACH_METRES:
+            rejected.append(f"{side} arm would need {reach:.2f} m of reach")
+            log("state", f"side={side} rejected: {rejected[-1]}")
+            continue
+        break
+    else:
+        raise RuntimeError("no usable arm: " + "; ".join(rejected))
 
     failures = []
     options = [(pitch, fraction) for fraction in (1.0, 0.5, 0.0) for pitch in GRASP_PITCHES_DEGREES]

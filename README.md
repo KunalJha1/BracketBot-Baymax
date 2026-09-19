@@ -130,6 +130,7 @@ Controls:
 | Routines | Welcome, thinking, celebrate, goodbye, double wave, calm moment, dance party | `W`, `T`, `C`, `G`, `V`, `K`, `X` |
 | Base mode | Toggle 4° lean / balance | `Z` |
 | Positioning | Detect table and place both arms | `R` |
+| Follow | Follow the person standing in front; distance slider | `F` |
 | Cancellation | Stop the current action/routine safely | `Esc` |
 
 The dashboard uploads only the selected allowlisted asset and its small runner
@@ -137,6 +138,30 @@ to `/tmp` on the active robot. It does not require this repository to be cloned
 on the robot. `ActionSpec` is the common primitive schema, while `RoutineSpec`
 stores ordered action IDs; no browser request or future model output can supply
 an arbitrary command.
+
+## Follow mode (person following)
+
+**Follow me** (`F`) starts `scripts/robot_follow.py` on the robot. Stand
+0.5–2 m in front of it: the only person-sized shape in that zone for half a
+second is locked on. It finds you in the depth camera's 3D points alone (no
+neural network), so it cannot tell you from a pillar or coat rack, and loses
+you if you stand right against a wall or another person. The robot holds the
+**Following distance** slider's gap (0.6–1.5 m, default 1.0 m, measured to the
+front of your torso) to within ±20 cm while you stand, turn, or walk slowly.
+The base is clamped to 0.3 m/s, so it cannot keep pace with normal walking and
+catches up when you pause. It never drives backward, stops for anything in a
+0.6 m corridor ahead, and stops by itself if the dashboard, the link, or
+balance is lost. After losing you for 10 s it locks onto whoever next stands in
+front of it. `Esc` stops it like every other action; `--simulate` exercises the
+dashboard, API, and UI path without a robot (the simulated runner is a scripted
+status generator, not `follow_core`).
+
+Do not use follow mode around people until every robot gate in
+`docs/superpowers/plans/2026-09-19-person-follow-depth-only.md` (Task 5) has
+passed, with a person at the physical e-stop for each gate that moves the
+robot. Until gate G4b passes, the speed cap is 0.15 m/s; `--follow-v-max 0.30`
+and `--follow-rotate-only` exist for the gates. Design:
+`docs/superpowers/specs/2026-09-19-person-follow-design.md`.
 
 ## Run local person and expression detection
 
