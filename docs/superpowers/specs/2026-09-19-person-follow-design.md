@@ -1,8 +1,10 @@
 # Person-follow navigation — design
 
 Status: design approved in conversation 2026-09-19; not implemented; no hardware evidence yet.
-Revised 2026-09-19 after prototyping (see §11). Implementation plan:
-`docs/superpowers/plans/2026-09-19-person-follow.md`.
+Revised 2026-09-19 after prototyping (see §11), then switched to **depth-only
+perception** (no neural network; see §12). Implementation plans:
+`docs/superpowers/plans/2026-09-19-person-follow.md` (Tasks 1–7 done as written),
+`docs/superpowers/plans/2026-09-19-person-follow-depth-only.md` (the change and the rest).
 
 ## 1. Goal
 
@@ -27,9 +29,10 @@ Feasible, with one physical limit.
 | Topic | Decision |
 |---|---|
 | Meaning of "20 cm" | Hold the configured gap to ±20 cm. |
-| Target | A person. |
+| Target | A person, found as a person-sized cluster in the depth point cloud. No neural network, no camera image. |
 | Gap | Adjustable at runtime, 0.6–1.5 m, default 1.0 m. |
-| Lock-on | The person who raises a hand (wrist above nose) for ~0.5 s after follow mode starts. |
+| Lock-on | After Follow is pressed: the only person-sized cluster standing 0.5–2.0 m ahead within ±30° for 0.5 s. |
+| Lost for 10 s | Return to SEARCHING and re-lock automatically on whoever stands in the start zone. |
 | Obstacles | Stop-only corridor guard; no path planning. |
 | Architecture | Everything closed-loop runs on the robot's Jetson; the dashboard only starts/stops, sets the gap, and sends a heartbeat. |
 | Person comes closer than gap − 20 cm | Hold still. **No reversing in v1** (no rear sensing). |
@@ -39,7 +42,9 @@ Feasible, with one physical limit.
 - Keeping up with normal walking speed; changing the daemon speed clamp.
 - Driving backward, steering around obstacles, map/SLAM-based planning.
 - Following through doors/corners after the person leaves the camera's view.
-- Re-identifying a person after a long absence (> 10 s) — they raise a hand again.
+- Re-identifying a person after a long absence (> 10 s) — whoever stands in the start zone is locked next.
+- Telling a person apart from person-sized objects (pillars, coat racks, tall plants), or from a
+  wall or another person within ~15 cm of them.
 - Voice start/stop, sound cues (the speaker would be a second hardware writer).
 - Arm motion of any kind during follow.
 - Using facial-expression estimates for anything.
@@ -51,8 +56,7 @@ laptop: robot_dashboard.py ──SSH stdin (JSON lines: gap, heartbeat, stop)─
                           ◄──SSH stdout (FOLLOW_STATUS json, 5 Hz)──────┐  │
                                                                         │  ▼
 robot (Jetson, bbos venv, files in /tmp):                          robot_follow.py (runner)
-  camera.rect ───────► follow_perception: pose engine → persons ──┐
-  camera.points ─────► follow_perception: torso range/bearing ────┤
+  camera.points ─────► follow_perception: person-sized clusters ──┐
   imu.orientation, drive.state (odometry) ────────────────────────┤
                                                                   ▼
                                       follow_core: Tracker → Controller → Supervisor
@@ -66,18 +70,16 @@ robot (Jetson, bbos venv, files in /tmp):                          robot_follow.
 | File | Runs on | Responsibility | Depends on |
 |---|---|---|---|
 | `scripts/follow_core.py` | robot + laptop | Pure logic: data types, lock-on, tracker, controller, supervisor, obstacle corridor, state machine, command parsing. **No BBOS, no TensorRT imports.** | numpy |
-| `scripts/follow_perception.py` | robot (decode also on laptop) | Pose engine wrapper (TensorRT via pycuda, imported lazily), pure pose-output decode + NMS, person → base-frame torso position from `camera.points`. | numpy; tensorrt/pycuda on robot only |
-| `scripts/robot_follow.py` | robot | Runner: BBOS readers/writers, main loop, signals, pid file, stdin/stdout protocol, CSV log, zero-twist exit. Thin — no decisions. | bbos, the two modules above |
+| `scripts/follow_perception.py` | robot + laptop | Base-frame → robot-local conversion and person-sized cluster finding in the point cloud. Pure numpy. | numpy |
+| `scripts/robot_follow.py` | robot | Runner: BBOS readers/writers, main loop, signals, pid file, stdin/stdout protocol, CSV log, zero-twist exit. Thin — no decisions. | bbos, numpy, the two modules above |
 | `scripts/robot_dashboard.py` | laptop | Follow card, start/stop, gap slider, heartbeat, status parsing, resource exclusion, `--simulate` fake runner. | existing dashboard |
 | `scripts/probe_follow.py` | robot | Read-only gate G0 probe: topic rates/fields, configs, self points, base x sign. | bbos |
-| `scripts/check_follow_alignment.py` | laptop | Gate G0: overlays depth edges on the `camera.rect` frame. | vision extra |
-| `scripts/build_pose_engine.sh` | robot | Gate G1: builds the TensorRT engine with `trtexec` and records versions. | JetPack |
 
 The runner and both modules are deployed to `/tmp` by the existing `_deploy`
 path, like `robot_base_mode.py`, and import each other by bare name (the
-script's directory is on `sys.path`). The runner is a PEP 723 script launched
-with `uv run --script`; its dependency block mirrors `bbapps/greeter/main.py`,
-the app already proven to run TensorRT through PyCUDA on this robot.
+script's directory is on `sys.path`). The runner needs only BBOS and numpy, so it
+runs in the robot's BBOS venv through the dashboard's existing
+`remote_python_command`, exactly like `robot_base_mode.py`.
 
 ### 5.2 Base-frame convention
 
@@ -92,36 +94,28 @@ verified at G0 and the ω sign at G3.
 
 ### 6.1 Perception (`follow_perception.py`)
 
-- **Model:** committed `yolo11n-pose.pt` → ONNX (opset 17, done locally) →
-  TensorRT FP16 engine **built on the Jetson** (`trtexec`), stored at
-  `~/.cache/baymax/yolo11n-pose.engine` with a sidecar recording JetPack,
-  TensorRT, input size, precision, and the checkpoint SHA-256. Never copied
-  between machines (see `docs/yolo-robot-port.md`).
-- **Input image:** `camera.rect` (rectified left eye), expected to be pixel-aligned
-  with `camera.depth` up to a scale factor. Fallback if G0 shows it is not: the left
-  half of `camera.head.rgb`, with each `camera.points` point projected into that raw
-  fisheye eye (`cv2.fisheye.projectPoints` with the left intrinsics, the stereo
-  rectification `R1`, and `Config("depth").camera_to_base_3x4`).
-- **Decode:** output `(1, 56, 8400)` → boxes, confidence, 17 COCO keypoints
-  (x, y, conf); confidence ≥ 0.40; NMS IoU 0.5. Pure numpy, unit-tested on
-  synthetic tensors and cross-checked against Ultralytics' own postprocessing of
-  the committed checkpoint (skipped when Ultralytics is not installed).
-- **Person position:** collect `camera.points` whose `mask` pixel lies inside the
-  torso rectangle (bounding rectangle of shoulders 5/6 and hips 11/12, at least 25%
-  of the box wide; the middle third of the box if keypoints are low-confidence) and
-  whose height is 0.2–2.0 m. Require ≥ 40 points; take the per-axis median →
-  `(forward, left)`, `range = hypot`, `bearing` per 5.2.
-  Depth and points frames must share a timestamp; the RGB frame used for detection
-  must be within 50 ms of it, otherwise the observation is dropped.
-- **Hand raised:** either wrist (9/10) with conf ≥ 0.5 is above the nose (0) in the
-  image by at least 10% of the person's box height, nose conf ≥ 0.5.
-- **Torso appearance:** 4×4×4 hue/saturation/value histogram (64 bins) of the torso
-  rectangle, L1-normalised. Value is included because hue/saturation alone cannot
-  tell black clothing from white.
+Depth only. Every new `camera.points` frame is converted to robot-local
+`(forward, left, up)` (5.2) and searched for person-sized clusters:
 
-Output per frame: `Perception(t, people, points)` with
-`PersonObservation(forward, left, score, hand_raised, hist)` per located person and
-the whole cloud in robot-local coordinates for the corridor check.
+1. **Crop:** keep points 0.10–2.0 m high, 0.3–3.5 m ahead, and within ±2.5 m
+   to the side (drops floor, ceiling, and far clutter).
+2. **Grid:** bin the kept points into a 10 cm floor grid over (forward, left); a
+   cell with at least 3 points is occupied.
+3. **Cluster:** group occupied cells that touch (8-neighbour connectivity).
+4. **Person-sized:** footprint extent at most 0.8 m in both forward and left, at
+   least 0.15 m in one of them; highest point at least 1.2 m; at least 60 points.
+5. **Position:** per-axis median of the cluster's points 0.8–1.6 m high (the
+   torso), or of all its points if fewer than 10 are in that band.
+
+All values live in a frozen `ClusterConfig` in `follow_perception.py`. Output
+per frame: `Perception(t, people, points)` with one
+`PersonObservation(forward, left, score=1.0, hist=None)` per person-sized
+cluster and the whole cloud in robot-local coordinates for the corridor check.
+Pure numpy; a few milliseconds per frame on the Jetson CPU.
+
+Known limits (accepted): any tall, narrow object (pillar, coat rack, tall plant)
+is person-sized; a person within ~10–15 cm of a wall or another person merges
+with it into one cluster that is either too wide (rejected) or displaced.
 
 ### 6.2 Tracker (`follow_core.Tracker`)
 
@@ -129,19 +123,20 @@ the whole cloud in robot-local coordinates for the corridor check.
   π·wheel_diam per wheel; wheel signs verified at G3/G4a).
   Person positions are transformed into this frame so that the robot's own motion is
   not mistaken for the person moving.
-- **Lock-on (SEARCHING):** candidates within range 0.5–2.5 m and |bearing| ≤ 60°.
-  A candidate with `hand_raised` in ≥ 80% of observations over a 0.5 s window,
-  associated frame-to-frame by nearest position (≤ 0.3 m), is locked. If two
-  candidates qualify at once, lock neither and keep waiting.
+- **Lock-on (SEARCHING):** candidates within range 0.5–2.0 m and |bearing| ≤ 30°,
+  associated frame-to-frame by nearest position (≤ 0.3 m). A candidate seen for
+  at least 0.5 s and present in ≥ 80% of the frames of the last 0.5 s is locked.
+  If two candidates qualify at once, lock neither and keep waiting.
 - **Tracking:** constant-velocity Kalman filter on (x, y, vx, vy) in odometry frame
   (measurement σ 0.08 m, acceleration σ 1 m/s², position σ capped at 1 m so the gate
   stays bounded while coasting; on LOST the velocity is zeroed and position σ grows
   by 0.5 m).
-  Association gate: Mahalanobis distance ≤ 3σ **and** histogram Bhattacharyya
-  distance ≤ 0.4 against a slowly updated reference (α = 0.05, updated only on
-  unambiguous matches). If two observations fall inside the gate with scores within
-  10% of each other, treat the frame as **ambiguous**: coast, don't update.
-- Hand raises by other people while locked are ignored.
+  Association gate: Mahalanobis distance ≤ 3σ. (The tracker also supports a
+  histogram appearance gate, but depth-only perception supplies no histogram, so
+  association is by position and motion alone.) If two observations fall inside
+  the gate with scores within 10% of each other, treat the frame as **ambiguous**:
+  coast, don't update.
+- Other people entering the start zone while one person is locked are ignored.
 - **Output:** `Track(t, x, y, range, bearing, v_radial, age_since_update)` where
   `v_radial` is the person's velocity component along the robot→person direction
   (positive = moving away), or `None`.
@@ -187,8 +182,7 @@ No track update for > 1.0 s moves the state machine to LOST (6.6).
 **Start preconditions** (runner refuses and exits non-zero with a reason):
 IMU upright; `camera.points` fresh; no known `drive.ctrl` writer running
 (`pgrep -af` for `greeter/main.py`, `nav/main.py`, `bbapps/teleop.py`,
-`quest_teleop/main.py`, `leader_follower_teleop.py`, `live_inference.py`); `drive.status.voltage` ≥ `Config("base").low_battery_v`;
-pose engine loads and one warm-up inference completes.
+`quest_teleop/main.py`, `leader_follower_teleop.py`, `live_inference.py`); `drive.status.voltage` ≥ `Config("base").low_battery_v`.
 
 **Exit:** in `finally`, write a zero twist 6 times at 20 ms intervals with pacing
 disabled (`keeptime=False`), set LEDs off, remove pid file.
@@ -243,7 +237,8 @@ All in one frozen `FollowConfig` dataclass in `follow_core.py`.
 | `self_mask` | `()` | robot-body boxes in the depth cloud, filled in from G0 |
 | `odom_mismatch_time` | 0.5 s | |
 | `meas_sigma` / `accel_sigma` / `max_pos_sigma` / `lost_pos_sigma` | 0.08 m / 1.0 m/s² / 1.0 m / 0.5 m | tracker |
-| `lock_window` / `lock_fraction` | 0.5 s / 0.8 | |
+| `lock_window` / `lock_fraction` | 0.5 s / 0.8 | presence fraction over the window |
+| `lock_range_min` / `lock_range_max` / `lock_bearing_max` | 0.5 / 2.0 m / 30° | start zone |
 
 ## 7. Dashboard ↔ runner protocol
 
@@ -262,12 +257,13 @@ gaps are clamped and the clamped value is reported back.
 at 5 Hz:
 
 ```text
-FOLLOW_STATUS {"state":"FOLLOWING","range":1.07,"gap":1.0,"error":0.07,"bearing_deg":-4.2,"v":0.08,"w":-0.1,"blocked":false,"age_ms":60}
+FOLLOW_STATUS {"state":"FOLLOWING","range":1.07,"gap":1.0,"error":0.07,"bearing_deg":-4.2,"v":0.08,"w":-0.1,"blocked":false,"age_ms":60,"rule":"ok"}
 ```
 
 **Dashboard behaviour:**
 - Follow card: Start/Stop toggle (key `F`), gap slider 0.6–1.5 m (step 0.1),
-  status line (state, range, gap error), last reason for refusal/exit.
+  status line (state, range, gap error; while SEARCHING: "stand in front of the
+  robot"), last reason for refusal/exit.
 - Follow holds the `base`, `led`, and `camera` resources: it is mutually exclusive
   with Lean and every gesture/routine; LED actions are disabled while it runs. The
   dashboard refuses to start Follow while Lean is active (the Lean runner is the only
@@ -289,8 +285,8 @@ points, track age, supervisor rule fired.
 All laptop tests run under the existing pytest suite; none require the robot.
 
 1. **`tests/test_follow_core.py`**
-   - Lock-on: raised hand ≥ 0.5 s locks; 0.3 s does not; two simultaneous raisers
-     lock neither; a bystander's raise while locked is ignored.
+   - Lock-on: a person in the start zone for ≥ 0.5 s locks; 0.3 s does not; two
+     people in the zone lock neither; people outside the zone are ignored.
    - Association: a bystander crossing between robot and target does not take the
      track; ambiguous frames coast.
    - Controller: deadband, `cos(bearing)` scaling, turn-in-place above 35°,
@@ -313,9 +309,10 @@ All laptop tests run under the existing pytest suite; none require the robot.
    - Obstacle appears: BLOCKED within one supervisor tick of corridor detection.
    - Stale/absent heartbeat: stops.
    This is **simulation evidence**, reported as such, never as hardware evidence.
-3. **`tests/test_follow_perception.py`** — pose decode on a stored ONNX Runtime
-   output fixture from the committed checkpoint; torso-median range on a synthetic
-   point cloud; timestamp-mismatch rejection.
+3. **`tests/test_follow_perception.py`** — synthetic point clouds: a standing
+   person is found at the right position; floor, a table, a wall, and a short box
+   are not; two separated people give two clusters; a person far beyond 3.5 m and
+   an empty cloud give none.
 4. **`tests/test_robot_dashboard.py`** additions — Follow start/stop in simulate
    mode, exclusion with Lean/gestures/LED actions, gap validation, heartbeat thread
    lifecycle, status parsing.
@@ -327,9 +324,9 @@ are recorded in `docs/robot-facts.md` with date and robot ID.
 
 | Gate | Procedure | Pass criterion |
 |---|---|---|
-| G0 — read-only probe | Depth daemon running? `camera.depth`/`camera.points` rate; `camera.rect` shape and alignment with depth; base-frame x sign; wheel/`drive.state.vel` sign; drive clamp and command timeout from `Config("drive")`; self points (arms at home) inside the corridor. | All values recorded; self-mask defined. |
-| G1 — pose engine | Build engine with `trtexec` on the Jetson; run decode on a real frame. | Warm latency ≤ 50 ms; person detected with keypoints. |
-| G2 — dry run | `robot_follow.py --dry-run` (never opens `drive.ctrl`). Person stands at taped marks 0.6 / 1.0 / 1.5 m straight ahead and ±30°. | Range within ±5 cm of tape at every mark; lock-on works; bystander crossing doesn't steal the track. |
+| G0 — read-only probe | Depth daemon running? `camera.depth`/`camera.points` rate; base-frame x sign; drive clamp and command timeout from `Config("drive")`; self points (arms at home) inside the corridor; `robot_follow.py --check` lists clusters (none with the area clear, one near 1.0 m with a person there). | All values recorded; self-mask defined. |
+| G1 | Removed with the switch to depth-only perception (there is no TensorRT engine). | — |
+| G2 — dry run | `robot_follow.py --dry-run` (never opens `drive.ctrl`). Person stands at taped marks 0.6 / 1.0 / 1.5 m straight ahead and ±30°; then 0.3 m beside a wall, next to a chair, and next to any pillar or coat rack; a bystander walks past 0.3 m to the side. | Range within ±5 cm of tape at every mark; lock-on works; the chair is not a cluster; the wall case still finds the person; bystander doesn't steal the track; which tall objects count as people is recorded. |
 | G3 — rotate only | `--rotate-only` (v forced to 0). Person walks an arc around the robot. | Keeps person within ±10° bearing at walking pace. |
 | G4a — follow, 0.15 m/s | Open floor. Person stands, steps back 0.5 m repeatedly, strolls slowly. | ≥ 95% of FOLLOWING samples within ±20 cm while the person moves ≤ 0.10 m/s; settled tape measurements agree with logged range within 5 cm. |
 | G4b — follow, 0.30 m/s | Same, `v_max` = 0.30. | Same criterion for person speed ≤ 0.25 m/s; no visible balance instability. |
@@ -344,15 +341,17 @@ previously shifted another robot's point cloud by 0.78 m.
 | Risk | Mitigation |
 |---|---|
 | Person walks faster than 0.3 m/s | Documented limit; gap reopens; dashboard shows the error. |
-| `camera.rect` absent or misaligned with depth | Fisheye-eye fallback path (6.1); decided at G0. |
+| A pillar, coat rack, or bystander is person-sized | Start in open space; auto re-lock after 10 s LOST can pick them (user choice); G2 records which objects count. |
+| Person merges with a wall or another person within ~15 cm | Cluster rejected or displaced → LOST; documented limit. |
 | Point-cloud calibration drift | G2 tape check after every reflash. |
 | Braking/acceleration pitch shakes the camera | Depth daemon compensates with IMU pitch; conservative ramps; check at G4. |
 | Robot's own arms/wheels in the depth cloud | Self-mask from G0; arms must be idle and at home. |
 | Another app writes `drive.ctrl` | Start precondition process check; dashboard exclusivity. |
-| TensorRT/pycuda API differences on the installed JetPack | Resolved at G1 before any motion work. |
-| Poor lighting, back-lit person, loose clothing hiding keypoints | Box-based torso fallback; LOST handling; out-of-scope beyond that. |
+| Stereo depth weak on untextured clothing or in poor light | Person cluster thins below 60 points → LOST; checked at G2. |
 
 ## 11. Revisions after prototyping (2026-09-19)
+
+(The perception-related items below are superseded by §12.)
 
 The core logic, perception decode, runner argument handling, and dashboard
 integration were prototyped and tested before the plan was written. The
@@ -372,3 +371,24 @@ Changes from the first draft:
   keypoints.
 - The dashboard's Esc handler runs before the "focused input" early return, so
   Esc stops the robot even while the gap slider has focus.
+
+## 12. Revision: depth-only perception (2026-09-19)
+
+Requested after Tasks 1–7 of the first plan were implemented: follow without an
+object detector. SLAM was considered: it localises the robot, not the person,
+so it cannot replace person detection; it could replace wheel odometry, which is
+not needed at these speeds and distances. Map-based trail following (the only
+approach that needs SLAM) is out of scope because corners are.
+
+What changed:
+- Perception is §6.1's depth clustering; the YOLO pose engine, keypoints, hand
+  raise, torso colour histogram, `camera.rect`, and the fisheye fallback are gone.
+- Lock-on is presence in a start zone (0.5–2.0 m, ±30°, 0.5 s) instead of a raised
+  hand. `PersonObservation` loses `hand_raised`.
+- After 10 s LOST the robot re-locks automatically (user's choice over stopping).
+- The runner needs only BBOS + numpy and runs in the BBOS venv like the Lean runner;
+  gate G1 and the TensorRT/fisheye tooling are removed.
+- Bystander rejection relies on position and motion only. In the closed-loop
+  simulation with no appearance cue, a bystander crossing in front and one passing
+  0.3 m beside the target kept the right person in 20/20 seeds each — simulation
+  evidence only; it does not model clusters merging.
