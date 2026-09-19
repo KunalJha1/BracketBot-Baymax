@@ -40,8 +40,8 @@ FAST = dataclasses.replace(CFG, v_max=0.30)
 FRAME = 1 / 15
 
 
-def person(forward, left=0.0, raised=False, hist=None):
-    return PersonObservation(forward, left, 0.9, raised, hist)
+def person(forward, left=0.0, hist=None):
+    return PersonObservation(forward, left, hist=hist)
 
 
 def onehot(index):
@@ -87,8 +87,8 @@ def run_lock_on(frames):
     return None
 
 
-def test_hand_raised_for_half_a_second_locks_that_person():
-    frames = [[person(1.2, 0.1, raised=True), person(1.5, -0.6)] for _ in range(15)]
+def test_person_in_the_start_zone_for_half_a_second_is_locked():
+    frames = [[person(1.2, 0.1), person(1.5, -0.95)] for _ in range(15)]  # the second is 32 degrees off-axis
     locked = run_lock_on(frames)
     assert locked is not None
     t, (obs, xy) = locked
@@ -96,21 +96,28 @@ def test_hand_raised_for_half_a_second_locks_that_person():
     assert xy == pytest.approx((1.2, 0.1))
 
 
-def test_brief_raise_does_not_lock():
-    frames = [[person(1.2, raised=i < 4)] for i in range(20)]
+def test_brief_presence_does_not_lock():
+    frames = [[person(1.2)] if i < 4 else [] for i in range(20)]
     assert run_lock_on(frames) is None
 
 
-def test_two_people_raising_hands_lock_neither():
-    frames = [[person(1.2, 0.5, raised=True), person(1.2, -0.5, raised=True)] for _ in range(20)]
+def test_flickering_candidate_does_not_lock():
+    frames = [[person(1.2)] if i % 3 == 0 else [] for i in range(30)]
     assert run_lock_on(frames) is None
 
 
-def test_people_outside_lock_zone_are_ignored():
-    far = [[person(3.0, raised=True)] for _ in range(20)]
-    wide = [[person(0.5, 1.2, raised=True)] for _ in range(20)]
+def test_two_people_in_the_zone_lock_neither():
+    frames = [[person(1.2, 0.3), person(1.2, -0.3)] for _ in range(20)]
+    assert run_lock_on(frames) is None
+
+
+def test_people_outside_the_start_zone_are_ignored():
+    far = [[person(2.3)] for _ in range(20)]
+    wide = [[person(1.0, 0.8)] for _ in range(20)]  # 39 degrees off-axis
+    near = [[person(0.4)] for _ in range(20)]
     assert run_lock_on(far) is None
     assert run_lock_on(wide) is None
+    assert run_lock_on(near) is None
 
 
 # --- tracker --------------------------------------------------------------
@@ -309,7 +316,7 @@ def test_loop_locks_on_then_follows():
         t = i * 0.02
         frame = None
         if i % 3 == 0:
-            frame = Perception(t, (person(1.6, raised=t < 1.0),), np.empty((0, 3)))
+            frame = Perception(t, (person(1.6),), np.empty((0, 3)))
         out = loop.tick(tick_inputs(t, perception=frame))
     assert out.state == FOLLOWING
     assert out.v > 0.0

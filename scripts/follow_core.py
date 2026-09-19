@@ -69,10 +69,10 @@ class FollowConfig:
     self_mask: tuple[tuple[float, float, float, float, float, float], ...] = ()
     # Lock-on
     lock_window: float = 0.5
-    lock_fraction: float = 0.8
+    lock_fraction: float = 0.8  # share of the window's frames the candidate must appear in
     lock_range_min: float = 0.5
-    lock_range_max: float = 2.5
-    lock_bearing_max: float = math.radians(60.0)
+    lock_range_max: float = 2.0
+    lock_bearing_max: float = math.radians(30.0)
     lock_assoc_dist: float = 0.3
     # Tracking
     gate_sigma: float = 3.0
@@ -122,9 +122,8 @@ class Pose2D:
 class PersonObservation:
     forward: float
     left: float
-    score: float
-    hand_raised: bool
-    hist: np.ndarray | None = None  # (64,) L1-normalised 4x4x4 HSV torso histogram
+    score: float = 1.0
+    hist: np.ndarray | None = None  # optional appearance cue; depth-only perception leaves it None
 
     @property
     def range(self):
@@ -218,18 +217,20 @@ class ConstantVelocityKF:
 
 
 class LockOn:
-    """Chooses the single person who keeps a hand raised for ``lock_window`` seconds."""
+    """Chooses the single person who stays in the start zone for ``lock_window`` seconds."""
 
     def __init__(self, cfg):
         self.cfg = cfg
-        self.candidates = []
+        self.reset()
 
     def reset(self):
         self.candidates = []
+        self.frames = []  # times of the frames seen while searching
 
     def update(self, t, people, positions):
         """Returns ``(observation, odom_xy)`` of the locked person, or None."""
         cfg = self.cfg
+        self.frames.append(t)
         used = set()
         for obs, xy in zip(people, positions):
             if not (cfg.lock_range_min <= obs.range <= cfg.lock_range_max):
@@ -242,23 +243,23 @@ class LockOn:
                 if i not in used and d <= best_d:
                     best, best_d = i, d
             if best is None:
-                self.candidates.append({"xy": xy, "first_t": t, "samples": [], "obs": obs})
+                self.candidates.append({"xy": xy, "first_t": t, "seen": [], "obs": obs})
                 best = len(self.candidates) - 1
             cand = self.candidates[best]
             cand["xy"], cand["obs"] = xy, obs
-            cand["samples"].append((t, obs.hand_raised))
+            cand["seen"].append(t)
             used.add(best)
 
         horizon = t - cfg.lock_window
-        self.candidates = [c for c in self.candidates if c["samples"][-1][0] >= horizon]
+        self.frames = [f for f in self.frames if f >= horizon]
+        self.candidates = [c for c in self.candidates if c["seen"][-1] >= horizon]
         qualified = []
         for cand in self.candidates:
-            cand["samples"] = [s for s in cand["samples"] if s[0] >= horizon]
-            raised = [r for _, r in cand["samples"]]
-            if t - cand["first_t"] >= cfg.lock_window and sum(raised) >= cfg.lock_fraction * len(raised):
+            cand["seen"] = [s for s in cand["seen"] if s >= horizon]
+            if t - cand["first_t"] >= cfg.lock_window and len(cand["seen"]) >= cfg.lock_fraction * len(self.frames):
                 qualified.append(cand)
         if len(qualified) != 1:
-            return None  # nobody yet, or two people at once: keep waiting
+            return None  # nobody yet, or two people in the zone: keep waiting
         return qualified[0]["obs"], qualified[0]["xy"]
 
 

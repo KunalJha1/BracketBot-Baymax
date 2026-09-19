@@ -1,7 +1,8 @@
 """Closed-loop kinematic simulation of FollowLoop.
 
 SIMULATION EVIDENCE ONLY. The robot is a unicycle with a first-order velocity
-lag; perception is 15 Hz with 100 ms latency and Gaussian range/bearing noise.
+lag; perception is 15 Hz with 100 ms latency and Gaussian range/bearing noise,
+and observations carry no appearance cue (as with depth-only perception).
 Passing here says the logic and tuning are coherent, not that the robot works.
 """
 
@@ -23,12 +24,6 @@ DT = 0.02
 FRAME_EVERY = 1 / 15
 LATENCY = 0.10
 LAG = 0.15  # balancing base velocity response time constant (s)
-TARGET_HIST = np.eye(64)[3]
-BYSTANDER_HIST = np.eye(64)[40]
-
-
-def raised_for_first_second(t):
-    return t < 1.0
 
 
 @dataclass
@@ -82,17 +77,16 @@ def run(scenario, cfg=CFG, gap=1.0):
             next_frame += FRAME_EVERY
             capture_t = t
             people = []
-            actors = [(scenario.target, TARGET_HIST, scenario.visible(t))]
+            actors = [(scenario.target, scenario.visible(t))]
             if scenario.bystander is not None:
-                actors.append((scenario.bystander, BYSTANDER_HIST, True))
-            for path, hist, visible in actors:
+                actors.append((scenario.bystander, True))
+            for path, visible in actors:
                 if not visible:
                     continue
                 f, l = robot.to_local(*path(t))
                 r = math.hypot(f, l) + rng.normal(0, 0.025)
                 b = math.atan2(l, f) + rng.normal(0, math.radians(1.0))
-                raised = path is scenario.target and raised_for_first_second(t)
-                people.append(PersonObservation(r * math.cos(b), r * math.sin(b), 0.9, raised, hist))
+                people.append(PersonObservation(r * math.cos(b), r * math.sin(b)))
             points = np.empty((0, 3))
             box = scenario.obstacle(t)
             if box is not None:
