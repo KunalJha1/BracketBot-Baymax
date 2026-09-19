@@ -384,7 +384,7 @@ class ExpressionAnalyzer:
         expression_models: Path | list[Path],
         smoothing: float = 0.25,
         face_confidence: float = 0.75,
-        min_face_size: int = 40,
+        min_face_size: int = 32,
     ) -> None:
         if isinstance(expression_models, Path):
             expression_models = [expression_models]
@@ -1445,7 +1445,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-face-size",
         type=int,
-        default=40,
+        default=32,
         help="skip expression cues for faces smaller than this many pixels",
     )
     parser.add_argument(

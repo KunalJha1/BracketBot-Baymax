@@ -11,8 +11,8 @@ or replace qualified care.
 
 ## What works today
 
-- An accessible local dashboard with a typed allowlist of 18 primitive actions:
-  seven gestures, adaptive two-arm table positioning, five light expressions,
+- An accessible local dashboard with a typed allowlist of 19 primitive actions:
+  eight gestures, adaptive two-arm table positioning, five light expressions,
   three sound cues, and two original instrumental music cues.
 - Seven deterministic multi-step routines, including **welcome**,
   **double wave**, **calm moment**, and **dance party**, built from the same
@@ -52,8 +52,9 @@ or replace qualified care.
 - An existing Gemini-powered greeter and provider-ready inference code with
   OpenAI and Google client dependencies.
 - Deterministic greeter voice commands for **wave**, **salute**, **handshake**,
-  **fist bump**, and **hug**, with non-action speech routed to OpenRouter when
-  configured.
+  **fist bump**, **hug**, **namaste**, pointing, dance, and safe **stop**, with
+  non-action speech routed to OpenRouter when configured. The lightweight local
+  assistant also exposes the existing light, sound, music, and routine catalog.
 
 ## Start the gesture dashboard
 
@@ -107,11 +108,22 @@ python3 scripts/robot_dashboard.py --simulate
 Simulation uses the real allowlist, API, sequencing state machine, progress,
 and stop path, but never opens SSH or writes to BBOS.
 
+### Run the orchestrated judge demo
+
+The dashboard includes a guided **first-minute demo** with a shared clock and
+presenter cue cards, followed by the existing three-part robot sequence:
+welcome, background packing with conversation and non-arm expressions still
+available, then a finale that waits for the packing process to release the
+robot. Rehearse the whole flow in simulation, or connect a safe packing wrapper
+with `--demo-pack-command`. Operator cues, the packing-process contract, and
+failure behavior are in
+[`docs/judge-demo.md`](docs/judge-demo.md).
+
 Controls:
 
 | Family | Actions | Keyboard |
 | --- | --- | --- |
-| Gestures | Wave, handshake, fist bump, hug, salute, point at person, dance | `1`–`4`, `S`, `O`, `D` |
+| Gestures | Wave, handshake, fist bump, hug, namaste, salute, point at person, dance | `1`–`4`, `N`, `S`, `O`, `D` |
 | Lights | Calm, ready, thinking, celebrate, off | `5`–`9` |
 | Sounds | Processing, birthday, battery reminder | `P`, `B`, `L` |
 | Music | Original calm and upbeat instrumentals | `M`, `U` |
@@ -290,8 +302,9 @@ model-authored tool argument cannot independently authorize motion:
 1. An exact, normalized phrase from the local allowlist starts one installed
    gesture without depending on network availability. Examples include
    “Baymax, give me a hug”, “give me a salute”, “wave at me”, “BracketBot,
-   bye” (wave, then disable torque on both arms), “BracketBot,
-   dance”, and “point at a person”.
+   bye” (wave, then disable torque on both arms), “BracketBot, namaste”,
+   “BracketBot, dance”, and “point at a person”. “Hey BracketBot, stop”
+   bypasses the model and safely cancels the active voice action.
 2. For a natural but still explicit request such as “Could you do a friendly
    wave hello?”, GPT-OSS can call the typed `perform_gesture` tool. The tool
    only accepts named allowlisted gestures, re-checks the finalized transcript,
@@ -330,6 +343,9 @@ OPENROUTER_API_KEY=...
 OPENROUTER_MODEL=openai/gpt-oss-20b
 BROWSERBASE_API_KEY=...
 BAYMAX_VOICE_BACKEND=local
+# Optional: defaults shown below
+BAYMAX_RESPONSE_CACHE_PATH=~/.cache/bracketbot/question-responses.sqlite3
+BAYMAX_RESPONSE_CACHE_TTL_DAYS=30
 ```
 
 Install the key-free local speech runtime once on the robot:
@@ -360,12 +376,40 @@ This is necessary when the robot is running its own hotspot and has no direct
 internet route. Stop the script with Ctrl-C to stop both the assistant and the
 proxy.
 
+Before a heart-rate scan, checkup, handshake, fist bump, or hug, the assistant
+finds the person with `scripts/person_tracker.py`. If nobody is centred in the
+head camera it turns in place (never drives), first toward where it last saw
+someone, then in 60° steps for at most one look around, and asks the person to
+come closer or step back when their face is out of range. It refuses to turn
+when the robot is not upright, is in lean mode, or another app is driving; say
+"stop" to end the turn. Pass `--no-person-finder` to disable turning.
+
+The private-link TTS bridge defaults to the cheerful macOS voice
+`Eddy (English (US))` at 178 words per minute, with a subtle `+4` baseline
+pitch lift for a lighter sound. Override any setting without editing code, for
+example:
+
+```sh
+BAYMAX_TTS_VOICE="Reed (English (US))" BAYMAX_TTS_RATE=170 BAYMAX_TTS_PITCH=0 \
+  ./scripts/run_robot_local_voice.sh
+```
+
+`BAYMAX_TTS_PITCH` accepts `-10` through `10`; use `0` for the voice's natural
+pitch.
+
+When the Gemini voice backend is selected, `BAYMAX_GEMINI_VOICE` defaults to
+the upbeat `Puck` voice.
+
 `OPENROUTER_MODEL` is optional and defaults to `openai/gpt-oss-20b`, which is
 well suited to the assistant's short, simple spoken queries. Browserbase is
 optional for ordinary conversation but required for live web answers. Without
 an OpenRouter key, allowlisted gestures still work and questions receive a
-short configuration message. Run all gesture tests in simulation/dry-run first
-and keep a person beside the physical e-stop when voice motion is enabled.
+short configuration message unless an exact answer is already cached. Stable,
+standalone questions are cached for 30 days; current-information questions,
+context-dependent follow-ups, and any response that uses a tool are never
+cached. Set `BAYMAX_RESPONSE_CACHE_PATH=off` to disable the cache. Run all
+gesture tests in simulation/dry-run first and keep a person beside the physical
+e-stop when voice motion is enabled.
 
 Local voice waits for the installed “Hey BracketBot” wake-word daemon, keeps a
 1.5-second post-wake listening grace period, then records until 1.5 seconds of
@@ -374,6 +418,19 @@ submitting the query early. It transcribes with the English Whisper base model
 and speaks the routed answer with eSpeak. For microphone debugging only,
 `uv run main.py --voice-backend local --local-always-listen` bypasses the wake
 word and starts on any speech; do not use that mode in a noisy public space.
+
+The lightweight local assistant also supports deterministic, persistent timers
+and reminders. For the demo, say “Hey BracketBot, remind me in 4 minutes to
+take my meds.” BracketBot confirms immediately, keeps the countdown running
+independently while other robot actions are demonstrated, then flashes amber
+and speaks “Reminder: take my meds.” “Set a timer for four minutes” uses the
+same path, “what reminders do I have?” lists pending entries, and “cancel my
+reminder” cancels them. Pending reminders survive assistant restarts in a local
+SQLite database. Due times are stored in UTC with their IANA timezone, and a
+local audit trail records scheduling, recovery, cancellation, and delivery.
+Set `BAYMAX_REMINDER_DB_PATH` and `BAYMAX_TIMEZONE` to override the defaults.
+These reminders are coordination aids, not medical advice or a clinical
+medication schedule.
 
 ## Run the contactless heart-rate check
 

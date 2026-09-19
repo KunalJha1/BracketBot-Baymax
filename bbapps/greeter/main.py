@@ -56,11 +56,19 @@ from bbos import Reader, Writer, Type, Config
 try:
     from .gesture_safety import depth_clearance, spoken_safety_refusal
     from .gesture_runtime import (
+        arm_motion_reserved,
         prepare_recorded_movement,
         play_recorded_movement,
+        recorded_movement_name,
         set_arms_limp,
     )
-    from .voice_router import OpenRouterClient, RouteKind, VoiceRouter, utterances_match
+    from .voice_router import (
+        OpenRouterClient,
+        RouteKind,
+        VoiceRouter,
+        default_question_response_cache,
+        utterances_match,
+    )
     from .pointing import (
         PersonTargetTracker,
         pointing_goal,
@@ -69,8 +77,20 @@ try:
     )
 except ImportError:  # ``uv run main.py`` executes this as a standalone script.
     from gesture_safety import depth_clearance, spoken_safety_refusal
-    from gesture_runtime import prepare_recorded_movement, play_recorded_movement, set_arms_limp
-    from voice_router import OpenRouterClient, RouteKind, VoiceRouter, utterances_match
+    from gesture_runtime import (
+        arm_motion_reserved,
+        prepare_recorded_movement,
+        play_recorded_movement,
+        recorded_movement_name,
+        set_arms_limp,
+    )
+    from voice_router import (
+        OpenRouterClient,
+        RouteKind,
+        VoiceRouter,
+        default_question_response_cache,
+        utterances_match,
+    )
     from pointing import PersonTargetTracker, pointing_goal, quaternion_from_z, quaternion_slerp
 
 load_dotenv()
@@ -174,7 +194,9 @@ def _play_movement_plan(name, plan):
 
 def start_movement(name):
     """Safety-check and start at most one allowlisted recorded movement."""
-    movement_name = "wave" if name == "goodbye" else name
+    if arm_motion_reserved():
+        return False, "My arms are busy packing, but I can still answer questions."
+    movement_name = recorded_movement_name(name)
     if movement_name not in _saved_movements:
         return False, f"Movement '{movement_name}' is not installed"
     if not _saved_movements[movement_name]:
@@ -342,6 +364,8 @@ def play_pointing_gesture(target):
 
 def start_robot_action(name):
     """Dispatch either a recorded movement or the camera-guided point gesture."""
+    if arm_motion_reserved():
+        return False, "My arms are busy packing, but I can still answer questions."
     point_preferences = {
         "point": "primary",
         "point-left": "left",
@@ -387,6 +411,14 @@ def start_robot_action(name):
 
     threading.Thread(target=run, name=f"voice-{name}", daemon=True).start()
     return True, f"Started {name}"
+
+
+def stop_robot_action():
+    """Request a safe return for whichever voice movement is active."""
+    if not _movement_playback_lock.locked():
+        return False, "No movement is running."
+    _movement_cancel_event.set()
+    return True, "Okay. Stopping safely."
 
 
 # ── Drive tool ────────────────────────────────────────────────────────
@@ -1307,8 +1339,13 @@ def local_voice_session(args):
     llm = OpenRouterClient(
         model=args.openrouter_model,
         timeout=args.openrouter_timeout,
+        response_cache=default_question_response_cache(),
     )
-    voice_router = VoiceRouter(llm, action_executor=start_robot_action)
+    voice_router = VoiceRouter(
+        llm,
+        action_executor=start_robot_action,
+        stop_executor=stop_robot_action,
+    )
     _debug["openrouter_configured"] = llm.configured
     _debug["browserbase_configured"] = llm.web_search.configured
     _debug["voice_backend"] = "local"
@@ -1404,8 +1441,13 @@ async def gemini_session(args):
     llm = OpenRouterClient(
         model=args.openrouter_model,
         timeout=args.openrouter_timeout,
+        response_cache=default_question_response_cache(),
     )
-    voice_router = VoiceRouter(llm, action_executor=start_robot_action)
+    voice_router = VoiceRouter(
+        llm,
+        action_executor=start_robot_action,
+        stop_executor=stop_robot_action,
+    )
     _debug["openrouter_configured"] = llm.configured
     _debug["browserbase_configured"] = llm.web_search.configured
 
@@ -1702,8 +1744,14 @@ def main():
         help="voice transport; auto uses Gemini only when GEMINI_API_KEY is set",
     )
     parser.add_argument("--model", default="gemini-2.5-flash-native-audio-preview-12-2025")
-    parser.add_argument("--voice", default="Iapetus",
-                        help="Gemini voice (Aoede, Charon, Fenrir, Iapetus, Kore, Orus, Puck, etc.)")
+    parser.add_argument(
+        "--voice",
+        default=os.environ.get("BAYMAX_GEMINI_VOICE", "Puck"),
+        help=(
+            "Gemini voice (Aoede, Charon, Fenrir, Iapetus, Kore, Orus, "
+            "Puck, etc.)"
+        ),
+    )
     parser.add_argument("--volume", type=float, default=0.45)
     parser.add_argument("--mic-gain", type=float, default=3.0)
     parser.add_argument(
@@ -1751,11 +1799,12 @@ def main():
         help="start on any speech instead of requiring wakeword.state",
     )
     parser.add_argument("--system-prompt", default=(
-        "You are the speech interface for a friendly robot called Baymax. "
+        "You are the speech interface for a cheerful, gentle robot called BracketBot. "
         "For EVERY human utterance, call route_utterance exactly once with the "
         "person's exact words. Never answer human speech yourself and never infer "
         "or perform a physical action. After the tool responds, speak only its "
-        "reply naturally and concisely. Text beginning '[SYSTEM EVENT:' is trusted "
+        "reply with a warm, upbeat, reassuring delivery while staying natural and "
+        "concise. Text beginning '[SYSTEM EVENT:' is trusted "
         "application input: respond to that directly without calling the tool."
     ))
     args = parser.parse_args()

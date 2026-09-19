@@ -95,6 +95,10 @@ APRON_DEPTH_METRES = 0.20
 # out over the table keep the full HAND_CLEARANCE_METRES.
 RAISE_EDGE_MARGIN_METRES = 0.0
 RAISE_CLEARANCE_METRES = 0.03
+# Hanging rest pose: joints straight, prismatic lift all the way down. The
+# lift sign differs per arm (docs/robot-facts.md).
+REST_LIFT_TURNS = 1.0
+REST_SECONDS = 6.0
 # Measured on bracketbot-184: grasps solve to 2-6 mm out to ~0.45 m from the
 # shoulder and fail beyond ~0.52 m, where tipping the ~14 cm fingers down
 # costs horizontal reach.
@@ -580,6 +584,78 @@ def plan_adjusted(cfg, side, pregrasp_pose, grasp, lift, quaternion, observation
     return descend, lifted
 
 
+def rest_arms(Config, Reader, Type, Writer, sides=("left", "right")):
+    """Lower the arms back to their hanging rest pose, then release torque."""
+
+    with tr.nonsuppressing(Reader("camera.points", keeptime=False)) as points:
+        deadline = time.monotonic() + 4.0
+        arm = None
+        while time.monotonic() < deadline:
+            if points.ready():
+                count = int(points.data["num_points"])
+                arm = points_to_arm(np.asarray(points.data["points"])[:count].astype(np.float64))
+                break
+            time.sleep(0.02)
+    plane = fit_table_plane(arm) if arm is not None else None
+    observation = ({"height": plane.height_at(0.3, 0.0), "near_edge": plane.near_edge}
+                   if plane is not None else {"height": -10.0, "near_edge": 10.0})
+    log("rest", f"table height={observation['height']:.3f} near_edge={observation['near_edge']:.3f}")
+
+    for side in sides:
+        cfg = Config(f"arm_{side}")
+        cfg.ik.init()
+        with tr.nonsuppressing(Reader(f"arm_{side}.state", keeptime=False)) as reader:
+            start = np.asarray(tr.fresh(reader)["pos"], dtype=np.float64).copy()
+        lift_sign = 1.0 if side == "left" else -1.0
+        straight = start.copy()
+        straight[1:7] = 0.0
+        hanging = straight.copy()
+        hanging[0] = lift_sign * REST_LIFT_TURNS
+        path = [start.copy()]
+        try:
+            blend_to(cfg, path, straight, observation, label=f"{side} straighten")
+            blend_to(cfg, path, hanging, observation, label=f"{side} lower")
+        except RuntimeError as exc:
+            log("rest", f"{side} rest path rejected: {exc}")
+            continue
+        xyz, _ = cfg.ik.fk(list(np.asarray(cfg.q2urdf(path[-1].copy()), dtype=np.float64)[:7]))
+        log("rest", f"{side} start={fmt(start)} -> rest={fmt(hanging)} hand_xyz={fmt(xyz)}")
+        with ExitStack() as stack:
+            control = stack.enter_context(tr.nonsuppressing(
+                Writer(f"arm_{side}.ctrl", Type("arm_ctrl"), keeptime=False)))
+            torque = stack.enter_context(tr.nonsuppressing(
+                Writer(f"arm_{side}.torque", Type("arm_torque"), keeptime=False)))
+
+            def command(pose):
+                with control.buf() as frame:
+                    frame["pos"][:] = np.asarray(pose, dtype=np.float32)
+                    frame["vel"][:] = 0
+                    frame["tau"][:] = 0
+                    frame["alpha"] = 0.0
+
+            def set_torque(enabled):
+                with torque.buf() as frame:
+                    frame["enable"][:] = enabled
+                    frame["tau_mode"][:] = False
+                    frame["compliance_mode"] = False
+
+            for _ in range(8):
+                command(start)
+                time.sleep(tr.TICK_SECONDS)
+            set_torque(True)
+            began = time.monotonic()
+            while True:
+                alpha = min((time.monotonic() - began) / REST_SECONDS, 1.0)
+                index = min(int(tr.smoothstep(alpha) * (len(path) - 1)), len(path) - 1)
+                command(path[index])
+                if alpha >= 1.0 or cancel_event.is_set():
+                    break
+                time.sleep(tr.TICK_SECONDS)
+            time.sleep(0.3)
+            set_torque(False)
+        log("rest", f"{side} arm is at its rest pose; torque off")
+
+
 def execute(plan_only=True, pid_file=None, stop_at=None, adjust=False,
             grip_torque=GRIP_CLOSE_TORQUE_NM):
     bbos, Config, Reader, Type, Writer = tr._load_bbos()
@@ -876,6 +952,8 @@ def main():
     parser.add_argument("--virtual", type=float, nargs=3, metavar=("X", "Y", "TOP"),
                         help="plan-only: plan against a pretend object at arm-frame X,Y "
                              "with this height, on the live table plane")
+    parser.add_argument("--rest", action="store_true",
+                        help="lower both arms back to their hanging rest pose and stop")
     parser.add_argument("--grip-torque", type=float, default=GRIP_CLOSE_TORQUE_NM,
                         help=f"constant gripper squeeze in Nm once contact is made "
                              f"(default {GRIP_CLOSE_TORQUE_NM}, max {MAX_GRIP_TORQUE_NM})")
@@ -898,6 +976,10 @@ def main():
     if args.pid_file:
         args.pid_file.write_text(f"{os.getpid()}\n")
     try:
+        if args.rest:
+            _, Config, Reader, Type, Writer = tr._load_bbos()
+            rest_arms(Config, Reader, Type, Writer)
+            return 0
         execute(plan_only=not args.execute, stop_at=args.stop_at, adjust=args.adjust,
                 grip_torque=args.grip_torque)
         return 0

@@ -47,7 +47,9 @@ on), cropped with YuNet the same way the robot does:
 | `afew` + `va_mtl` average, square crop (current) | 59% | 86% |
 
 Contempt is removed before the argmax. Faces smaller than `--min-face-size`
-(40 px) are skipped, because accuracy falls from 57% at 64 px to 44% at 24 px.
+(32 px) are skipped, because accuracy falls from 57% at 64 px to 51% at 32 px
+and 44% at 24 px. The robot's 512x384 `camera.rect` shows faces at roughly
+30-45 px from a couple of metres, so stand close for reliable cues.
 
 ## Prepare the models
 
