@@ -146,3 +146,9 @@ def test_spoken_safety_refusal_hides_depth_diagnostics():
     )
     assert "depth" not in reply
     assert "4093" not in reply
+
+
+def test_goodbye_safety_refusal_describes_the_wave():
+    assert spoken_safety_refusal("goodbye", "robot is not upright") == (
+        "I can't wave goodbye while I'm not upright."
+    )

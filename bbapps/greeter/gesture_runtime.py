@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import ExitStack
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 import threading
 import time
@@ -34,6 +35,19 @@ EASE_SECONDS = 3.0
 PLAYBACK_SPEED = 0.6
 TICK_SECONDS = 0.015
 ARM_SIDES = ("left", "right")
+ARM_RESERVATION_PATH = Path(
+    os.environ.get("BAYMAX_ARM_RESERVATION", "/tmp/bracketbot-demo-arm-reserved")
+)
+
+
+def arm_motion_reserved():
+    """Whether another trusted process currently owns the robot arms."""
+    return ARM_RESERVATION_PATH.exists()
+
+
+def recorded_movement_name(action):
+    """Return the installed recording used to perform a named voice action."""
+    return "wave" if action == "goodbye" else action
 
 
 def fresh(reader, timeout=2.0):
@@ -93,19 +107,23 @@ def _smoothstep(value):
 
 def set_arms_limp(sides=ARM_SIDES):
     """Disable arm torque without commanding a new pose."""
-    with ExitStack() as stack:
-        torque_writers = {
-            side: stack.enter_context(
-                Writer(f"arm_{side}.torque", Type("arm_torque"), keeptime=False)
-            )
-            for side in sides
-        }
-        for side in sides:
-            with torque_writers[side].buf() as buf:
-                buf["enable"][:] = False
-                buf["tau_mode"][:] = False
-                buf["compliance_mode"] = False
-    print(f"[arm] torque off; limp={','.join(sides)}", flush=True)
+    failures = []
+    disabled = []
+    for side in sides:
+        try:
+            with Writer(
+                f"arm_{side}.torque", Type("arm_torque"), keeptime=False
+            ) as torque_writer:
+                with torque_writer.buf() as buf:
+                    buf["enable"][:] = False
+                    buf["tau_mode"][:] = False
+                    buf["compliance_mode"] = False
+            disabled.append(side)
+        except Exception as exc:
+            failures.append(f"{side}: {exc}")
+    print(f"[arm] torque off; limp={','.join(disabled)}", flush=True)
+    if failures:
+        raise RuntimeError("failed to disable arm torque (" + "; ".join(failures) + ")")
 
 
 def play_recorded_movement(name, plan, cancel_event, shutdown_event):
@@ -204,9 +222,9 @@ class RecordedGestureController:
         self._thread = None
 
     def _load(self, name):
-        movement_name = "wave" if name == "goodbye" else name
+        movement_name = recorded_movement_name(name)
         if movement_name not in {
-            "wave", "salute", "handshake", "fist bump", "hug", "dance"
+            "wave", "salute", "handshake", "fist bump", "hug", "namaste", "dance"
         }:
             raise RuntimeError(f"gesture '{name}' is not installed in this assistant")
         path = (
@@ -220,6 +238,8 @@ class RecordedGestureController:
             raise RuntimeError(f"could not load gesture '{name}': {exc}") from exc
 
     def start(self, name):
+        if arm_motion_reserved():
+            return False, "My arms are busy packing, but I can still answer questions."
         if not self._lock.acquire(blocking=False):
             return False, "Another movement is already running"
         try:
@@ -254,6 +274,8 @@ class RecordedGestureController:
 
     def preflight(self, name):
         """Run the same read-only gate as ``start`` without opening writers."""
+        if arm_motion_reserved():
+            return False, "My arms are busy packing, but I can still answer questions."
         if self._lock.locked():
             return False, "Another movement is already running"
         try:
@@ -267,7 +289,10 @@ class RecordedGestureController:
         )
 
     def stop(self):
+        if not self.running():
+            return False, "No movement is running."
         self._cancel.set()
+        return True, "Okay. Stopping safely."
 
     def running(self):
         return self._lock.locked()

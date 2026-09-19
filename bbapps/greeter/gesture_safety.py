@@ -38,6 +38,7 @@ def spoken_safety_refusal(action: str, error: object) -> str:
     """Turn detailed operator diagnostics into one short spoken explanation."""
     detail = str(error).lower()
     label = action.replace("point-left", "point").replace("point-right", "point")
+    label = label.replace("goodbye", "wave goodbye")
     if "clearance" in detail or "inside the arm" in detail:
         return f"I can't {label}; there isn't enough clearance. Please step back a little."
     if "not upright" in detail:
