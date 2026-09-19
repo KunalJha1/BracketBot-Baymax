@@ -470,3 +470,217 @@ def start_refusal(cfg, *, roll_deg, pitch_deg, voltage, low_battery_v, drive_wri
     if voltage is not None and low_battery_v is not None and voltage < low_battery_v:
         return f"battery low ({voltage:.1f} V < {low_battery_v:.1f} V)"
     return None
+
+
+@dataclass(frozen=True, eq=False)
+class TickInputs:
+    t: float  # loop clock (s)
+    heartbeat_age: float
+    stop_requested: bool
+    roll_deg: float
+    pitch_deg: float
+    measured_v: float  # from wheel feedback (m/s)
+    measured_omega: float  # rad/s
+    perception: Perception | None = None  # a new frame since the last tick, if any
+
+
+@dataclass(frozen=True)
+class TickOutput:
+    t: float
+    state: str
+    v: float  # what to send
+    omega: float
+    v_cmd: float  # what the controller asked for
+    omega_cmd: float
+    rule: str
+    exit: bool
+    gap: float
+    range: float | None
+    bearing: float | None
+    blocked: bool
+    corridor_points: int
+    track_age: float | None
+
+    @property
+    def error(self):
+        return None if self.range is None else self.range - self.gap
+
+
+class FollowLoop:
+    """Composes lock-on, tracking, control, and supervision. One call per control tick."""
+
+    def __init__(self, cfg=None, gap=None):
+        self.cfg = cfg or FollowConfig()
+        self.gap = self.cfg.gap_default
+        if gap is not None:
+            self.set_gap(gap)
+        self.pose = Pose2D()
+        self.lock_on = LockOn(self.cfg)
+        self.tracker = Tracker(self.cfg)
+        self.corridor = CorridorGuard(self.cfg)
+        self.limiter = RateLimiter(self.cfg)
+        self.odom_check = OdometryCheck(self.cfg)
+        self.state = SEARCHING
+        self.lost_since = None
+        self.last_t = None
+        self.last_points_t = None
+        self.corridor_points = 0
+
+    def set_gap(self, gap):
+        self.gap = clamp(float(gap), self.cfg.gap_min, self.cfg.gap_max)
+        return self.gap
+
+    def tick(self, inp):
+        cfg = self.cfg
+        dt = 0.0 if self.last_t is None else max(0.0, inp.t - self.last_t)
+        self.last_t = inp.t
+        self.pose.integrate(inp.measured_v, inp.measured_omega, dt)
+        mismatch = self.odom_check.update(
+            inp.t, self.limiter.v, self.limiter.omega, inp.measured_v, inp.measured_omega
+        )
+        if inp.perception is not None:
+            self._perceive(inp.perception)
+        self._advance_state(inp.t)
+
+        tracking = self.state in (FOLLOWING, BLOCKED)
+        track = self.tracker.track(inp.t, self.pose) if tracking else None
+        v_cmd, omega_cmd = follow_command(track, self.gap, cfg) if track else (0.0, 0.0)
+        points_age = math.inf if self.last_points_t is None else inp.t - self.last_points_t
+        verdict = supervise(
+            cfg, v=v_cmd, omega=omega_cmd,
+            stop_requested=inp.stop_requested, heartbeat_age=inp.heartbeat_age,
+            roll_deg=inp.roll_deg, pitch_deg=inp.pitch_deg, odom_mismatch=mismatch,
+            tracking=tracking, track_age=track.age if track else None,
+            points_age=points_age, blocked=self.corridor.blocked,
+            range_m=track.range if track else None,
+        )
+        if verdict.exit:
+            self.limiter.reset()
+            v, omega = 0.0, 0.0
+        else:
+            v, omega = self.limiter.step(verdict.v, verdict.omega, dt)
+        return TickOutput(
+            t=inp.t, state=self.state, v=v, omega=omega, v_cmd=v_cmd, omega_cmd=omega_cmd,
+            rule=verdict.rule, exit=verdict.exit, gap=self.gap,
+            range=track.range if track else None, bearing=track.bearing if track else None,
+            blocked=self.corridor.blocked, corridor_points=self.corridor_points,
+            track_age=track.age if track else None,
+        )
+
+    def _perceive(self, frame):
+        positions = [self.pose.to_odom(o.forward, o.left) for o in frame.people]
+        if self.state == SEARCHING:
+            locked = self.lock_on.update(frame.t, frame.people, positions)
+            if locked is not None:
+                obs, xy = locked
+                self.tracker.start(frame.t, xy, obs.hist)
+                self.lock_on.reset()
+                self.state = FOLLOWING
+        elif self.tracker.update(frame.t, frame.people, positions) == "updated" and self.state == LOST:
+            self.state = FOLLOWING
+            self.lost_since = None
+        person = None
+        if self.tracker.locked:
+            track = self.tracker.track(frame.t, self.pose)
+            person = (track.forward, track.left)
+        self.corridor_points = corridor_count(frame.points, person, self.cfg)
+        self.corridor.update(frame.t, self.corridor_points)
+        self.last_points_t = frame.t
+
+    def _advance_state(self, t):
+        if self.state in (FOLLOWING, BLOCKED):
+            if self.tracker.age(t) > self.cfg.lost_after:
+                self.state = LOST
+                self.lost_since = t
+                self.tracker.mark_lost()
+            else:
+                self.state = BLOCKED if self.corridor.blocked else FOLLOWING
+        elif self.state == LOST and t - self.lost_since > self.cfg.lost_timeout:
+            self.state = SEARCHING
+            self.lost_since = None
+            self.tracker.reset()
+            self.lock_on.reset()
+
+
+@dataclass(frozen=True)
+class Command:
+    kind: str  # "heartbeat" | "gap" | "stop"
+    gap: float | None = None
+
+
+def parse_command(line, cfg):
+    """One dashboard stdin line -> Command, or None if malformed. Gaps are clamped."""
+    try:
+        message = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(message, dict):
+        return None
+    kind = message.get("type")
+    if kind in ("heartbeat", "stop"):
+        return Command(kind)
+    if kind == "gap":
+        value = message.get("m")
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            return None
+        return Command("gap", clamp(float(value), cfg.gap_min, cfg.gap_max))
+    return None
+
+
+def status_line(out):
+    def rounded(value, digits=3):
+        return None if value is None else round(value, digits)
+
+    payload = {
+        "state": out.state,
+        "range": rounded(out.range),
+        "gap": round(out.gap, 2),
+        "error": rounded(out.error),
+        "bearing_deg": rounded(None if out.bearing is None else math.degrees(out.bearing), 1),
+        "v": round(out.v, 3),
+        "w": round(out.omega, 3),
+        "blocked": out.blocked,
+        "age_ms": None if out.track_age is None else round(out.track_age * 1000),
+        "rule": out.rule,
+    }
+    return STATUS_PREFIX + json.dumps(payload, separators=(",", ":"))
+
+
+STATE_LED = {
+    SEARCHING: ((70, 125, 255), "pulse"),
+    FOLLOWING: ((70, 220, 120), "solid"),
+    BLOCKED: ((255, 160, 0), "solid"),
+    LOST: ((255, 160, 0), "blink"),
+}
+
+
+def led_color(state, elapsed):
+    """RGB for the state's LED pattern ``elapsed`` seconds into it (same shapes as robot_effect.py)."""
+    rgb, pattern = STATE_LED[state]
+    if pattern == "solid":
+        scale = 1.0
+    elif pattern == "blink":
+        scale = 1.0 if int(elapsed * 3) % 2 == 0 else 0.08
+    else:
+        scale = 0.2 + 0.8 * (0.5 - 0.5 * math.cos(2 * math.pi * elapsed / 1.6))
+    return tuple(round(c * scale) for c in rgb)
+
+
+def timestamp_to_seconds(value):
+    """BBOS timestamps have appeared in s, ms, us, and ns; normalise by magnitude."""
+    value = float(value)
+    if value > 1e17:
+        return value / 1e9
+    if value > 1e14:
+        return value / 1e6
+    if value > 1e11:
+        return value / 1e3
+    return value
+
+
+def wheel_twist(turns_per_s, wheel_diam, robot_width, wheel_signs=(1.0, 1.0)):
+    """drive.state.vel (turns/s, [left, right]) -> (v m/s, omega rad/s)."""
+    circumference = math.pi * wheel_diam
+    v_left = wheel_signs[0] * float(turns_per_s[0]) * circumference
+    v_right = wheel_signs[1] * float(turns_per_s[1]) * circumference
+    return (v_left + v_right) / 2.0, (v_right - v_left) / robot_width

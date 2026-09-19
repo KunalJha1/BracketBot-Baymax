@@ -6,20 +6,33 @@ import numpy as np
 import pytest
 
 from follow_core import (
+    BLOCKED,
+    FOLLOWING,
+    SEARCHING,
+    STATUS_PREFIX,
+    Command,
     CorridorGuard,
     FollowConfig,
+    FollowLoop,
     LockOn,
     OdometryCheck,
+    Perception,
     PersonObservation,
     Pose2D,
     RateLimiter,
+    TickInputs,
     Track,
     Tracker,
     corridor_count,
     follow_command,
     hist_distance,
+    led_color,
+    parse_command,
     start_refusal,
+    status_line,
     supervise,
+    timestamp_to_seconds,
+    wheel_twist,
 )
 
 CFG = FollowConfig()
@@ -271,3 +284,91 @@ def test_start_refusal():
     assert "greeter" in start_refusal(CFG, **{**ok, "drive_writers": ["123 python greeter/main.py"]})
     assert start_refusal(CFG, **{**ok, "voltage": 20.0}) == "battery low (20.0 V < 21.0 V)"
     assert start_refusal(CFG, **{**ok, "voltage": None}) is None
+
+
+# --- loop -----------------------------------------------------------------
+
+def tick_inputs(t, **overrides):
+    values = dict(t=t, heartbeat_age=0.1, stop_requested=False, roll_deg=0.0, pitch_deg=0.0,
+                  measured_v=0.0, measured_omega=0.0, perception=None)
+    values.update(overrides)
+    return TickInputs(**values)
+
+
+def test_loop_holds_still_while_searching():
+    loop = FollowLoop(CFG)
+    frame = Perception(0.0, (person(1.5, 0.3),), np.empty((0, 3)))
+    out = loop.tick(tick_inputs(0.0, perception=frame))
+    assert (out.state, out.v, out.omega, out.rule) == (SEARCHING, 0.0, 0.0, "no-track")
+
+
+def test_loop_locks_on_then_follows():
+    loop = FollowLoop(FAST)
+    out = None
+    for i in range(100):
+        t = i * 0.02
+        frame = None
+        if i % 3 == 0:
+            frame = Perception(t, (person(1.6, raised=t < 1.0),), np.empty((0, 3)))
+        out = loop.tick(tick_inputs(t, perception=frame))
+    assert out.state == FOLLOWING
+    assert out.v > 0.0
+
+
+def test_loop_exits_on_heartbeat_loss():
+    out = FollowLoop(CFG).tick(tick_inputs(0.0, heartbeat_age=1.5))
+    assert out.exit is True
+    assert (out.v, out.omega, out.rule) == (0.0, 0.0, "heartbeat")
+
+
+def test_gap_is_clamped():
+    loop = FollowLoop(CFG)
+    assert loop.set_gap(3.0) == 1.5
+    assert loop.set_gap(0.1) == 0.6
+
+
+# --- protocol and helpers -------------------------------------------------
+
+def test_parse_command():
+    assert parse_command('{"type":"heartbeat"}', CFG) == Command("heartbeat")
+    assert parse_command('{"type":"stop"}', CFG) == Command("stop")
+    assert parse_command('{"type":"gap","m":1.2}', CFG) == Command("gap", 1.2)
+    assert parse_command('{"type":"gap","m":9}', CFG) == Command("gap", 1.5)
+    for bad in ("", "nope", "[]", '{"type":"gap","m":true}', '{"type":"gap","m":NaN}',
+                '{"type":"gap"}', '{"type":"drive","v":1}'):
+        assert parse_command(bad, CFG) is None, bad
+
+
+def test_status_line_is_prefixed_json():
+    loop = FollowLoop(CFG)
+    out = loop.tick(tick_inputs(0.0))
+    line = status_line(out)
+    assert line.startswith(STATUS_PREFIX)
+    payload = json.loads(line[len(STATUS_PREFIX):])
+    assert payload["state"] == SEARCHING
+    assert payload["gap"] == 1.0
+    assert payload["range"] is None
+    assert set(payload) == {"state", "range", "gap", "error", "bearing_deg", "v", "w",
+                            "blocked", "age_ms", "rule"}
+
+
+def test_led_patterns():
+    assert led_color(FOLLOWING, 0.0) == (70, 220, 120)
+    assert led_color(BLOCKED, 5.0) == (255, 160, 0)
+    assert led_color("LOST", 0.0) == (255, 160, 0)
+    assert led_color("LOST", 0.4) == (20, 13, 0)
+    assert led_color(SEARCHING, 0.0) == (14, 25, 51)
+
+
+def test_timestamp_units_are_normalised():
+    for value in (1_760_000_000.5, 1_760_000_000_500, 1_760_000_000_500_000, 1_760_000_000_500_000_000):
+        assert timestamp_to_seconds(value) == pytest.approx(1_760_000_000.5)
+
+
+def test_wheel_twist():
+    v, omega = wheel_twist((1.0, 1.0), 0.165, 0.3275)
+    assert (v, omega) == pytest.approx((math.pi * 0.165, 0.0))
+    v, omega = wheel_twist((-1.0, 1.0), 0.165, 0.3275)
+    assert v == pytest.approx(0.0)
+    assert omega == pytest.approx(2 * math.pi * 0.165 / 0.3275)
+    assert wheel_twist((1.0, 1.0), 0.165, 0.3275, (-1.0, -1.0))[0] < 0
