@@ -18,10 +18,11 @@
 # bbai = { path = "/home/bracketbot/bbai", editable = true }
 # ///
 """
-Greeter: YOLO person detection + Gemini Live voice greeting + wave movement.
+Greeter: person detection + Gemini Live audio + deterministic voice actions.
 
 Detects people via YOLO26 TensorRT, triggers Gemini to say hello and plays
-the 'wave' arm movement when a face is detected.
+the 'wave' arm movement when a face is detected. Human speech is sent through
+the local action allowlist; non-action conversation can use OpenRouter.
 
 Usage:
   uv run main.py
@@ -51,6 +52,11 @@ from google.genai import types
 
 from bbos import Reader, Writer, Type, Config
 
+try:
+    from .voice_router import OpenRouterClient, RouteKind, VoiceRouter, utterances_match
+except ImportError:  # ``uv run main.py`` executes this as a standalone script.
+    from voice_router import OpenRouterClient, RouteKind, VoiceRouter, utterances_match
+
 load_dotenv()
 
 SCRIPT_DIR = Path(__file__).parent
@@ -73,6 +79,7 @@ def resample_24k_to_16k(pcm_24k):
 DOF = 8
 _arm_shm = {}
 _arm_lock = threading.Lock()
+_movement_playback_lock = threading.Lock()
 _saved_movements = {}
 
 
@@ -122,8 +129,6 @@ def _cleanup_arm_shm():
 
 def play_movement(name=""):
     """Play back a saved movement by name."""
-    shm = _get_arm_shm()
-
     if name and name in _saved_movements:
         traj = _saved_movements[name]
     elif name:
@@ -132,32 +137,69 @@ def play_movement(name=""):
     else:
         print("[arm] No movement name given", flush=True)
         return
+    if not traj:
+        print(f"[arm] Movement '{name}' has no frames", flush=True)
+        return
+
+    shm = _get_arm_shm()
 
     n = len(traj)
     dur = traj[-1]["t"]
     print(f"[arm] Playing '{name}': {n} frames ({dur:.1f}s)", flush=True)
 
-    # Send first position before enabling torque
-    shm["w_left"]["pos"] = np.array(traj[0]["left"], dtype=np.float32)
-    shm["w_right"]["pos"] = np.array(traj[0]["right"], dtype=np.float32)
-    time.sleep(0.1)
-    shm["w_torque_left"]["enable"] = np.ones(DOF, dtype=np.bool_)
-    shm["w_torque_right"]["enable"] = np.ones(DOF, dtype=np.bool_)
-    time.sleep(0.1)
+    torque_enabled = False
+    try:
+        # Send first position before enabling torque.
+        shm["w_left"]["pos"] = np.array(traj[0]["left"], dtype=np.float32)
+        shm["w_right"]["pos"] = np.array(traj[0]["right"], dtype=np.float32)
+        time.sleep(0.1)
+        # Mark cleanup required before either write, so a partial enable is
+        # still followed by best-effort torque-off writes.
+        torque_enabled = True
+        shm["w_torque_left"]["enable"] = np.ones(DOF, dtype=np.bool_)
+        shm["w_torque_right"]["enable"] = np.ones(DOF, dtype=np.bool_)
+        time.sleep(0.1)
 
-    t0 = time.time()
-    for frame in traj:
-        if stop_event.is_set():
-            break
-        target = t0 + frame["t"]
-        time.sleep(max(0, target - time.time()))
-        shm["w_left"]["pos"] = np.array(frame["left"], dtype=np.float32)
-        shm["w_right"]["pos"] = np.array(frame["right"], dtype=np.float32)
+        t0 = time.time()
+        for frame in traj:
+            if stop_event.is_set():
+                break
+            target = t0 + frame["t"]
+            time.sleep(max(0, target - time.time()))
+            shm["w_left"]["pos"] = np.array(frame["left"], dtype=np.float32)
+            shm["w_right"]["pos"] = np.array(frame["right"], dtype=np.float32)
+    finally:
+        torque_off = not torque_enabled
+        if torque_enabled:
+            try:
+                shm["w_torque_left"]["enable"] = np.zeros(DOF, dtype=np.bool_)
+                shm["w_torque_right"]["enable"] = np.zeros(DOF, dtype=np.bool_)
+                torque_off = True
+            except Exception as exc:
+                print(f"[arm] Failed to disable torque: {exc}", flush=True)
+        print(
+            f"[arm] Playback done, torque {'off' if torque_off else 'state uncertain'}",
+            flush=True,
+        )
 
-    # Disable torque after playback
-    shm["w_torque_left"]["enable"] = np.zeros(DOF, dtype=np.bool_)
-    shm["w_torque_right"]["enable"] = np.zeros(DOF, dtype=np.bool_)
-    print(f"[arm] Playback done, torque off", flush=True)
+
+def start_movement(name):
+    """Start at most one allowlisted movement without blocking the voice loop."""
+    if name not in _saved_movements:
+        return False, f"Movement '{name}' is not installed"
+    if not _saved_movements[name]:
+        return False, f"Movement '{name}' has no frames"
+    if not _movement_playback_lock.acquire(blocking=False):
+        return False, "Another movement is already running"
+
+    def run():
+        try:
+            play_movement(name)
+        finally:
+            _movement_playback_lock.release()
+
+    threading.Thread(target=run, name=f"voice-movement-{name}", daemon=True).start()
+    return True, f"Started {name}"
 
 
 # ── Drive tool ────────────────────────────────────────────────────────
@@ -291,6 +333,8 @@ _debug = {
     "mic_gain": 3.0, "volume": 0.45,
     "persons_detected": 0, "greetings_sent": 0,
     "current_detections": 0,
+    "last_voice_route": "",
+    "openrouter_configured": False,
 }
 
 # ── MJPEG feed queue ─────────────────────────────────────────────────
@@ -303,7 +347,7 @@ _greet_lock = threading.Lock()
 
 
 def _greet_person():
-    """Send greeting prompt to Gemini and play wave movement."""
+    """Send a greeting prompt to Gemini and start the allowlisted wave."""
     global _last_greet_time
 
     with _greet_lock:
@@ -316,9 +360,12 @@ def _greet_person():
 
     _debug["greetings_sent"] = _debug.get("greetings_sent", 0) + 1
 
+    # This application event is trusted and does not need model-selected tools.
+    start_movement("wave")
+
     prompt = (
-        "A person just appeared in front of you! "
-        "Say hello warmly and wave. Keep it short — 1-2 sentences max."
+        "[SYSTEM EVENT: PERSON APPEARED] "
+        "Say hello warmly. Keep it short — 1-2 sentences max."
     )
 
     print(f"[greeter] Sending greeting to Gemini", flush=True)
@@ -965,57 +1012,38 @@ async def gemini_session(args):
         return
 
     client = genai.Client(api_key=api_key)
+    llm = OpenRouterClient(
+        model=args.openrouter_model,
+        timeout=args.openrouter_timeout,
+    )
+    voice_router = VoiceRouter(llm)
+    _debug["openrouter_configured"] = llm.configured
 
     tools = [
         types.FunctionDeclaration(
-            name="drive",
+            name="route_utterance",
             description=(
-                "Drive the robot in a direction. Use this when the user asks to "
-                "move, drive, go forward, backward, turn left, turn right, or spin."
+                "Pass every human utterance to the deterministic Baymax router. "
+                "It safely selects an allowlisted gesture or sends non-action "
+                "conversation to OpenRouter. Preserve the person's exact words."
             ),
             behavior="NON_BLOCKING",
             parameters=types.Schema(
                 type=types.Type.OBJECT,
                 properties={
-                    "direction": types.Schema(
+                    "utterance": types.Schema(
                         type=types.Type.STRING,
-                        enum=["forward", "backward", "left", "right", "stop"],
-                        description="Direction to drive",
-                    ),
-                    "speed": types.Schema(
-                        type=types.Type.NUMBER,
-                        description="Speed from 0.0 to 1.0 (default 0.5)",
-                    ),
-                    "duration": types.Schema(
-                        type=types.Type.NUMBER,
-                        description="Duration in seconds (default 1.0)",
+                        description="The exact words spoken by the person",
                     ),
                 },
-                required=["direction"],
+                required=["utterance"],
             ),
-        ),
-        types.FunctionDeclaration(
-            name="play_movement",
-            description="Play a saved arm movement by name. Available: 'wave', 'hug', 'fist bump', 'handshake'.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Movement name, e.g. 'wave'"},
-                },
-                "required": ["name"],
-            },
-            behavior="NON_BLOCKING",
-        ),
-        types.FunctionDeclaration(
-            name="list_movements",
-            description="List all available arm movements.",
-            parameters={"type": "object", "properties": {}},
-            behavior="NON_BLOCKING",
         ),
     ]
 
     config = types.LiveConnectConfig(
         response_modalities=[types.Modality.AUDIO],
+        input_audio_transcription=types.AudioTranscriptionConfig(mode="VERBATIM"),
         speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -1048,6 +1076,9 @@ async def gemini_session(args):
             async with client.aio.live.connect(model=args.model, config=config) as session:
                 _gemini_session = session
                 _gemini_loop = asyncio.get_event_loop()
+                # Final transcripts are the authority for motion. Gemini's
+                # function argument must match one before the router sees it.
+                transcript_queue = asyncio.Queue(maxsize=4)
                 print(f"[gemini] Connected (attempt #{attempt})", flush=True)
                 _debug["gemini_connected"] = True
                 _debug["gemini_attempt"] = attempt
@@ -1059,23 +1090,66 @@ async def gemini_session(args):
                         _debug["last_tool_call"] = fc.name
                         print(f"[tool] {fc.name}({fc.args})", flush=True)
                         try:
-                            if fc.name == "drive":
-                                direction = fc.args.get("direction", "forward")
-                                speed = min(max(fc.args.get("speed", 0.5), 0.0), 1.0)
-                                duration = min(max(fc.args.get("duration", 1.0), 0.1), 10.0)
-                                threading.Thread(
-                                    target=drive_robot, args=(direction, speed, duration), daemon=True
-                                ).start()
-                                result = {"status": "driving", "direction": direction,
-                                          "speed": speed, "duration": duration}
-                            elif fc.name == "play_movement":
-                                name = fc.args.get("name", "")
-                                threading.Thread(
-                                    target=play_movement, args=(name,), daemon=True
-                                ).start()
-                                result = {"status": "playing", "name": name}
-                            elif fc.name == "list_movements":
-                                result = {"movements": list(_saved_movements.keys())}
+                            if fc.name == "route_utterance":
+                                claimed = str(fc.args.get("utterance", ""))
+                                utterance = None
+                                deadline = asyncio.get_event_loop().time() + 2.0
+                                while utterance is None:
+                                    remaining = deadline - asyncio.get_event_loop().time()
+                                    if remaining <= 0:
+                                        break
+                                    try:
+                                        stamp, transcript = await asyncio.wait_for(
+                                            transcript_queue.get(), timeout=remaining
+                                        )
+                                    except asyncio.TimeoutError:
+                                        break
+                                    if time.monotonic() - stamp > 3.0:
+                                        continue
+                                    if utterances_match(transcript, claimed):
+                                        utterance = transcript
+                                if utterance is None:
+                                    result = {
+                                        "kind": "error",
+                                        "reply": (
+                                            "I could not verify that voice command. "
+                                            "Please say it again."
+                                        ),
+                                    }
+                                    await session.send_tool_response(
+                                        function_responses=[
+                                            types.FunctionResponse(
+                                                name=fc.name,
+                                                id=fc.id,
+                                                response=result,
+                                                scheduling="WHEN_IDLE",
+                                            )
+                                        ]
+                                    )
+                                    continue
+                                decision = await asyncio.to_thread(
+                                    voice_router.route, utterance
+                                )
+                                _debug["last_voice_route"] = decision.kind.value
+                                if decision.kind == RouteKind.ACTION:
+                                    started, status = start_movement(decision.action)
+                                    if not started:
+                                        result = {
+                                            "kind": "error",
+                                            "reply": status,
+                                        }
+                                    else:
+                                        result = {
+                                            "kind": decision.kind.value,
+                                            "status": "started",
+                                            "action": decision.action,
+                                            "reply": decision.reply,
+                                        }
+                                else:
+                                    result = {
+                                        "kind": decision.kind.value,
+                                        "reply": decision.reply or "",
+                                    }
                             else:
                                 result = {"error": f"Unknown tool: {fc.name}"}
                         except Exception as e:
@@ -1133,6 +1207,19 @@ async def gemini_session(args):
                         audio_chunks_recv = 0
                         turn = session.receive()
                         async for response in turn:
+                            input_transcription = (
+                                getattr(response.server_content, "input_transcription", None)
+                                if response.server_content else None
+                            )
+                            if input_transcription and input_transcription.text:
+                                item = (time.monotonic(), input_transcription.text.strip())
+                                if transcript_queue.full():
+                                    try:
+                                        transcript_queue.get_nowait()
+                                    except asyncio.QueueEmpty:
+                                        pass
+                                transcript_queue.put_nowait(item)
+
                             if (response.server_content
                                     and response.server_content.model_turn
                                     and response.server_content.model_turn.parts):
@@ -1213,14 +1300,19 @@ def main():
                         help="Gemini voice (Aoede, Charon, Fenrir, Iapetus, Kore, Orus, Puck, etc.)")
     parser.add_argument("--volume", type=float, default=0.45)
     parser.add_argument("--mic-gain", type=float, default=3.0)
+    parser.add_argument(
+        "--openrouter-model",
+        default=os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-20b"),
+        help="OpenRouter model slug used for non-action speech",
+    )
+    parser.add_argument("--openrouter-timeout", type=float, default=20.0)
     parser.add_argument("--system-prompt", default=(
-        "You are a friendly greeter robot called BracketBot. "
-        "When told someone appeared, say hello warmly and welcome them. "
-        "Always use the play_movement tool with name 'wave' to wave at them while greeting. "
-        "Keep greetings short — 1-2 sentences max. Be friendly and enthusiastic. "
-        "You can also have a conversation with people who talk to you. "
-        "If someone asks for a hug, fist bump, or handshake, use play_movement with the matching name. "
-        "Keep all responses concise and natural."
+        "You are the speech interface for a friendly robot called Baymax. "
+        "For EVERY human utterance, call route_utterance exactly once with the "
+        "person's exact words. Never answer human speech yourself and never infer "
+        "or perform a physical action. After the tool responds, speak only its "
+        "reply naturally and concisely. Text beginning '[SYSTEM EVENT:' is trusted "
+        "application input: respond to that directly without calling the tool."
     ))
     args = parser.parse_args()
 
@@ -1236,6 +1328,11 @@ def main():
     print(f"  Voice: {args.voice}", flush=True)
     print(f"  Volume: {args.volume}", flush=True)
     print(f"  Mic gain: {args.mic_gain}x", flush=True)
+    print(f"  OpenRouter model: {args.openrouter_model}", flush=True)
+    print(
+        f"  OpenRouter: {'configured' if os.environ.get('OPENROUTER_API_KEY') else 'not configured'}",
+        flush=True,
+    )
     print(f"  Movements: {len(_saved_movements)} loaded", flush=True)
     print(f"  Greet cooldown: {GREET_COOLDOWN}s", flush=True)
     print("=" * 50, flush=True)

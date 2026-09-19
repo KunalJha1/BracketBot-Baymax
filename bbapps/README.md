@@ -21,7 +21,7 @@ Hidden files: `.autostart` is probably what the bot launches on boot. `.python-v
 | Folder | What's in it |
 | --- | --- |
 | `examples/` | 11 small `view_*.py` demos, one each for arms, camera, depth, IK, IMU, LED, mic, Quest, speaker, USB, and wakeword |
-| `greeter/` | `main.py` + `movements/` (wave, hug, handshake, fist bump `.json`) |
+| `greeter/` | Gemini Live mic/speaker transport, deterministic voice-command routing, optional OpenRouter conversation, and wave/hug/handshake/fist-bump movements |
 | `mimic/` | `main.py` + `recordings/` (dance, wave `.json`) |
 | `nav/` | `main.py` (~161 KB, the biggest file) + `planner.py`, `reloc_planner.py`, `reloc_geom.py` |
 | `quest_teleop/` | `main.py` + `scripts/` (homing, tracking, quest, quat, sound) + `wavs/` for mode sounds |
@@ -33,7 +33,7 @@ Hidden files: `.autostart` is probably what the bot launches on boot. `.python-v
 
 No keys are committed. Apps read them from the environment:
 
-- `greeter/` needs `GEMINI_API_KEY`
+- `greeter/` needs `GEMINI_API_KEY`; set `OPENROUTER_API_KEY` to answer non-action speech through OpenRouter
 - `inference/` needs `--api-key`, `$BB_API_KEY`, or `/etc/BB_API_KEY`
 
 ## Browsing the tree

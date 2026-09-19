@@ -11,8 +11,16 @@ or replace qualified care.
 
 ## What works today
 
-- An accessible local dashboard for **wave**, **handshake**, **fist bump**, and
-  **hug**.
+- An accessible local dashboard with a typed allowlist of 15 primitive actions:
+  five gestures, five light expressions, three sound cues, and two original
+  instrumental music cues.
+- Seven deterministic multi-step routines, including **welcome**,
+  **double wave**, **calm moment**, and **dance party**, built from the same
+  primitives future assistant plans will use.
+- A stateful 4° **Lean / Balance** toggle with continuous BBOS refresh,
+  upright gating, disconnect fallback, and explicit balance restoration.
+- A local simulation mode that exercises dashboard actions, routines,
+  cancellation, progress, and APIs without SSH or robot hardware.
 - Automatic selection between the `botwifi` and USB `bot` SSH aliases.
 - Robot-side safety checks before every gesture: upright check, bounded entry
   motion, live lift-height preservation, smooth entry and return, and torque
@@ -24,6 +32,9 @@ or replace qualified care.
   localization, and smoothed EmotiEffLib visible-expression estimates.
 - An existing Gemini-powered greeter and provider-ready inference code with
   OpenAI and Google client dependencies.
+- Deterministic greeter voice commands for **wave**, **handshake**, **fist
+  bump**, and **hug**, with non-action speech routed to OpenRouter when
+  configured.
 
 ## Start the gesture dashboard
 
@@ -51,19 +62,32 @@ the configured order. Override the aliases when necessary:
 python3 scripts/robot_dashboard.py --ssh-hosts botwifi,bot
 ```
 
+Develop or demo the full dashboard while the robot is offline:
+
+```sh
+python3 scripts/robot_dashboard.py --simulate
+```
+
+Simulation uses the real allowlist, API, sequencing state machine, progress,
+and stop path, but never opens SSH or writes to BBOS.
+
 Controls:
 
-| Action | Button | Keyboard |
+| Family | Actions | Keyboard |
 | --- | --- | --- |
-| Wave | Wave | `1` |
-| Handshake | Handshake | `2` |
-| Fist bump | Fist bump | `3` |
-| Hug | Hug | `4` |
-| Return safely and stop | Stop motion | `Esc` |
+| Gestures | Wave, handshake, fist bump, hug, dance | `1`–`4`, `D` |
+| Lights | Calm, ready, thinking, celebrate, off | `5`–`9` |
+| Sounds | Processing, birthday, battery reminder | `P`, `B`, `L` |
+| Music | Original calm and upbeat instrumentals | `M`, `U` |
+| Routines | Welcome, thinking, celebrate, goodbye, double wave, calm moment, dance party | `W`, `T`, `C`, `G`, `V`, `K`, `X` |
+| Base mode | Toggle 4° lean / balance | `Z` |
+| Cancellation | Stop the current action/routine safely | `Esc` |
 
-The dashboard uploads the selected recording and `gesture_test.py` to `/tmp`
-on the active robot. It does not require this repository to be cloned on the
-robot.
+The dashboard uploads only the selected allowlisted asset and its small runner
+to `/tmp` on the active robot. It does not require this repository to be cloned
+on the robot. `ActionSpec` is the common primitive schema, while `RoutineSpec`
+stores ordered action IDs; no browser request or future model output can supply
+an arbitrary command.
 
 ## Run local person and expression detection
 
@@ -110,6 +134,12 @@ startup. Their sources and checksums are documented in
 Ultralytics YOLO11 pose model; review upstream Ultralytics licensing before
 redistributing or using it commercially.
 
+The checkpoint loads, infers, exports to ONNX opset 17, and runs through ONNX
+Runtime locally. The robot was offline during the compatibility pass, so its
+specific Jetson runtime is not claimed as verified. See
+[`docs/yolo-robot-port.md`](docs/yolo-robot-port.md) for the evidence, expected
+TensorRT path, and exact live-robot gate to run after reconnecting.
+
 ## Safety model
 
 Robot motion is treated as a privileged tool, not as unrestricted model
@@ -137,6 +167,12 @@ Current gesture protections include:
 - smooth three-second entry and return paths;
 - `SIGINT`, `SIGTERM`, and SSH-disconnect handling;
 - single-motion locking in the dashboard.
+
+Lean mode is held by its own single BBOS writer because the request expires
+after roughly 0.25 seconds. The runner verifies the IMU first, republishes at
+20 Hz, restores balance on normal stop/signals, and relies on BBOS request
+expiry as a final disconnect fallback. The global Stop control cancels the
+current action and returns the base to balance.
 
 Recordings are robot-specific motor-turn trajectories. Validate any new or
 edited recording on the intended robot with a dry run before enabling motion.
@@ -185,12 +221,53 @@ The existing `bbapps/greeter/main.py` uses `GEMINI_API_KEY`. The inference
 folder already contains Google and OpenAI client dependencies and is the best
 reference for future provider adapters.
 
+### Voice commands and OpenRouter
+
+The greeter uses Gemini Live for its existing microphone/speaker transport and
+finalized speech transcription. Every spoken human turn is verified against
+that transcript and passed to `bbapps/greeter/voice_router.py` before anything
+happens; a model-authored tool argument cannot independently authorize motion:
+
+1. An exact, normalized phrase from the local allowlist starts one installed
+   gesture. Examples include “Baymax, give me a hug”, “Baymax, fist bump me”,
+   “shake my hand”, and “wave at me”. Only one movement can run at a time.
+2. Questions and other conversation are sent as text to OpenRouter. The LLM
+   never receives a robot-action tool and cannot create a motion.
+3. Similar but unapproved text, such as “tell me about fist bumps”, cannot
+   trigger a gesture. Add new voice authority deliberately in
+   `ACTION_ALIASES`, not in an LLM prompt.
+
+Configure both parts in `.env` on the robot:
+
+```sh
+GEMINI_API_KEY=...
+OPENROUTER_API_KEY=...
+OPENROUTER_MODEL=openai/gpt-oss-20b
+```
+
+Then run the existing app as usual:
+
+```sh
+cd bbapps/greeter
+uv run main.py
+```
+
+`OPENROUTER_MODEL` is optional and defaults to `openai/gpt-oss-20b`, which is
+well suited to the assistant's short, simple spoken queries. Without an
+OpenRouter key, allowlisted gestures still work and questions receive a short
+configuration message. Run all gesture tests in simulation/dry-run first and
+keep a person beside the physical e-stop when voice motion is enabled.
+
 ## Repository layout
 
 | Path | Purpose |
 | --- | --- |
 | `scripts/robot_dashboard.py` | Local accessible dashboard and SSH discovery |
 | `scripts/gesture_test.py` | Generic safe robot-side gesture runner |
+| `scripts/robot_effect.py` | Bounded, cancellable robot-side sound/LED runner |
+| `scripts/robot_base_mode.py` | Bounded 4° lean hold with balance restoration |
+| `scripts/generate_music_assets.py` | Deterministically regenerates original PCM music cues |
+| `scripts/check_yolo_runtime.py` | Camera-free YOLO runtime compatibility smoke test |
 | `scripts/handshake_test.py` | Focused standalone handshake runner |
 | `scripts/wave_test.py` | Focused standalone wave runner |
 | `people_detector.py` | Local YOLO + YuNet + visible-expression pipeline |
@@ -204,6 +281,8 @@ reference for future provider adapters.
 | `bbapps/play_sound/` | Speaker playback and soundboard |
 | `docs/bracketbot-bbos-dictionary.md` | BBOS topic and API field guide |
 | `docs/robot-facts.md` | Measurements and findings from the physical robot |
+| `docs/dashboard-action-roadmap.md` | Action-family inventory and safe sequencing roadmap |
+| `docs/yolo-robot-port.md` | YOLO compatibility evidence and Jetson port gate |
 
 Most robot apps target Python 3.10 and declare their robot-only dependencies
 in inline `uv` metadata or their local `pyproject.toml`. The local dashboard
@@ -228,8 +307,11 @@ button or keyboard action.
 ## Development checks
 
 ```sh
-python3 -m py_compile scripts/robot_dashboard.py scripts/gesture_test.py people_detector.py
-uv run --extra vision --extra dev pytest tests/test_people_detector.py
+python3 -m py_compile scripts/robot_dashboard.py scripts/gesture_test.py \
+  scripts/robot_effect.py scripts/robot_base_mode.py \
+  scripts/check_yolo_runtime.py people_detector.py
+uv run --extra vision --extra dev pytest
+uv run --extra vision python scripts/check_yolo_runtime.py
 git diff --check
 ```
 
@@ -239,13 +321,14 @@ production robot action path.
 
 ## Roadmap
 
-- [ ] Extract a provider-neutral conversation and tool-calling interface.
+- [x] Separate deterministic voice actions from an OpenRouter conversation adapter.
 - [ ] Add speech interruption and turn-taking tests.
 - [ ] Add authenticated remote access instead of exposing the local dashboard.
 - [ ] Add consent-aware vision and local retention controls.
 - [ ] Feed the local vision result into the assistant as an optional,
       uncertainty-labelled observation instead of an automatic trigger.
-- [ ] Wrap sound, LED, navigation, and approved routines as typed tools.
+- [x] Wrap gestures, sound, LED, and approved routines as typed dashboard actions.
+- [ ] Add navigation only after bounded-distance controls and obstacle/stop gates are proven on the robot.
 - [ ] Add action-policy tests proving models cannot bypass the safety gate.
 - [ ] Add health/status telemetry without medical diagnosis claims.
 - [ ] Package deployment and service management for the Jetson.

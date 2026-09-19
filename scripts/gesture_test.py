@@ -59,6 +59,9 @@ def load_trajectory(path):
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"could not read trajectory {path}: {exc}") from exc
 
+    # Mimic recordings wrap the same frame schema with name/save metadata.
+    if isinstance(frames, dict):
+        frames = frames.get("frames")
     if not isinstance(frames, list) or len(frames) < 2:
         raise ValueError("trajectory must contain at least two frames")
 
