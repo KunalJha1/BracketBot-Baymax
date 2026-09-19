@@ -1,8 +1,9 @@
 """Local, accessible web dashboard for allowlisted BracketBot actions.
 
 The server binds to localhost by default. It discovers the first reachable SSH
-alias (``botwifi`` then ``bot``), copies small safety-focused runners to the
-robot, and executes only actions and routines from the fixed allowlists below.
+route (the configured Wi-Fi alias, the robot's mDNS name, then USB), copies
+small safety-focused runners to the robot, and executes only actions and
+routines from the fixed allowlists below.
 
 Use ``--simulate`` to develop the complete UI and sequencing path without a
 connected robot. Simulation never opens SSH or writes to BBOS.
@@ -42,6 +43,23 @@ SSH_OPTIONS = (
     "-o", "ControlPath=/tmp/bracketbot-dashboard-%C",
     "-o", "ServerAliveInterval=2",
     "-o", "ServerAliveCountMax=2",
+)
+# Discovery commands must not create a persistent multiplexing master. A new
+# master inherits subprocess.run's capture pipes and keeps them open for the
+# ControlPersist window, making a successful probe look like a timeout.
+SSH_PROBE_OPTIONS = (
+    *SSH_OPTIONS,
+    "-o", "ControlMaster=no",
+    "-o", "ControlPath=none",
+)
+# A .local name may resolve to several IPv6 addresses. SSH applies its
+# ConnectTimeout to each address, so the outer probe must allow more than one
+# attempt before deciding that hotspot discovery failed.
+SSH_PROBE_TIMEOUT = 12
+DEFAULT_SSH_HOSTS = (
+    "botwifi",
+    "bracketbot@bracketbot-184.local",
+    "bot",
 )
 
 @dataclass(frozen=True)
@@ -284,12 +302,17 @@ class RobotController:
     @staticmethod
     def _probe(host):
         command = [
-            "ssh", *SSH_OPTIONS, host,
+            "ssh", *SSH_PROBE_OPTIONS, host,
             'test -x "$HOME/.local/bin/uv" && '
             'test -d "$HOME/bbos"',
         ]
         try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=SSH_PROBE_TIMEOUT,
+            )
             return result.returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             return False
@@ -350,8 +373,8 @@ class RobotController:
                     self.state.host = None
                     self.state.phase = "Robot not found"
                     self.state.error = (
-                        "No configured SSH connection is reachable. Check Wi-Fi/USB, "
-                        "then choose Reconnect."
+                        "No robot SSH route is reachable. Check the hotspot/Wi-Fi or "
+                        "USB connection, then choose Reconnect."
                     )
         finally:
             with self.state.lock:
@@ -881,7 +904,7 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:220px; overflow:a
     <h2 id="connection-title" class="sr-only">Robot connection</h2>
     <div class="status-copy">
       <div class="status-line"><span id="dot" class="dot" aria-hidden="true"></span><span id="status">Connecting…</span></div>
-      <p id="detail" aria-live="polite">Checking botwifi and bot</p>
+      <p id="detail" aria-live="polite">Checking Wi-Fi, hotspot, and USB routes</p>
       <p id="base-detail">Base: balance mode</p>
       <p id="latency-detail">Dispatch: waiting for an action</p>
       <p id="error" class="error" role="alert" hidden></p>
@@ -1077,8 +1100,15 @@ def main():
     parser = argparse.ArgumentParser(description="Accessible local BracketBot command dashboard")
     parser.add_argument("--bind", default="127.0.0.1", help="listen address (default: localhost only)")
     parser.add_argument("--port", type=int, default=8020)
-    parser.add_argument("--ssh-hosts", type=parse_hosts, default=("botwifi", "bot"),
-                        help="comma-separated SSH aliases in priority order")
+    parser.add_argument(
+        "--ssh-hosts",
+        type=parse_hosts,
+        default=DEFAULT_SSH_HOSTS,
+        help=(
+            "comma-separated SSH routes in priority order "
+            "(default: Wi-Fi alias, hotspot/mDNS, USB)"
+        ),
+    )
     parser.add_argument(
         "--simulate",
         action="store_true",

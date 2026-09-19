@@ -41,7 +41,8 @@ or replace qualified care.
 Requirements:
 
 - Python 3.10 or newer on the control computer.
-- SSH aliases named `botwifi` and/or `bot`.
+- An SSH alias named `botwifi` and/or `bot`, or the robot reachable as
+  `bracketbot-184.local` over mDNS.
 - BBOS installed on the robot at `~/bbos` with `uv` at `~/.local/bin/uv`.
 - A person beside the physical e-stop whenever the robot moves.
 
@@ -55,11 +56,14 @@ Open <http://127.0.0.1:8020>. The page is intentionally bound to localhost;
 it should not be exposed to a network without authentication and transport
 security.
 
-The dashboard checks both SSH routes and chooses the first reachable one in
-the configured order. Override the aliases when necessary:
+The dashboard checks the configured Wi-Fi alias first, then automatically
+tries the robot's mDNS hostname (`bracketbot-184.local`) so hotspot address
+changes do not require editing SSH config, and finally falls back to USB.
+Override the routes when necessary:
 
 ```sh
-python3 scripts/robot_dashboard.py --ssh-hosts botwifi,bot
+python3 scripts/robot_dashboard.py \
+  --ssh-hosts botwifi,bracketbot@bracketbot-184.local,bot
 ```
 
 On connection, the dashboard preloads its fixed runners and assets into the

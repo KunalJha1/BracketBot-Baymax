@@ -5,11 +5,14 @@ import wave
 from scripts.robot_dashboard import (
     ACTION_LIST,
     ACTIONS,
+    DEFAULT_SSH_HOSTS,
     EFFECT_RUNNER,
     ROUTINE_LIST,
     ROUTINES,
     ROOT,
     RUNNER,
+    SSH_PROBE_OPTIONS,
+    SSH_PROBE_TIMEOUT,
     RobotController,
     action_bundle_paths,
     action_resource_path,
@@ -145,6 +148,18 @@ def test_unknown_operations_are_rejected():
 
 def test_parse_hosts_deduplicates_and_preserves_order():
     assert parse_hosts("botwifi, bot, botwifi") == ("botwifi", "bot")
+
+
+def test_default_routes_try_mdns_wifi_before_usb():
+    assert DEFAULT_SSH_HOSTS == (
+        "botwifi",
+        "bracketbot@bracketbot-184.local",
+        "bot",
+    )
+    assert SSH_PROBE_TIMEOUT > 2 * 3
+    assert SSH_PROBE_OPTIONS[-4:] == (
+        "-o", "ControlMaster=no", "-o", "ControlPath=none"
+    )
 
 
 def test_action_bundle_contains_each_runner_and_asset_once():
