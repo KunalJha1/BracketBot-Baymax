@@ -1,0 +1,411 @@
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+import sys
+import threading
+import time
+import wave
+
+import numpy as np
+
+from bbapps.greeter import voice_actions
+
+
+class FakeGestureController:
+    def __init__(self):
+        self.actions = []
+        self.stops = 0
+        self.active = False
+
+    def start(self, action):
+        self.actions.append(action)
+        self.active = True
+        return True, f"Started {action}"
+
+    def stop(self):
+        self.stops += 1
+        self.active = False
+        return True, "stopped"
+
+    def running(self):
+        return self.active
+
+
+class FakeLeds:
+    def __init__(self):
+        self.effects = []
+        self.clears = 0
+
+    def start_effect(self, rgb, pattern, duration):
+        self.effects.append((rgb, pattern, duration))
+
+    def clear_effect(self):
+        self.clears += 1
+
+
+class FakeSpeaker:
+    def __init__(self):
+        self.frames = []
+
+    @contextmanager
+    def buf(self):
+        frame = {}
+        yield frame
+        self.frames.append(np.asarray(frame["audio"]).copy())
+
+
+def wait_for_controller(controller, timeout=1.0):
+    deadline = time.monotonic() + timeout
+    while controller._operation_lock.locked() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert not controller._operation_lock.locked()
+
+
+def test_unknown_voice_action_is_rejected(tmp_path):
+    controller = voice_actions.VoiceActionController(FakeGestureController(), tmp_path)
+
+    assert controller.start("drive-away") == (
+        False,
+        "Voice action 'drive-away' is not installed.",
+    )
+
+
+def test_gesture_uses_existing_safety_controller_and_stop(tmp_path):
+    gestures = FakeGestureController()
+    controller = voice_actions.VoiceActionController(gestures, tmp_path)
+
+    assert controller.start("namaste") == (True, "Started namaste")
+    assert gestures.actions == ["namaste"]
+    assert controller.stop() == (True, "Okay. Stopping safely.")
+    wait_for_controller(controller)
+    assert gestures.stops >= 1
+
+
+def test_routine_runs_declared_steps_in_order(tmp_path, monkeypatch):
+    controller = voice_actions.VoiceActionController(FakeGestureController(), tmp_path)
+    controller.bind(FakeSpeaker(), SimpleNamespace(), FakeLeds())
+    steps = []
+    monkeypatch.setattr(controller, "_run_step", steps.append)
+
+    assert controller.start("welcome") == (True, "Started welcome")
+    wait_for_controller(controller)
+
+    assert steps == ["light-ready", "wave"]
+
+
+def test_sound_reuses_bound_speaker_writer(tmp_path):
+    path = tmp_path / "happy_birthday.wav"
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(np.array([1000, -1000, 500, -500], dtype=np.int16).tobytes())
+
+    speaker = FakeSpeaker()
+    controller = voice_actions.VoiceActionController(FakeGestureController(), tmp_path)
+    controller.bind(
+        speaker,
+        SimpleNamespace(sample_rate=16000, chunk_size=4, channels=1),
+        FakeLeds(),
+    )
+
+    assert controller.start("sound-birthday") == (True, "Started sound-birthday")
+    wait_for_controller(controller)
+
+    assert len(speaker.frames) == 1
+    assert speaker.frames[0].reshape(-1).tolist() == [650, -650, 325, -325]
+
+
+def test_stop_clears_active_led_effect(tmp_path, monkeypatch):
+    leds = FakeLeds()
+    controller = voice_actions.VoiceActionController(FakeGestureController(), tmp_path)
+    controller.bind(FakeSpeaker(), SimpleNamespace(), leds)
+    monkeypatch.setitem(
+        voice_actions.LED_EFFECTS,
+        "light-ready",
+        ((70, 220, 120), "solid", 5.0),
+    )
+
+    assert controller.start("light-ready") == (True, "Started light-ready")
+    deadline = time.monotonic() + 1.0
+    while not leds.effects and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert controller.stop() == (True, "Okay. Stopping safely.")
+    wait_for_controller(controller)
+
+    assert leds.effects == [((70, 220, 120), "solid", 5.0)]
+    assert leds.clears >= 1
+
+
+class FakeScanner:
+    installed = True
+
+    def __init__(self, result=None, error=None, block=False):
+        self.result = result
+        self.error = error
+        self.block = block
+        self.calls = 0
+
+    def scan(self, cancel):
+        self.calls += 1
+        if self.block:
+            cancel.wait(2.0)
+            return None
+        if self.error:
+            raise self.error
+        return self.result
+
+
+def test_heart_rate_scan_announces_result_and_frees_the_controller(tmp_path):
+    announced = []
+    leds = FakeLeds()
+    scanner = FakeScanner({"bpm": 71.6, "confident": True})
+    controller = voice_actions.VoiceActionController(
+        FakeGestureController(), tmp_path, heart_rate_scanner=scanner
+    )
+    controller.bind(FakeSpeaker(), SimpleNamespace(), leds, announce=announced.append)
+
+    assert controller.start("heart-rate") == (True, "Started heart-rate scan")
+    wait_for_controller(controller)
+
+    assert scanner.calls == 1
+    assert announced == [
+        "Your heart rate looks like about 72 beats per minute. "
+        "This is a camera estimate, not a medical measurement."
+    ]
+    assert leds.effects and leds.clears >= 1
+
+
+def test_checkup_reports_range_and_scan_failure_is_spoken_safely(tmp_path):
+    announced = []
+    controller = voice_actions.VoiceActionController(
+        FakeGestureController(),
+        tmp_path,
+        heart_rate_scanner=FakeScanner(error=voice_actions.HeartRateScanError("boom")),
+    )
+    controller.bind(FakeSpeaker(), SimpleNamespace(), FakeLeds(), announce=announced.append)
+
+    assert controller.start("checkup")[0] is True
+    wait_for_controller(controller)
+    assert announced == ["Sorry, I couldn't run the heart-rate scan right now."]
+
+    in_range = voice_actions.heart_rate_message({"bpm": 64, "confident": True}, checkup=True)
+    assert in_range.startswith("Your checkup is done.")
+    assert "within the typical adult resting range" in in_range
+    high = voice_actions.heart_rate_message({"bpm": 120, "confident": True}, checkup=True)
+    assert "outside the typical adult resting range" in high
+    weak = voice_actions.heart_rate_message({"bpm": 80, "confident": False})
+    assert "don't rely on it" in weak
+    assert "couldn't get a clear" in voice_actions.heart_rate_message(None)
+
+
+def test_stop_cancels_heart_rate_scan_without_announcing(tmp_path):
+    announced = []
+    controller = voice_actions.VoiceActionController(
+        FakeGestureController(), tmp_path, heart_rate_scanner=FakeScanner(block=True)
+    )
+    controller.bind(FakeSpeaker(), SimpleNamespace(), FakeLeds(), announce=announced.append)
+
+    assert controller.start("heart-rate")[0] is True
+    assert controller.start("wave") == (False, "Another voice action is already running.")
+    assert controller.stop() == (True, "Okay. Stopping safely.")
+    wait_for_controller(controller)
+
+    assert announced == []
+
+
+def test_heart_rate_is_rejected_when_scanner_is_not_installed(tmp_path):
+    controller = voice_actions.VoiceActionController(FakeGestureController(), tmp_path)
+
+    assert controller.start("heart-rate") == (
+        False,
+        "Heart-rate scanning is not installed on this robot yet.",
+    )
+    assert not controller._operation_lock.locked()
+
+
+def test_rppg_scanner_parses_script_json(tmp_path):
+    script = tmp_path / "robot_rppg.py"
+    script.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'result': {'bpm': 66.0, 'confident': True}}))\n"
+    )
+    uv = tmp_path / "uv"
+    # Stand-in for `uv run --quiet robot_rppg.py --duration N`.
+    uv.write_text(f"#!/bin/sh\nexec {sys.executable} \"$3\"\n")
+    uv.chmod(0o755)
+
+    scanner = voice_actions.RppgScanner(script, uv_bin=str(uv), duration_s=1)
+
+    assert scanner.scan(threading.Event()) == {"bpm": 66.0, "confident": True}
+
+
+def test_reminder_fires_while_a_gesture_owns_the_action_lock(tmp_path):
+    gestures = FakeGestureController()
+    leds = FakeLeds()
+    announcements = []
+    controller = voice_actions.VoiceActionController(
+        gestures,
+        tmp_path,
+        reminder_db_path=tmp_path / "reminders.sqlite3",
+        reminder_timezone="America/Toronto",
+    )
+    controller.bind(
+        FakeSpeaker(),
+        SimpleNamespace(),
+        leds,
+        announce=announcements.append,
+    )
+
+    assert controller.start("wave") == (True, "Started wave")
+    reminder = SimpleNamespace(delay_seconds=0.02, message="take my meds")
+    started, reply = controller.schedule_reminder(reminder)
+
+    assert started is True
+    assert reply == "Okay. I'll remind you in 0.02 seconds to take my meds."
+    deadline = time.monotonic() + 1.0
+    while not announcements and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert announcements == ["Reminder: take my meds."]
+    assert leds.effects == [voice_actions.REMINDER_LED]
+    controller.stop()
+    controller.close()
+
+
+def test_cancelled_reminder_does_not_announce(tmp_path):
+    announcements = []
+    controller = voice_actions.VoiceActionController(
+        FakeGestureController(),
+        tmp_path,
+        reminder_db_path=tmp_path / "reminders.sqlite3",
+        reminder_timezone="America/Toronto",
+    )
+    controller.bind(
+        FakeSpeaker(),
+        SimpleNamespace(),
+        FakeLeds(),
+        announce=announcements.append,
+    )
+    reminder = SimpleNamespace(delay_seconds=0.05, message=None)
+
+    assert controller.schedule_reminder(reminder)[0] is True
+    assert controller.cancel_reminders() == (True, "Okay. I cancelled 1 reminder.")
+    time.sleep(0.08)
+
+    assert announcements == []
+    controller.close()
+
+
+def test_internal_reminder_actions_set_list_cancel_and_audit(tmp_path):
+    controller = voice_actions.VoiceActionController(
+        FakeGestureController(),
+        tmp_path,
+        reminder_db_path=tmp_path / "reminders.sqlite3",
+        reminder_timezone="America/Toronto",
+    )
+    try:
+        created = controller.set_reminder(
+            "2099-01-15T09:30:00",
+            "call home",
+            source="internal-test",
+        )
+
+        assert created["timezone"] == "America/Toronto"
+        assert controller.reminder_records() == [created]
+        assert controller.list_reminders()[0] is True
+        assert controller.cancel_reminder(created["id"]) == (
+            True,
+            f"Okay. I cancelled reminder {created['id']}.",
+        )
+        assert controller.reminder_records() == []
+        assert [
+            item["event"] for item in controller.reminder_audit(created["id"])
+        ] == ["cancelled", "scheduled"]
+    finally:
+        controller.close()
+
+
+class FakeFinder:
+    def __init__(self, result):
+        self.result = result
+        self.purposes = []
+
+    def acquire(self, purpose, cancel, hint_deg=None):
+        self.purposes.append(purpose)
+        return dict(self.result)
+
+
+def test_scan_finds_the_person_first_and_skips_scan_when_nobody_is_there(tmp_path):
+    announced = []
+    scanner = FakeScanner({"bpm": 70, "confident": True})
+    finder = FakeFinder({"found": False, "reason": "nobody"})
+    controller = voice_actions.VoiceActionController(
+        FakeGestureController(), tmp_path, heart_rate_scanner=scanner, person_finder=finder
+    )
+    controller.bind(FakeSpeaker(), SimpleNamespace(), FakeLeds(), announce=announced.append)
+
+    assert controller.start("heart-rate")[0] is True
+    wait_for_controller(controller)
+
+    assert finder.purposes == ["scan"]
+    assert scanner.calls == 0
+    assert announced == [voice_actions.NOT_FOUND_MESSAGE]
+
+
+def test_scan_runs_after_turning_to_the_person(tmp_path):
+    announced = []
+    scanner = FakeScanner({"bpm": 70, "confident": True})
+    finder = FakeFinder({"found": True, "distance": "ok", "turned_deg": 120})
+    controller = voice_actions.VoiceActionController(
+        FakeGestureController(), tmp_path, heart_rate_scanner=scanner, person_finder=finder
+    )
+    controller.bind(FakeSpeaker(), SimpleNamespace(), FakeLeds(), announce=announced.append)
+
+    controller.start("checkup")
+    wait_for_controller(controller)
+
+    assert scanner.calls == 1
+    assert announced[0] == "There you are."
+    assert announced[1].startswith("Your checkup is done.")
+
+
+def test_unavailable_tracker_keeps_old_behaviour(tmp_path):
+    scanner = FakeScanner({"bpm": 70, "confident": True})
+    finder = FakeFinder({"found": False, "unavailable": True})
+    controller = voice_actions.VoiceActionController(
+        FakeGestureController(), tmp_path, heart_rate_scanner=scanner, person_finder=finder
+    )
+    controller.bind(FakeSpeaker(), SimpleNamespace(), FakeLeds(), announce=lambda _text: None)
+
+    controller.start("heart-rate")
+    wait_for_controller(controller)
+
+    assert scanner.calls == 1
+
+
+def test_person_gesture_faces_person_then_runs(tmp_path):
+    gestures = FakeGestureController()
+    gestures.start = lambda action: (gestures.actions.append(action), True, "ok")[1:]
+    finder = FakeFinder({"found": True, "distance": "far", "turned_deg": 0})
+    announced = []
+    controller = voice_actions.VoiceActionController(gestures, tmp_path, person_finder=finder)
+    controller.bind(FakeSpeaker(), SimpleNamespace(), FakeLeds(), announce=announced.append)
+    controller._cancel.wait = lambda timeout=None: False     # skip the 3 s pause
+
+    assert controller.start("handshake")[0] is True
+    wait_for_controller(controller)
+
+    assert finder.purposes == ["gesture"]
+    assert gestures.actions == ["handshake"]
+    assert announced == ["Please come a little closer."]
+
+
+def test_non_person_gestures_do_not_search(tmp_path):
+    finder = FakeFinder({"found": False})
+    gestures = FakeGestureController()
+    controller = voice_actions.VoiceActionController(gestures, tmp_path, person_finder=finder)
+
+    assert controller.start("wave") == (True, "Started wave")
+    assert finder.purposes == []
+    controller.stop()
+    wait_for_controller(controller)

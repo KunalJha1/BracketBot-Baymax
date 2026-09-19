@@ -133,7 +133,8 @@ class WhisperCppTranscriber:
 
     DEFAULT_PROMPT = (
         "Hey BracketBot. Baymax. Weather in Waterloo. Wave. Handshake. "
-        "Fist bump. Hug. Salute. Dance."
+        "Fist bump. Hug. Salute. Dance. Remind me in four minutes to take "
+        "my meds. Set a timer for four minutes."
     )
 
     def __init__(

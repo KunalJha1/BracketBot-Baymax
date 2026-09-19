@@ -14,6 +14,7 @@ It intentionally does not start the camera/YOLO greeter.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from pathlib import Path
 import sys
@@ -35,7 +36,15 @@ try:
         play_dance_music,
         speaker_chunks,
     )
-    from .voice_router import OpenRouterClient, RouteKind, VoiceRouter
+    from .voice_router import (
+        OpenRouterClient,
+        RouteKind,
+        VoiceRouter,
+        default_question_response_cache,
+    )
+    from .voice_actions import SILENT_ACTIONS, RppgScanner, VoiceActionController
+    from .reminders import default_reminder_db_path, default_timezone_name
+    from .person_finder import PersonTrackerClient
 except ImportError:
     from gesture_runtime import RecordedGestureController
     from local_voice import (
@@ -48,7 +57,15 @@ except ImportError:
         play_dance_music,
         speaker_chunks,
     )
-    from voice_router import OpenRouterClient, RouteKind, VoiceRouter
+    from voice_router import (
+        OpenRouterClient,
+        RouteKind,
+        VoiceRouter,
+        default_question_response_cache,
+    )
+    from voice_actions import SILENT_ACTIONS, RppgScanner, VoiceActionController
+    from reminders import default_reminder_db_path, default_timezone_name
+    from person_finder import PersonTrackerClient
 
 
 def load_env(path: Path) -> None:
@@ -101,6 +118,7 @@ class LedStatus:
     def __init__(self, refresh_s: float = 0.35):
         self.refresh_s = refresh_s
         self._status = "idle"
+        self._effect = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -111,19 +129,52 @@ class LedStatus:
         with self._lock:
             self._status = status
 
+    def start_effect(self, rgb, pattern: str, duration: float) -> None:
+        if pattern not in {"solid", "pulse", "blink"}:
+            raise ValueError(f"Unknown LED pattern: {pattern}")
+        with self._lock:
+            self._effect = (tuple(rgb), pattern, time.monotonic(), float(duration))
+
+    def clear_effect(self) -> None:
+        with self._lock:
+            self._effect = None
+
+    @staticmethod
+    def _effect_scale(pattern: str, elapsed: float) -> float:
+        if pattern == "solid":
+            return 1.0
+        if pattern == "blink":
+            return 1.0 if int(elapsed * 3) % 2 == 0 else 0.08
+        return 0.2 + 0.8 * (0.5 - 0.5 * math.cos(2 * math.pi * elapsed / 1.6))
+
     def _run(self) -> None:
         try:
             with Writer("led.ctrl", Type("led_ctrl"), keeptime=False) as led:
                 while not self._stop.is_set():
                     with self._lock:
                         status = self._status
+                        effect = self._effect
+                    now = time.monotonic()
+                    if effect is not None and now - effect[2] >= effect[3]:
+                        with self._lock:
+                            if self._effect == effect:
+                                self._effect = None
+                        effect = None
                     # Do not publish an idle frame. The LED daemon treats a
                     # quiet controller as released and restores the robot's
                     # configured idle color after its short stale timeout.
                     if status != "idle":
+                        color = self.COLORS[status]
+                    elif effect is not None:
+                        rgb, pattern, started, _duration = effect
+                        scale = self._effect_scale(pattern, now - started)
+                        color = tuple(round(value * scale) for value in rgb)
+                    else:
+                        color = None
+                    if color is not None:
                         with led.buf() as frame:
                             frame["rgb"] = np.asarray(
-                                self.COLORS[status], dtype=np.uint8
+                                color, dtype=np.uint8
                             )
                             frame["brightness"] = np.int16(-1)
                             frame["period_ms"] = np.uint16(0)
@@ -153,7 +204,7 @@ def answer_text(router: VoiceRouter, utterance: str) -> str:
     return decision.reply or "I did not understand that."
 
 
-def run_voice(args, router, transcriber, synthesizer, gesture_controller) -> None:
+def run_voice(args, router, transcriber, synthesizer, action_controller) -> None:
     mic_cfg = Config("mic")
     speaker_cfg = Config("speaker")
     segmenter = SpeechSegmenter(
@@ -168,6 +219,7 @@ def run_voice(args, router, transcriber, synthesizer, gesture_controller) -> Non
     pending_wake = False
     mic_last_update = time.monotonic()
     mic_reconnect_after_s = 1.0
+    mic_shape_logged = False
 
     with (
         LedStatus() as leds,
@@ -179,6 +231,14 @@ def run_voice(args, router, transcriber, synthesizer, gesture_controller) -> Non
             buf_ms=400,
         ) as speaker,
     ):
+        def announce(text: str) -> None:
+            # Results of background actions, such as a heart-rate scan.
+            print(f"[local-assistant] Reply: {text}")
+            action_controller.speak(
+                play_speech, speaker, synthesizer, text, speaker_cfg, args.volume
+            )
+
+        action_controller.bind(speaker, speaker_cfg, leds, announce=announce)
         microphone = Reader("mic.audio", keeptime=False).__enter__()
         try:
             print("[local-assistant] Ready. Say: Hey BracketBot, then your question.")
@@ -217,7 +277,13 @@ def run_voice(args, router, transcriber, synthesizer, gesture_controller) -> Non
                     time.sleep(0.01)
                     continue
                 mic_last_update = time.monotonic()
-                audio = microphone.data["audio"].reshape(-1).copy()
+                raw_audio = microphone.data["audio"]
+                if not mic_shape_logged:
+                    # More than one channel means the direction a voice came
+                    # from can be estimated to pick the first turn.
+                    print(f"[local-assistant] mic frame shape {raw_audio.shape}", flush=True)
+                    mic_shape_logged = True
+                audio = raw_audio.reshape(-1).copy()
                 boosted = (
                     audio.astype(np.float32) * args.mic_gain
                 ).clip(-32768, 32767).astype(np.int16)
@@ -251,23 +317,16 @@ def run_voice(args, router, transcriber, synthesizer, gesture_controller) -> Non
                     reply = decision.reply or "I did not understand that."
                     print(f"[local-assistant] Reply: {reply}")
                     leds.set("speaking")
-                    if (
-                        decision.kind == RouteKind.ACTION
-                        and decision.action == "dance"
-                        and decision.action_started is True
-                    ):
-                        play_dance_music(
-                            speaker,
-                            Path(__file__).parent.parent
-                            / "play_sound"
-                            / "wavs"
-                            / "baymax_celebration.wav",
-                            speaker_cfg,
-                            gesture_controller.running,
-                        )
+                    if decision.action in SILENT_ACTIONS and decision.action_started:
+                        pass
                     else:
-                        play_speech(
-                            speaker, synthesizer, reply, speaker_cfg, args.volume
+                        action_controller.speak(
+                            play_speech,
+                            speaker,
+                            synthesizer,
+                            reply,
+                            speaker_cfg,
+                            args.volume,
                         )
                 except LocalVoiceError as exc:
                     print(f"[local-assistant] {exc}")
@@ -286,6 +345,7 @@ def run_voice(args, router, transcriber, synthesizer, gesture_controller) -> Non
                     leds.set("idle")
                     segmenter.reset()
         finally:
+            action_controller.unbind()
             microphone.__exit__(None, None, None)
 
 
@@ -298,7 +358,7 @@ def main() -> None:
     parser.add_argument("--speak-text", help="synthesize one phrase on the robot speaker")
     parser.add_argument(
         "--preflight-gesture",
-        choices=("wave", "salute", "handshake", "fist bump", "hug", "dance"),
+        choices=("wave", "salute", "handshake", "fist bump", "hug", "namaste", "dance"),
         help="run fresh IMU, arm-entry, and depth checks without moving",
     )
     parser.add_argument("--mic-gain", type=float, default=3.0)
@@ -320,6 +380,15 @@ def main() -> None:
     parser.add_argument("--max-utterance", type=float, default=8.0)
     parser.add_argument("--always-listen", action="store_true")
     parser.add_argument(
+        "--reminder-db",
+        type=Path,
+        help="persistent reminder SQLite path (default: BAYMAX_REMINDER_DB_PATH or user state)",
+    )
+    parser.add_argument(
+        "--timezone",
+        help="IANA timezone for reminders (default: BAYMAX_TIMEZONE or system timezone)",
+    )
+    parser.add_argument(
         "--whisper-bin",
         default="/home/bracketbot/.local/share/whisper.cpp/build/bin/whisper-cli",
     )
@@ -336,14 +405,50 @@ def main() -> None:
         default=os.environ.get("LOCAL_TTS_URL", ""),
         help="optional natural-voice service on the private USB link",
     )
+    parser.add_argument(
+        "--rppg-script",
+        type=Path,
+        default=Path(__file__).parent.parent / "rppg" / "robot_rppg.py",
+        help="read-only head-camera heart-rate scan used for heart-rate and checkup requests",
+    )
+    parser.add_argument(
+        "--person-tracker-script",
+        type=Path,
+        default=Path(__file__).parent.parent / "person" / "person_tracker.py",
+        help="turns in place to face the person before camera actions",
+    )
+    parser.add_argument(
+        "--no-person-finder",
+        action="store_true",
+        help="never turn to look for the person; use whatever is in view",
+    )
     args = parser.parse_args()
 
     load_env(args.env)
+    person_finder = None
+    if not args.no_person_finder:
+        person_finder = PersonTrackerClient(args.person_tracker_script)
+        # Start now so the face model is warm and it is already remembering
+        # where people are before the first request.
+        person_finder.start()
     gesture_controller = RecordedGestureController(
         Path(__file__).parent / "movements"
     )
+    action_controller = VoiceActionController(
+        gesture_controller,
+        Path(__file__).parent.parent / "play_sound" / "wavs",
+        heart_rate_scanner=RppgScanner(args.rppg_script),
+        person_finder=person_finder,
+        reminder_db_path=args.reminder_db or default_reminder_db_path(),
+        reminder_timezone=args.timezone or default_timezone_name(),
+    )
     router = VoiceRouter(
-        OpenRouterClient(), action_executor=gesture_controller.start
+        OpenRouterClient(response_cache=default_question_response_cache()),
+        action_executor=action_controller.start,
+        stop_executor=action_controller.stop,
+        reminder_executor=action_controller.schedule_reminder,
+        reminder_cancel_executor=action_controller.cancel_reminders,
+        reminder_list_executor=action_controller.list_reminders,
     )
     transcriber = WhisperCppTranscriber(
         args.whisper_bin,
@@ -377,6 +482,8 @@ def main() -> None:
             return
         if args.text:
             print(answer_text(router, args.text))
+            # Let a background scan finish and print its result before exit.
+            action_controller.wait()
             return
         if args.speak_text:
             speaker_cfg = Config("speaker")
@@ -385,9 +492,12 @@ def main() -> None:
             ) as speaker:
                 play_speech(speaker, synthesizer, args.speak_text, speaker_cfg, args.volume)
             return
-        run_voice(args, router, transcriber, synthesizer, gesture_controller)
+        run_voice(args, router, transcriber, synthesizer, action_controller)
     finally:
+        action_controller.close()
         gesture_controller.close()
+        if person_finder is not None:
+            person_finder.close()
 
 
 if __name__ == "__main__":

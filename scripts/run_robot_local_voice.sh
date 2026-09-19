@@ -7,6 +7,9 @@ proxy_port="${BAYMAX_PROXY_PORT:-8899}"
 proxy_url="http://${proxy_host}:${proxy_port}"
 tts_port="${BAYMAX_TTS_PORT:-8900}"
 tts_url="http://${proxy_host}:${tts_port}/tts"
+tts_voice="${BAYMAX_TTS_VOICE:-Eddy (English (US))}"
+tts_rate="${BAYMAX_TTS_RATE:-178}"
+tts_pitch="${BAYMAX_TTS_PITCH:-4}"
 proxy_pid=""
 tts_pid=""
 
@@ -36,7 +39,10 @@ proxy_pid=$!
 
 python3 scripts/local_tts_server.py \
   --host "$proxy_host" \
-  --port "$tts_port" &
+  --port "$tts_port" \
+  --voice "$tts_voice" \
+  --rate "$tts_rate" \
+  --pitch "$tts_pitch" &
 tts_pid=$!
 
 for _ in {1..50}; do
@@ -67,6 +73,9 @@ scp -q \
   bbapps/greeter/local_assistant.py \
   bbapps/greeter/local_voice.py \
   bbapps/greeter/voice_router.py \
+  bbapps/greeter/voice_actions.py \
+  bbapps/greeter/reminders.py \
+  bbapps/greeter/person_finder.py \
   bbapps/greeter/gesture_safety.py \
   bbapps/greeter/gesture_runtime.py \
   "$robot_host:/home/bracketbot/bbapps/greeter/"
@@ -74,8 +83,37 @@ scp -q bbapps/greeter/movements/*.json \
   "$robot_host:/home/bracketbot/bbapps/greeter/movements/"
 scp -q bbapps/mimic/recordings/dance.json \
   "$robot_host:/home/bracketbot/bbapps/mimic/recordings/dance.json"
-scp -q bbapps/play_sound/wavs/baymax_celebration.wav \
-  "$robot_host:/home/bracketbot/bbapps/play_sound/wavs/baymax_celebration.wav"
+scp -q \
+  bbapps/play_sound/wavs/robot_processing.wav \
+  bbapps/play_sound/wavs/happy_birthday.wav \
+  bbapps/play_sound/wavs/low_battery_1.wav \
+  bbapps/play_sound/wavs/baymax_calm.wav \
+  bbapps/play_sound/wavs/baymax_celebration.wav \
+  "$robot_host:/home/bracketbot/bbapps/play_sound/wavs/"
+echo "Syncing the read-only heart-rate scan..."
+ssh -o BatchMode=yes "$robot_host" "mkdir -p /home/bracketbot/bbapps/rppg"
+scp -q \
+  scripts/robot_rppg.py \
+  rppg.py \
+  assets/models/face_landmarker.task \
+  "$robot_host:/home/bracketbot/bbapps/rppg/"
+# Install the scan's MediaPipe/OpenCV/SciPy environment now, through the
+# proxy, so the first "what's my heart rate" does not wait on downloads.
+if ! ssh -o BatchMode=yes "$robot_host" \
+  "cd /home/bracketbot/bbapps/rppg && env HTTPS_PROXY='$proxy_url' https_proxy='$proxy_url' /home/bracketbot/.local/bin/uv run --quiet robot_rppg.py --help >/dev/null"; then
+  echo "Heart-rate scan environment did not install; heart-rate requests will fail until it does." >&2
+fi
+echo "Syncing the person tracker (turns in place to face you)..."
+ssh -o BatchMode=yes "$robot_host" "mkdir -p /home/bracketbot/bbapps/person"
+scp -q \
+  scripts/person_tracker.py \
+  scripts/camera_geometry.py \
+  assets/models/face_detection_yunet_2026may.onnx \
+  "$robot_host:/home/bracketbot/bbapps/person/"
+if ! ssh -o BatchMode=yes "$robot_host" \
+  "cd /home/bracketbot/bbapps/person && env HTTPS_PROXY='$proxy_url' https_proxy='$proxy_url' /home/bracketbot/.local/bin/uv run --quiet person_tracker.py --check-deps"; then
+  echo "Person tracker environment did not install; camera actions will use whatever is in view." >&2
+fi
 echo "Starting Gemini-free voice assistant on ${robot_host}..."
 ssh -tt "$robot_host" \
   "cd /home/bracketbot/bbapps/greeter && env HTTPS_PROXY='$proxy_url' https_proxy='$proxy_url' LOCAL_TTS_URL='$tts_url' /home/bracketbot/.local/bin/uv run --offline local_assistant.py"

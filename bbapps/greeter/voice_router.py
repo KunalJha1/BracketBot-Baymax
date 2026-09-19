@@ -10,10 +10,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
 from http import client as http_client
 import json
 import os
+from pathlib import Path
 import re
+import sqlite3
 import threading
 import time
 from typing import Callable
@@ -24,8 +27,12 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 BROWSERBASE_SEARCH_URL = "https://api.browserbase.com/v1/search"
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 DEFAULT_SYSTEM_PROMPT = (
-    "You are Baymax, a warm embodied home robot assistant. Answer in one or "
-    "two short, natural sentences because your response will be spoken aloud. "
+    "You are BracketBot, a warm embodied home robot assistant with a cheerful, "
+    "gentle bedside manner inspired by Baymax. Sound genuinely happy to help, "
+    "reassuring, and lightly playful while staying calm. Use friendly everyday "
+    "words and natural contractions. Do not imitate a movie script, force "
+    "catchphrases, or overuse exclamation marks. Answer in one or two short, "
+    "natural sentences because your response will be spoken aloud. "
     "You have web_search and perform_gesture tools. You MUST use web_search "
     "before answering about weather, "
     "current conditions, news, prices, schedules, or anything else that may have "
@@ -66,10 +73,23 @@ GESTURE_NAMES = (
     "handshake",
     "fist bump",
     "hug",
+    "namaste",
     "point",
     "point-left",
     "point-right",
     "dance",
+)
+
+STOP_ALIASES = frozenset(
+    {
+        "stop",
+        "stop moving",
+        "stop the action",
+        "cancel",
+        "cancel that",
+        "cancel the action",
+        "that's enough",
+    }
 )
 
 PERFORM_GESTURE_TOOL = {
@@ -122,6 +142,109 @@ class ModelResponse:
     action_message: str | None = None
 
 
+@dataclass(frozen=True)
+class ReminderRequest:
+    """A locally parsed timer/reminder request with no model-selected fields."""
+
+    kind: str
+    delay_seconds: float
+    message: str | None = None
+
+
+_NUMBER_WORDS = {
+    "a": 1,
+    "an": 1,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+}
+
+_REMINDER_REQUEST = re.compile(
+    r"^(?:remind me|set (?:me )?(?:a )?reminder) in "
+    r"(?P<amount>[a-z0-9 -]+?) (?P<unit>seconds?|minutes?|hours?) "
+    r"(?:to|that) (?P<message>.+)$"
+)
+_TIMER_REQUEST = re.compile(
+    r"^(?:set|start) (?:a )?timer (?:for )?"
+    r"(?P<amount>[a-z0-9 -]+?) (?P<unit>seconds?|minutes?|hours?)$"
+)
+REMINDER_CANCEL_ALIASES = frozenset(
+    {
+        "cancel my reminder",
+        "cancel the reminder",
+        "cancel all reminders",
+        "cancel my timer",
+        "cancel the timer",
+        "cancel all timers",
+    }
+)
+REMINDER_LIST_ALIASES = frozenset(
+    {
+        "list my reminders",
+        "list reminders",
+        "what are my reminders",
+        "what reminders do i have",
+        "do i have any reminders",
+    }
+)
+
+
+def _parse_spoken_number(value: str) -> float | None:
+    value = value.strip().replace("-", " ")
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    words = value.split()
+    if not words or any(word not in _NUMBER_WORDS for word in words):
+        return None
+    if len(words) == 1:
+        return float(_NUMBER_WORDS[words[0]])
+    if len(words) == 2 and _NUMBER_WORDS[words[0]] >= 20:
+        return float(_NUMBER_WORDS[words[0]] + _NUMBER_WORDS[words[1]])
+    return None
+
+
+def match_reminder_request(text: str) -> ReminderRequest | None:
+    """Parse the bounded spoken reminder grammar without consulting the LLM."""
+    normalized = normalize_utterance(text)
+    match = _REMINDER_REQUEST.fullmatch(normalized)
+    kind = "reminder"
+    if match is None:
+        match = _TIMER_REQUEST.fullmatch(normalized)
+        kind = "timer"
+    if match is None:
+        return None
+    amount = _parse_spoken_number(match.group("amount"))
+    if amount is None:
+        return None
+    unit = match.group("unit")
+    multiplier = 1 if unit.startswith("second") else 60 if unit.startswith("minute") else 3600
+    message = match.groupdict().get("message")
+    return ReminderRequest(kind, amount * multiplier, message)
+
+
 # Keep this deliberately explicit. Adding an alias here is what grants spoken
 # language permission to start that motion.
 ACTION_ALIASES = {
@@ -167,6 +290,15 @@ ACTION_ALIASES = {
             "i need a hug",
         }
     ),
+    "namaste": frozenset(
+        {
+            "namaste",
+            "do namaste",
+            "do a namaste",
+            "put your hands together",
+            "bring your hands together",
+        }
+    ),
     "fist bump": frozenset(
         {
             "fist bump",
@@ -210,10 +342,59 @@ ACTION_ALIASES = {
             "can you dance",
         }
     ),
+    "light-calm": frozenset(
+        {"calm light", "turn on the calm light", "show a calm light"}
+    ),
+    "light-ready": frozenset(
+        {"ready light", "turn on the ready light", "show the ready light"}
+    ),
+    "light-thinking": frozenset(
+        {"thinking light", "turn on the thinking light", "show the thinking light"}
+    ),
+    "light-celebrate": frozenset(
+        {"celebration light", "turn on the celebration light", "show the celebration light"}
+    ),
+    "lights-off": frozenset(
+        {"lights off", "turn the lights off", "turn off the lights"}
+    ),
+    "sound-processing": frozenset(
+        {"play the processing sound", "play the thinking sound"}
+    ),
+    "sound-birthday": frozenset(
+        {"play the birthday sound", "play happy birthday"}
+    ),
+    "sound-low-battery": frozenset(
+        {"play the battery reminder", "play the low battery sound"}
+    ),
+    "music-calm": frozenset(
+        {"play calm music", "play the calm melody"}
+    ),
+    "music-celebration": frozenset(
+        {"play upbeat music", "play the celebration melody"}
+    ),
+    "welcome": frozenset(
+        {"welcome me", "welcome everyone", "do the welcome routine"}
+    ),
+    "thinking": frozenset(
+        {"do the thinking routine", "start thinking"}
+    ),
+    "celebrate": frozenset(
+        {"celebrate", "let's celebrate", "do the celebration routine"}
+    ),
+    "double-wave": frozenset(
+        {"double wave", "wave twice", "do a double wave"}
+    ),
+    "calm-moment": frozenset(
+        {"start a calm moment", "do the calm routine"}
+    ),
+    "dance-party": frozenset(
+        {"start a dance party", "do the dance party routine"}
+    ),
 }
 
 _WAKE_PREFIX = re.compile(
-    r"^(?:(?:hey|hi|hello|ok|okay)\s+)?(?:baymax|bamax|bracket\s*bot)\s+"
+    r"^(?:(?:hey|hi|hello|ok|okay)\s+)?"
+    r"(?:baymax|bamax|(?:bracket|racket)\s*bot)\s+"
 )
 _LEADING_POLITE = re.compile(r"^(?:please\s+|can you please\s+|could you please\s+)")
 _TRAILING_POLITE = re.compile(r"\s+(?:please|for me|right now|now)$")
@@ -246,12 +427,56 @@ def match_action(text: str) -> str | None:
     return None
 
 
+_HEART_RATE_TERMS = re.compile(r"\b(?:heart ?rate|heart ?beat|pulse)\b")
+_CHECKUP_TERMS = re.compile(r"\b(?:check ?up|health check|wellness check)\b")
+_PERSONAL = re.compile(r"\b(?:my|me)\b")
+_PAST_TENSE = re.compile(r"\b(?:was|were|had|yesterday|last)\b")
+_HEALTH_REQUEST_STARTS = (
+    "check ",
+    "measure ",
+    "scan ",
+    "take ",
+    "read ",
+    "run ",
+    "start ",
+    "i need ",
+    "i want ",
+    "i'd like ",
+    "let's ",
+)
+
+
+def match_health_request(text: str) -> str | None:
+    """Recognize a request for the camera heart-rate scan or a checkup.
+
+    This is looser than gesture matching because the scan is read-only: it
+    never moves the robot. It still requires a request about the speaker, so
+    general discussion ("what is a normal heart rate") goes to the LLM.
+    """
+    normalized = normalize_utterance(text)
+    if not normalized or _NEGATIONS.search(normalized) or _PAST_TENSE.search(normalized):
+        return None
+    requested = (
+        _PERSONAL.search(normalized) is not None
+        or normalized.startswith(_REQUEST_PREFIXES)
+        or normalized.startswith(_HEALTH_REQUEST_STARTS)
+    )
+    if _CHECKUP_TERMS.search(normalized):
+        if requested or _CHECKUP_TERMS.match(normalized):
+            return "checkup"
+        return None
+    if _HEART_RATE_TERMS.search(normalized) and requested:
+        return "heart-rate"
+    return None
+
+
 _GESTURE_TERMS = {
     "wave": ("wave", "waving"),
     "salute": ("salute", "saluting"),
     "handshake": ("handshake", "shake my hand", "shaking my hand"),
     "fist bump": ("fist bump",),
     "hug": ("hug",),
+    "namaste": ("namaste", "hands together"),
     "point": ("point", "pointing"),
     "point-left": ("point", "pointing"),
     "point-right": ("point", "pointing"),
@@ -355,12 +580,159 @@ def is_question(text: str) -> bool:
     return first_word in _QUESTION_OPENERS
 
 
+_TIME_SENSITIVE_CACHE_TERMS = re.compile(
+    r"\b(?:"
+    r"now|today|tonight|tomorrow|yesterday|current|currently|latest|recent|"
+    r"recently|live|time|date|day|week|month|year|news|weather|forecast|"
+    r"temperature|price|prices|stock|stocks|crypto|market|score|scores|game|"
+    r"match|result|results|winner|won|schedule|standings|roster|lineup|odds|"
+    r"election|elected|president|minister|mayor|governor|ceo|king|queen|"
+    r"monarch|chancellor|leader|exchange rate|traffic|flight|flights|"
+    r"available|availability|open|closed|near me|local|next|last|upcoming"
+    r")\b"
+)
+_CONTEXT_DEPENDENT_CACHE_TERMS = re.compile(
+    r"\b(?:this|that|these|those|it|its|they|them|he|she|him|her|my|mine|our|"
+    r"ours|earlier|again)\b"
+)
+_CONTEXT_DEPENDENT_CACHE_PREFIX = re.compile(
+    r"^(?:and |also |what about |how about |tell me more|explain more|go on)"
+)
+
+
+def is_cacheable_question(text: str) -> bool:
+    """Return whether a spoken question is safe to reuse without fresh context."""
+    normalized = normalize_utterance(text)
+    if not normalized or not is_question(text):
+        return False
+    if _TIME_SENSITIVE_CACHE_TERMS.search(normalized):
+        return False
+    if _CONTEXT_DEPENDENT_CACHE_TERMS.search(normalized):
+        return False
+    return not _CONTEXT_DEPENDENT_CACHE_PREFIX.match(normalized)
+
+
 class OpenRouterError(RuntimeError):
     """A user-safe wrapper for OpenRouter request or response failures."""
 
 
 class BrowserbaseSearchError(RuntimeError):
     """A user-safe wrapper for Browserbase Search API failures."""
+
+
+class QuestionResponseCache:
+    """Persistent exact-question cache that safely degrades if SQLite fails."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        ttl_seconds: float = 30 * 24 * 60 * 60,
+        clock: Callable[[], float] = time.time,
+    ):
+        self.path = Path(path).expanduser()
+        self.ttl_seconds = max(0.0, float(ttl_seconds))
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._enabled = self.ttl_seconds > 0
+        if self._enabled:
+            self._initialize()
+
+    @staticmethod
+    def _key(question: str, model: str, system_prompt: str) -> str:
+        identity = json.dumps(
+            [normalize_utterance(question), model, system_prompt],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+    def _disable(self, exc: Exception) -> None:
+        if self._enabled:
+            print(f"[voice-router] Response cache disabled: {exc}", flush=True)
+        self._enabled = False
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.path, timeout=2.0)
+
+    def _initialize(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS question_responses (
+                        cache_key TEXT PRIMARY KEY,
+                        answer TEXT NOT NULL,
+                        created_at REAL NOT NULL
+                    )
+                    """
+                )
+        except (OSError, sqlite3.Error) as exc:
+            self._disable(exc)
+
+    def get(self, question: str, model: str, system_prompt: str) -> str | None:
+        if not self._enabled:
+            return None
+        cache_key = self._key(question, model, system_prompt)
+        try:
+            with self._lock, self._connect() as connection:
+                row = connection.execute(
+                    "SELECT answer, created_at FROM question_responses WHERE cache_key = ?",
+                    (cache_key,),
+                ).fetchone()
+                if row is None:
+                    return None
+                if self._clock() - float(row[1]) > self.ttl_seconds:
+                    connection.execute(
+                        "DELETE FROM question_responses WHERE cache_key = ?",
+                        (cache_key,),
+                    )
+                    return None
+                return str(row[0])
+        except (OSError, sqlite3.Error) as exc:
+            self._disable(exc)
+            return None
+
+    def put(
+        self,
+        question: str,
+        answer: str,
+        model: str,
+        system_prompt: str,
+    ) -> None:
+        if not self._enabled or not answer.strip():
+            return
+        cache_key = self._key(question, model, system_prompt)
+        try:
+            with self._lock, self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO question_responses(cache_key, answer, created_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(cache_key) DO UPDATE SET
+                        answer = excluded.answer,
+                        created_at = excluded.created_at
+                    """,
+                    (cache_key, answer.strip(), self._clock()),
+                )
+        except (OSError, sqlite3.Error) as exc:
+            self._disable(exc)
+
+
+def default_question_response_cache() -> QuestionResponseCache | None:
+    """Build the robot's on-disk cache, configurable through environment vars."""
+    configured_path = os.environ.get("BAYMAX_RESPONSE_CACHE_PATH", "").strip()
+    if configured_path.lower() in {"off", "none", "disabled"}:
+        return None
+    path = configured_path or str(
+        Path.home() / ".cache" / "bracketbot" / "question-responses.sqlite3"
+    )
+    try:
+        ttl_days = float(os.environ.get("BAYMAX_RESPONSE_CACHE_TTL_DAYS", "30"))
+    except ValueError:
+        ttl_days = 30.0
+    return QuestionResponseCache(path, ttl_seconds=max(0.0, ttl_days) * 86400)
 
 
 class BrowserbaseSearchClient:
@@ -457,6 +829,7 @@ class OpenRouterClient:
         max_tool_rounds: int = 2,
         retry_delays: tuple[float, ...] = (0.25, 0.75, 1.5),
         sleep: Callable[[float], None] = time.sleep,
+        response_cache: QuestionResponseCache | None = None,
     ):
         self.api_key = (
             os.environ.get("OPENROUTER_API_KEY", "") if api_key is None else api_key
@@ -470,6 +843,7 @@ class OpenRouterClient:
         self.max_tool_rounds = max(1, max_tool_rounds)
         self.retry_delays = tuple(max(0.0, delay) for delay in retry_delays)
         self._sleep = sleep
+        self.response_cache = response_cache
         self._history: list[dict[str, str]] = []
         self._lock = threading.Lock()
 
@@ -583,15 +957,30 @@ class OpenRouterClient:
         utterance: str,
         gesture_handler: Callable[[str], tuple[bool, str]] | None = None,
     ) -> ModelResponse:
-        if not self.api_key:
-            raise OpenRouterError(
-                "OpenRouter is not configured yet. Set OPENROUTER_API_KEY to enable questions."
-            )
-
         with self._lock:
+            cacheable = (
+                self.response_cache is not None
+                and is_cacheable_question(utterance)
+            )
+            if cacheable:
+                cached_reply = self.response_cache.get(
+                    utterance, self.model, self.system_prompt
+                )
+                if cached_reply is not None:
+                    print("[voice-router] Reused cached answer.", flush=True)
+                    self._remember(utterance, cached_reply)
+                    return ModelResponse(text=cached_reply)
+
+            if not self.api_key:
+                raise OpenRouterError(
+                    "OpenRouter is not configured yet. Set OPENROUTER_API_KEY to enable questions."
+                )
+
             messages: list[dict[str, object]] = [
                 {"role": "system", "content": self.system_prompt},
-                *self._history,
+                # Cacheable questions are intentionally answered standalone so
+                # the saved reply cannot be contaminated by an earlier turn.
+                *([] if cacheable else self._history),
                 {"role": "user", "content": utterance},
             ]
             tools = []
@@ -603,12 +992,14 @@ class OpenRouterClient:
             selected_action = None
             action_started = None
             action_message = None
+            used_tools = False
             for _ in range(self.max_tool_rounds + 1):
                 message = self._completion(messages, tools)
                 tool_calls = message.get("tool_calls")
                 if not tool_calls:
                     reply = self._message_text(message)
                     break
+                used_tools = True
                 if not isinstance(tool_calls, list):
                     raise OpenRouterError("OpenRouter returned malformed tool calls.")
                 messages.append(message)
@@ -664,22 +1055,29 @@ class OpenRouterClient:
                         "The assistant could not finish after using its tools."
                     )
 
-            self._history.extend(
-                [
-                    {"role": "user", "content": utterance},
-                    {"role": "assistant", "content": reply},
-                ]
-            )
-            if self.max_history_messages:
-                self._history = self._history[-self.max_history_messages :]
-            else:
-                self._history.clear()
+            self._remember(utterance, reply)
+            if cacheable and not used_tools and selected_action is None:
+                self.response_cache.put(
+                    utterance, reply, self.model, self.system_prompt
+                )
             return ModelResponse(
                 text=reply,
                 action=selected_action,
                 action_started=action_started,
                 action_message=action_message,
             )
+
+    def _remember(self, utterance: str, reply: str) -> None:
+        self._history.extend(
+            [
+                {"role": "user", "content": utterance},
+                {"role": "assistant", "content": reply},
+            ]
+        )
+        if self.max_history_messages:
+            self._history = self._history[-self.max_history_messages :]
+        else:
+            self._history.clear()
 
     def ask(self, utterance: str) -> str:
         """Compatibility chat API; robot tools are unavailable to direct callers."""
@@ -693,17 +1091,45 @@ class VoiceRouter:
         self,
         llm: OpenRouterClient,
         action_executor: Callable[[str], tuple[bool, str]] | None = None,
+        stop_executor: Callable[[], tuple[bool, str]] | None = None,
+        reminder_executor: Callable[[ReminderRequest], tuple[bool, str]] | None = None,
+        reminder_cancel_executor: Callable[[], tuple[bool, str]] | None = None,
+        reminder_list_executor: Callable[[], tuple[bool, str]] | None = None,
     ):
         self.llm = llm
         self.action_executor = action_executor
+        self.stop_executor = stop_executor
+        self.reminder_executor = reminder_executor
+        self.reminder_cancel_executor = reminder_cancel_executor
+        self.reminder_list_executor = reminder_list_executor
 
     @staticmethod
     def _action_reply(action: str) -> str:
         return {
             "goodbye": "Goodbye. I will wave, then go limp.",
+            "namaste": "Namaste. Bringing my hands together now.",
             "point": "Okay. I will point at the primary person I can see.",
             "point-left": "Okay. I will point at the person on the left.",
             "point-right": "Okay. I will point at the person on the right.",
+            "light-calm": "Okay. Showing the calm light.",
+            "light-ready": "Okay. Showing the ready light.",
+            "light-thinking": "Okay. Showing the thinking light.",
+            "light-celebrate": "Okay. Showing the celebration light.",
+            "lights-off": "Okay. Turning the lights off.",
+            "welcome": "Welcome. Starting the welcome routine.",
+            "thinking": "Okay. Starting the thinking routine.",
+            "celebrate": "Let's celebrate.",
+            "double-wave": "Of course. Waving twice.",
+            "calm-moment": "Okay. Starting a calm moment.",
+            "dance-party": "Let's start the dance party.",
+            "heart-rate": (
+                "Okay. Let me find you. Then please look at my camera and hold "
+                "still for about twenty seconds while I check your heart rate."
+            ),
+            "checkup": (
+                "Starting your checkup. Let me find you, then please look at my "
+                "camera and hold still for about twenty seconds."
+            ),
         }.get(action, f"Of course. Starting the {action} now.")
 
     def _execute(self, action: str) -> tuple[bool | None, str]:
@@ -716,7 +1142,60 @@ class VoiceRouter:
         if not utterance:
             return RouteDecision(RouteKind.EMPTY, utterance)
 
-        action = match_action(utterance)
+        if normalize_utterance(utterance) in STOP_ALIASES:
+            if self.stop_executor is None:
+                stopped, status = None, "Okay. Stopping now."
+            else:
+                stopped, status = self.stop_executor()
+            return RouteDecision(
+                RouteKind.ACTION if stopped is not False else RouteKind.ERROR,
+                utterance,
+                action="stop",
+                reply=status,
+                action_started=stopped,
+            )
+
+        if normalize_utterance(utterance) in REMINDER_CANCEL_ALIASES:
+            if self.reminder_cancel_executor is None:
+                cancelled, status = False, "Reminder cancellation is unavailable."
+            else:
+                cancelled, status = self.reminder_cancel_executor()
+            return RouteDecision(
+                RouteKind.ACTION if cancelled else RouteKind.ERROR,
+                utterance,
+                action="cancel-reminders",
+                reply=status,
+                action_started=cancelled,
+            )
+
+        if normalize_utterance(utterance) in REMINDER_LIST_ALIASES:
+            if self.reminder_list_executor is None:
+                listed, status = False, "Reminder listing is unavailable."
+            else:
+                listed, status = self.reminder_list_executor()
+            return RouteDecision(
+                RouteKind.ACTION if listed else RouteKind.ERROR,
+                utterance,
+                action="list-reminders",
+                reply=status,
+                action_started=listed,
+            )
+
+        reminder = match_reminder_request(utterance)
+        if reminder is not None:
+            if self.reminder_executor is None:
+                started, status = False, "Reminders are unavailable right now."
+            else:
+                started, status = self.reminder_executor(reminder)
+            return RouteDecision(
+                RouteKind.ACTION if started else RouteKind.ERROR,
+                utterance,
+                action=reminder.kind,
+                reply=status,
+                action_started=started,
+            )
+
+        action = match_action(utterance) or match_health_request(utterance)
         if action:
             started, status = self._execute(action)
             return RouteDecision(

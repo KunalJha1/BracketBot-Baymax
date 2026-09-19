@@ -4,11 +4,15 @@ from http.client import RemoteDisconnected
 from bbapps.greeter.voice_router import (
     BrowserbaseSearchClient,
     OpenRouterClient,
+    QuestionResponseCache,
     RouteKind,
     VoiceRouter,
     authorize_gesture_tool,
+    is_cacheable_question,
     is_question,
     match_action,
+    match_health_request,
+    match_reminder_request,
     normalize_utterance,
     utterances_match,
 )
@@ -32,12 +36,15 @@ def test_normalize_removes_wake_word_and_politeness():
     assert normalize_utterance("Hey Baymax, please give me a hug now!") == "give me a hug"
     assert normalize_utterance("Bamax fist-bump me, please") == "fist bump me"
     assert normalize_utterance("Hey BracketBot, what's the weather?") == "what's the weather"
+    assert normalize_utterance("Hey Racket Bot, set a timer") == "set a timer"
 
 
 def test_allowlisted_phrases_match_actions():
     assert match_action("BracketBot bye") == "goodbye"
     assert match_action("Baymax, goodbye") == "goodbye"
     assert match_action("Baymax give me a hug") == "hug"
+    assert match_action("Hey BracketBot, namaste") == "namaste"
+    assert match_action("Put your hands together") == "namaste"
     assert match_action("Baymax fist bump me") == "fist bump"
     assert match_action("Could you please shake my hand?") == "handshake"
     assert match_action("Wave for me") == "wave"
@@ -47,6 +54,13 @@ def test_allowlisted_phrases_match_actions():
     assert match_action("point to the person on the right") == "point-right"
     assert match_action("BracketBot dance") == "dance"
     assert match_action("Can you dance?") == "dance"
+    assert match_action("turn on the calm light") == "light-calm"
+    assert match_action("play happy birthday") == "sound-birthday"
+    assert match_action("play calm music") == "music-calm"
+    assert match_action("welcome everyone") == "welcome"
+    assert match_action("wave twice") == "double-wave"
+    assert match_action("start a calm moment") == "calm-moment"
+    assert match_action("start a dance party") == "dance-party"
 
 
 def test_similar_or_question_phrases_do_not_trigger_motion():
@@ -64,6 +78,106 @@ def test_model_gesture_authority_requires_an_explicit_matching_request():
     assert not authorize_gesture_tool("What is a wave?", "wave")[0]
     assert not authorize_gesture_tool("Please do not wave", "wave")[0]
     assert not authorize_gesture_tool("Could you salute?", "wave")[0]
+    assert authorize_gesture_tool("Could you do a namaste greeting?", "namaste")[0]
+
+
+def test_stop_is_deterministic_and_never_reaches_the_llm_or_action_executor():
+    class FailingLLM:
+        def ask(self, utterance):
+            raise AssertionError("stop must not reach the LLM")
+
+    actions = []
+    stops = []
+    decision = VoiceRouter(
+        FailingLLM(),
+        action_executor=lambda action: (actions.append(action) is None, "started"),
+        stop_executor=lambda: (stops.append("stop") is None, "Okay. Stopping safely."),
+    ).route("Hey BracketBot, please stop now")
+
+    assert decision.kind == RouteKind.ACTION
+    assert decision.action == "stop"
+    assert decision.action_started is True
+    assert decision.reply == "Okay. Stopping safely."
+    assert actions == []
+    assert stops == ["stop"]
+
+
+def test_stop_reports_when_no_movement_is_running():
+    decision = VoiceRouter(
+        object(), stop_executor=lambda: (False, "No movement is running.")
+    ).route("cancel that")
+
+    assert decision.kind == RouteKind.ERROR
+    assert decision.action == "stop"
+    assert decision.action_started is False
+    assert decision.reply == "No movement is running."
+
+
+def test_reminder_is_parsed_and_scheduled_without_the_llm():
+    class FailingLLM:
+        def ask(self, utterance):
+            raise AssertionError("reminders must not reach the LLM")
+
+    scheduled = []
+    router = VoiceRouter(
+        FailingLLM(),
+        reminder_executor=lambda reminder: (
+            scheduled.append(reminder) is None,
+            "Okay. I'll remind you in 4 minutes to take my meds.",
+        ),
+    )
+
+    decision = router.route(
+        "Hey BracketBot, remind me in 4 minutes to take my meds"
+    )
+
+    assert decision.kind == RouteKind.ACTION
+    assert decision.action == "reminder"
+    assert decision.action_started is True
+    assert decision.reply == "Okay. I'll remind you in 4 minutes to take my meds."
+    assert scheduled[0].delay_seconds == 240
+    assert scheduled[0].message == "take my meds"
+
+
+def test_timer_accepts_spoken_number_and_reminder_cancel_is_separate_from_stop():
+    timer = match_reminder_request("BracketBot, set a timer for four minutes")
+    assert timer is not None
+    assert timer.kind == "timer"
+    assert timer.delay_seconds == 240
+    assert timer.message is None
+
+    stops = []
+    cancellations = []
+    decision = VoiceRouter(
+        object(),
+        stop_executor=lambda: (stops.append(True) is None, "stopped"),
+        reminder_cancel_executor=lambda: (
+            cancellations.append(True) is None,
+            "Okay. I cancelled 1 reminder.",
+        ),
+    ).route("cancel my reminder")
+
+    assert decision.action == "cancel-reminders"
+    assert decision.kind == RouteKind.ACTION
+    assert cancellations == [True]
+    assert stops == []
+
+
+def test_reminders_can_be_listed_without_reaching_the_llm():
+    listed = []
+    decision = VoiceRouter(
+        object(),
+        reminder_list_executor=lambda: (
+            listed.append(True) is None,
+            "You have one active reminder.",
+        ),
+    ).route("Hey BracketBot, what reminders do I have?")
+
+    assert decision.kind == RouteKind.ACTION
+    assert decision.action == "list-reminders"
+    assert decision.action_started is True
+    assert decision.reply == "You have one active reminder."
+    assert listed == [True]
 
 
 def test_point_action_has_camera_specific_reply():
@@ -90,6 +204,15 @@ def test_question_detection_handles_spoken_text_without_punctuation():
     assert is_question("Baymax what time is it") is True
     assert is_question("Could you explain gravity") is True
     assert is_question("I like robots") is False
+
+
+def test_only_standalone_non_current_questions_are_cacheable():
+    assert is_cacheable_question("What is the capital of Canada?") is True
+    assert is_cacheable_question("Could you explain gravity") is True
+    assert is_cacheable_question("What is the weather today?") is False
+    assert is_cacheable_question("What time is it?") is False
+    assert is_cacheable_question("What about that one?") is False
+    assert is_cacheable_question("I like robots") is False
 
 
 def test_action_never_calls_llm():
@@ -185,6 +308,153 @@ def test_openrouter_request_contract_and_bounded_history():
         {"role": "assistant", "content": "First answer."},
         {"role": "user", "content": "Follow up?"},
     ]
+
+
+def test_exact_question_cache_persists_and_works_without_openrouter(tmp_path):
+    requests = []
+
+    def opener(api_request, timeout):
+        requests.append(json.loads(api_request.data))
+        return FakeResponse(
+            {"choices": [{"message": {"content": "Ottawa is Canada's capital."}}]}
+        )
+
+    cache_path = tmp_path / "question-responses.sqlite3"
+    first_client = OpenRouterClient(
+        api_key="test-key",
+        opener=opener,
+        response_cache=QuestionResponseCache(cache_path),
+    )
+    assert first_client.ask("What is the capital of Canada?") == (
+        "Ottawa is Canada's capital."
+    )
+
+    offline_client = OpenRouterClient(
+        api_key="",
+        opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a cache hit must not call OpenRouter")
+        ),
+        response_cache=QuestionResponseCache(cache_path),
+    )
+    assert offline_client.ask("Hey Baymax, what is the capital of Canada") == (
+        "Ottawa is Canada's capital."
+    )
+    assert len(requests) == 1
+
+
+def test_cache_hit_is_kept_in_history_for_follow_up(tmp_path):
+    cache = QuestionResponseCache(tmp_path / "question-responses.sqlite3")
+    cache.put(
+        "What is the capital of Canada?",
+        "Ottawa is Canada's capital.",
+        "openai/gpt-oss-20b",
+        "test prompt",
+    )
+    requests = []
+
+    def opener(api_request, timeout):
+        requests.append(json.loads(api_request.data))
+        return FakeResponse(
+            {"choices": [{"message": {"content": "It was founded in 1826."}}]}
+        )
+
+    client = OpenRouterClient(
+        api_key="test-key",
+        system_prompt="test prompt",
+        opener=opener,
+        response_cache=cache,
+    )
+    assert client.ask("What is the capital of Canada?") == "Ottawa is Canada's capital."
+    assert client.ask("What about its history?") == "It was founded in 1826."
+    assert requests[0]["messages"][-3:] == [
+        {"role": "user", "content": "What is the capital of Canada?"},
+        {"role": "assistant", "content": "Ottawa is Canada's capital."},
+        {"role": "user", "content": "What about its history?"},
+    ]
+
+
+def test_time_sensitive_questions_are_never_reused(tmp_path):
+    replies = iter(["Sunny right now.", "Cloudy right now."])
+    requests = []
+
+    def opener(api_request, timeout):
+        requests.append(json.loads(api_request.data))
+        return FakeResponse(
+            {"choices": [{"message": {"content": next(replies)}}]}
+        )
+
+    client = OpenRouterClient(
+        api_key="test-key",
+        opener=opener,
+        response_cache=QuestionResponseCache(tmp_path / "question-responses.sqlite3"),
+    )
+    assert client.ask("What is the weather today?") == "Sunny right now."
+    assert client.ask("What is the weather today?") == "Cloudy right now."
+    assert len(requests) == 2
+
+
+def test_tool_using_answers_are_never_cached(tmp_path):
+    tool_call = {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "id": "search_tides",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": json.dumps({"query": "ocean tides"}),
+                            },
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    replies = iter(
+        [
+            tool_call,
+            {"choices": [{"message": {"content": "First fresh answer."}}]},
+            tool_call,
+            {"choices": [{"message": {"content": "Second fresh answer."}}]},
+        ]
+    )
+    requests = []
+
+    def opener(api_request, timeout):
+        requests.append(json.loads(api_request.data))
+        return FakeResponse(next(replies))
+
+    class StubSearch:
+        configured = True
+
+        def search(self, query):
+            return {"query": query, "results": []}
+
+    client = OpenRouterClient(
+        api_key="test-key",
+        opener=opener,
+        web_search=StubSearch(),
+        response_cache=QuestionResponseCache(tmp_path / "question-responses.sqlite3"),
+    )
+    assert client.ask("What causes ocean tides?") == "First fresh answer."
+    assert client.ask("What causes ocean tides?") == "Second fresh answer."
+    assert len(requests) == 4
+
+
+def test_question_cache_expires_entries(tmp_path):
+    now = [100.0]
+    cache = QuestionResponseCache(
+        tmp_path / "question-responses.sqlite3",
+        ttl_seconds=10,
+        clock=lambda: now[0],
+    )
+    cache.put("Why is the sky blue?", "Because of scattering.", "model", "prompt")
+    assert cache.get("Why is the sky blue?", "model", "prompt") == (
+        "Because of scattering."
+    )
+    now[0] = 111.0
+    assert cache.get("Why is the sky blue?", "model", "prompt") is None
 
 
 def test_openrouter_retries_one_transient_disconnect():
@@ -543,3 +813,56 @@ def test_empty_utterance_does_not_call_llm():
             raise AssertionError("empty input must not reach the LLM")
 
     assert VoiceRouter(FailingLLM()).route("   ").kind == RouteKind.EMPTY
+
+
+def test_heart_rate_and_checkup_requests_match_the_camera_scan():
+    for phrase in (
+        "Hey Baymax, what's my heart rate?",
+        "whats my heartrate",
+        "check my pulse",
+        "can you measure my heart rate",
+        "take my pulse please",
+        "how is my heartbeat",
+    ):
+        assert match_health_request(phrase) == "heart-rate", phrase
+    for phrase in (
+        "give me a checkup",
+        "Baymax, can you do a check-up",
+        "I need a check up",
+        "checkup",
+        "run a health check on me",
+        "can you check my heart rate as part of a checkup",
+    ):
+        assert match_health_request(phrase) == "checkup", phrase
+
+
+def test_heart_rate_discussion_does_not_start_a_scan():
+    for phrase in (
+        "what is a normal heart rate",
+        "how does a pulse oximeter work",
+        "what happens at a checkup",
+        "my heart rate was high yesterday",
+        "I had a checkup last week",
+        "don't check my heart rate",
+        "give me a hug",
+    ):
+        assert match_health_request(phrase) is None, phrase
+
+
+def test_heart_rate_request_routes_to_executor_without_llm():
+    class FailingLLM:
+        def ask(self, utterance):
+            raise AssertionError("health scans must not call the LLM")
+
+    started = []
+    router = VoiceRouter(
+        FailingLLM(),
+        action_executor=lambda action: started.append(action) or (True, "Started"),
+    )
+
+    decision = router.route("Hey Baymax, what's my heart rate?")
+
+    assert started == ["heart-rate"]
+    assert decision.kind == RouteKind.ACTION
+    assert "hold still" in decision.reply
+    assert router.route("give me a checkup").action == "checkup"
