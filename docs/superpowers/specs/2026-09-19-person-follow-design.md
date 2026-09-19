@@ -398,3 +398,32 @@ What changed:
   simulation with no appearance cue, a bystander crossing in front and one passing
   0.3 m beside the target kept the right person in 20/20 seeds each — simulation
   evidence only; it does not model clusters merging.
+
+## 13. Known follow-ups (open after the final review, 2026-09-19)
+
+Not defects that block the first hardware bring-up, but the next session should
+take them in this order:
+
+1. **Tests assert protection the depth-only design no longer has.** The tracker
+   tests still feed clothing histograms (`hist=onehot(...)`), a path depth-only
+   perception never produces, so the suite implies a bystander protection that is
+   not live. Re-run those cases with `hist=None` or mark them as covering the
+   dormant hook.
+2. **Nothing tests `robot_follow.control_loop`.** The stdin/stop/EOF handling, the
+   per-tick drive write, and the zero-twist-on-exit `finally` are the safety glue
+   and need a fake-BBOS reader/writer harness.
+3. **Zero-twist invariant has one hole:** if the `led.ctrl` writer fails to open
+   after `drive.ctrl` succeeded, the drive writer is released without an explicit
+   zero (harmless in practice — nothing was written and the daemon times out in
+   0.1 s — but the invariant should be literally true).
+4. **Dormant code:** `timestamp_to_seconds`, `band`, `score` (always 1.0), and the
+   histogram hook (`hist_*` config, `hist_distance`) are unused by the depth-only
+   path. Keep them only as documented hooks, or delete them with their tests.
+5. **The CSV log is never flushed** (`/tmp` is tmpfs on the Jetson): a periodic
+   `flush()` protects gate evidence if a session ends hard.
+6. **Dashboard refusal reasons** ("Return to balance mode before following") are
+   returned by the API but never shown; spec §7 asks the Follow card to show the
+   last refusal reason.
+7. **Commit hygiene at merge:** commit `e3fa11f` has its `Co-Authored-By` line
+   inside the subject, and `ac49bd8` names a different Claude model. A squash
+   merge removes both; an interactive reword fixes them if the history is kept.
