@@ -160,3 +160,173 @@ def hist_distance(p, q):
         return 0.0
     overlap = float(np.sum(np.sqrt(np.clip(p, 0, None) * np.clip(q, 0, None))))
     return math.sqrt(max(0.0, 1.0 - overlap))
+
+
+class ConstantVelocityKF:
+    """(x, y, vx, vy) in the odometry frame, observed as (x, y)."""
+
+    H = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+
+    def __init__(self, x, y, t, cfg, vel_sigma=0.5):
+        self.cfg = cfg
+        self.s = np.array([x, y, 0.0, 0.0])
+        self.P = np.diag([cfg.meas_sigma**2] * 2 + [vel_sigma**2] * 2)
+        self.R = np.eye(2) * cfg.meas_sigma**2
+        self.t = t
+
+    def predict(self, t):
+        dt = t - self.t
+        if dt <= 0:
+            return
+        F = np.eye(4)
+        F[0, 2] = F[1, 3] = dt
+        G = np.array([[0.5 * dt * dt, 0.0], [0.0, 0.5 * dt * dt], [dt, 0.0], [0.0, dt]])
+        self.s = F @ self.s
+        self.P = F @ self.P @ F.T + G @ G.T * self.cfg.accel_sigma**2
+        self.t = t
+        self._cap_position_variance()
+
+    def _cap_position_variance(self):
+        # Keeps the association gate bounded during long coasts.
+        limit = self.cfg.max_pos_sigma**2
+        for i in (0, 1):
+            if self.P[i, i] > limit:
+                k = math.sqrt(limit / self.P[i, i])
+                self.P[i, :] *= k
+                self.P[:, i] *= k
+
+    def _innovation(self, z):
+        y = np.asarray(z, dtype=float) - self.H @ self.s
+        S = self.H @ self.P @ self.H.T + self.R
+        return y, S
+
+    def mahalanobis(self, z):
+        y, S = self._innovation(z)
+        return float(math.sqrt(y @ np.linalg.solve(S, y)))
+
+    def update(self, z):
+        y, S = self._innovation(z)
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.s = self.s + K @ y
+        self.P = (np.eye(4) - K @ self.H) @ self.P
+
+    def forget_velocity(self, vel_sigma=0.5):
+        pos_var = self.cfg.lost_pos_sigma**2
+        self.s[2:] = 0.0
+        self.P = np.diag([self.P[0, 0] + pos_var, self.P[1, 1] + pos_var, vel_sigma**2, vel_sigma**2])
+        self._cap_position_variance()
+
+
+class LockOn:
+    """Chooses the single person who keeps a hand raised for ``lock_window`` seconds."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.candidates = []
+
+    def reset(self):
+        self.candidates = []
+
+    def update(self, t, people, positions):
+        """Returns ``(observation, odom_xy)`` of the locked person, or None."""
+        cfg = self.cfg
+        used = set()
+        for obs, xy in zip(people, positions):
+            if not (cfg.lock_range_min <= obs.range <= cfg.lock_range_max):
+                continue
+            if abs(obs.bearing) > cfg.lock_bearing_max:
+                continue
+            best, best_d = None, cfg.lock_assoc_dist
+            for i, cand in enumerate(self.candidates):
+                d = math.dist(xy, cand["xy"])
+                if i not in used and d <= best_d:
+                    best, best_d = i, d
+            if best is None:
+                self.candidates.append({"xy": xy, "first_t": t, "samples": [], "obs": obs})
+                best = len(self.candidates) - 1
+            cand = self.candidates[best]
+            cand["xy"], cand["obs"] = xy, obs
+            cand["samples"].append((t, obs.hand_raised))
+            used.add(best)
+
+        horizon = t - cfg.lock_window
+        self.candidates = [c for c in self.candidates if c["samples"][-1][0] >= horizon]
+        qualified = []
+        for cand in self.candidates:
+            cand["samples"] = [s for s in cand["samples"] if s[0] >= horizon]
+            raised = [r for _, r in cand["samples"]]
+            if t - cand["first_t"] >= cfg.lock_window and sum(raised) >= cfg.lock_fraction * len(raised):
+                qualified.append(cand)
+        if len(qualified) != 1:
+            return None  # nobody yet, or two people at once: keep waiting
+        return qualified[0]["obs"], qualified[0]["xy"]
+
+
+class Tracker:
+    """Follows the locked person frame to frame, refusing to guess between look-alikes."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.reset()
+
+    def reset(self):
+        self.kf = None
+        self.ref_hist = None
+        self.last_update = None
+
+    @property
+    def locked(self):
+        return self.kf is not None
+
+    def start(self, t, xy, hist):
+        self.kf = ConstantVelocityKF(xy[0], xy[1], t, self.cfg)
+        self.ref_hist = None if hist is None else np.asarray(hist, dtype=float)
+        self.last_update = t
+
+    def mark_lost(self):
+        self.kf.forget_velocity()
+
+    def age(self, t):
+        return t - self.last_update
+
+    def update(self, t, people, positions):
+        """Returns "updated", "coasted" (no match), or "ambiguous" (two close matches)."""
+        cfg = self.cfg
+        self.kf.predict(t)
+        candidates = []
+        for obs, xy in zip(people, positions):
+            d = self.kf.mahalanobis(xy)
+            h = hist_distance(self.ref_hist, obs.hist)
+            if d > cfg.gate_sigma or h > cfg.hist_max_distance:
+                continue
+            score = 0.5 * d / cfg.gate_sigma + 0.5 * h / cfg.hist_max_distance
+            candidates.append((score, obs, xy))
+        if not candidates:
+            return "coasted"
+        candidates.sort(key=lambda item: item[0])
+        if len(candidates) > 1 and candidates[1][0] <= candidates[0][0] * (1 + cfg.ambiguity_ratio):
+            return "ambiguous"
+        _, obs, xy = candidates[0]
+        self.kf.update(xy)
+        self.last_update = t
+        if obs.hist is not None:
+            hist = np.asarray(obs.hist, dtype=float)
+            if self.ref_hist is None:
+                self.ref_hist = hist
+            else:
+                blended = (1 - cfg.hist_alpha) * self.ref_hist + cfg.hist_alpha * hist
+                self.ref_hist = blended / blended.sum()
+        return "updated"
+
+    def track(self, t, pose):
+        """Robot-relative view of the person at time ``t``; does not modify the filter."""
+        dt = max(0.0, t - self.kf.t)
+        x = self.kf.s[0] + self.kf.s[2] * dt
+        y = self.kf.s[1] + self.kf.s[3] * dt
+        forward, left = pose.to_local(x, y)
+        rng = math.hypot(forward, left)
+        if rng > 1e-6:
+            v_radial = (self.kf.s[2] * (x - pose.x) + self.kf.s[3] * (y - pose.y)) / rng
+        else:
+            v_radial = 0.0
+        return Track(forward, left, rng, math.atan2(left, forward), float(v_radial), self.age(t))
