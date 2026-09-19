@@ -115,7 +115,8 @@ catches up when you pause. It never drives backward, stops for anything in a
 0.6 m corridor ahead, and stops by itself if the dashboard, the link, or
 balance is lost. After losing you for 10 s it locks onto whoever next stands in
 front of it. `Esc` stops it like every other action; `--simulate` exercises the
-whole path without a robot.
+dashboard, API, and UI path without a robot (the simulated runner is a scripted
+status generator, not `follow_core`).
 
 Do not use follow mode around people until every robot gate in
 `docs/superpowers/plans/2026-09-19-person-follow-depth-only.md` (Task 5) has

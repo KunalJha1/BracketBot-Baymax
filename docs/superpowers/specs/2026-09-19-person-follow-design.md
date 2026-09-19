@@ -132,7 +132,7 @@ the front of the torso, about 0.1 m nearer than the person's centre.
   at least 0.5 s and present in ≥ 80% of the frames of the last 0.5 s is locked.
   If two candidates qualify at once, lock neither and keep waiting.
 - **Tracking:** constant-velocity Kalman filter on (x, y, vx, vy) in odometry frame
-  (measurement σ 0.08 m, acceleration σ 1 m/s², position σ capped at 1 m so the gate
+  (measurement σ 0.08 m, acceleration σ 1 m/s², position σ capped at 0.4 m so the gate
   stays bounded while coasting; on LOST the velocity is zeroed and position σ grows
   by 0.5 m).
   Association gate: Mahalanobis distance ≤ 3σ. (The tracker also supports a
@@ -240,7 +240,7 @@ All in one frozen `FollowConfig` dataclass in `follow_core.py`.
 | `person_exclusion_radius` | 0.35 m | |
 | `self_mask` | `()` | robot-body boxes in the depth cloud, filled in from G0 |
 | `odom_mismatch_time` | 0.5 s | |
-| `meas_sigma` / `accel_sigma` / `max_pos_sigma` / `lost_pos_sigma` | 0.08 m / 1.0 m/s² / 1.0 m / 0.5 m | tracker |
+| `meas_sigma` / `accel_sigma` / `max_pos_sigma` / `lost_pos_sigma` | 0.08 m / 1.0 m/s² / 0.4 m / 0.5 m | tracker |
 | `lock_window` / `lock_fraction` | 0.5 s / 0.8 | presence fraction over the window |
 | `lock_range_min` / `lock_range_max` / `lock_bearing_max` | 0.5 / 2.0 m / 30° | start zone |
 

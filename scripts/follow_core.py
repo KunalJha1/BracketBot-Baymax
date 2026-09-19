@@ -81,7 +81,7 @@ class FollowConfig:
     ambiguity_ratio: float = 0.10
     meas_sigma: float = 0.08
     accel_sigma: float = 1.0
-    max_pos_sigma: float = 1.0
+    max_pos_sigma: float = 0.4
     lost_pos_sigma: float = 0.5
 
 
@@ -154,7 +154,12 @@ class Track:
 
 
 def hist_distance(p, q):
-    """Bhattacharyya distance of two L1-normalised histograms; 0 when either is missing."""
+    """Bhattacharyya distance of two L1-normalised histograms; 0 when either is missing.
+
+    Dormant appearance hook (spec-sanctioned): depth-only perception never supplies
+    a histogram, so ``p``/``q`` are always None here and this always returns 0.0.
+    Do not mistake it for live behaviour.
+    """
     if p is None or q is None:
         return 0.0
     overlap = float(np.sum(np.sqrt(np.clip(p, 0, None) * np.clip(q, 0, None))))
@@ -622,7 +627,13 @@ def parse_command(line, cfg):
         return Command(kind)
     if kind == "gap":
         value = message.get("m")
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            finite = math.isfinite(value)
+        except OverflowError:  # a bare JSON integer too large to convert to float
+            return None
+        if not finite:
             return None
         return Command("gap", clamp(float(value), cfg.gap_min, cfg.gap_max))
     return None

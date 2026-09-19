@@ -148,6 +148,27 @@ def test_two_lookalikes_inside_the_gate_are_ambiguous():
     assert tracker.update(FRAME, people, [(1.0, 0.05), (1.0, -0.05)]) == "ambiguous"
 
 
+def lost_coasting_tracker():
+    """A tracker whose last known position was (1.0, 0.0), lost 3 s ago."""
+    tracker = Tracker(CFG)
+    tracker.start(0.0, (1.0, 0.0), None)
+    tracker.mark_lost()
+    tracker.kf.predict(3.0)
+    return tracker
+
+
+def test_position_gate_rejects_a_cluster_2m_away_during_a_lost_coast():
+    tracker = lost_coasting_tracker()
+    stranger = person(0.0)
+    assert tracker.update(3.0, [stranger], [(3.0, 0.0)]) == "coasted"
+
+
+def test_position_gate_accepts_a_cluster_0_3m_away_during_a_lost_coast():
+    tracker = lost_coasting_tracker()
+    same_person = person(0.0)
+    assert tracker.update(3.0, [same_person], [(1.3, 0.0)]) == "updated"
+
+
 def test_track_view_does_not_modify_the_filter():
     tracker = Tracker(CFG)
     tracker.start(0.0, (1.0, 0.0), None)
@@ -344,6 +365,14 @@ def test_parse_command():
     for bad in ("", "nope", "[]", '{"type":"gap","m":true}', '{"type":"gap","m":NaN}',
                 '{"type":"gap"}', '{"type":"drive","v":1}'):
         assert parse_command(bad, CFG) is None, bad
+
+
+def test_parse_command_ignores_a_bare_integer_too_large_for_a_float():
+    # A bare JSON integer (no decimal point/exponent) survives json.loads as an
+    # arbitrary-precision int; math.isfinite() raises OverflowError converting it.
+    huge_int = "9" * 400
+    assert parse_command('{"type":"gap","m":1e999999}', CFG) is None
+    assert parse_command('{"type":"gap","m":' + huge_int + '}', CFG) is None
 
 
 def test_status_line_is_prefixed_json():

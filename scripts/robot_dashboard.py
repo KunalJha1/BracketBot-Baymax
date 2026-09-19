@@ -264,10 +264,17 @@ class DashboardState:
         self.follow_gap = FOLLOW_GAP_DEFAULT
         self.follow_process = None
         self.follow_pid_file = None
+        # Assume a poll "just happened" at start-up so follow can begin normally;
+        # kept fresh by every real /api/status request from here on.
+        self.last_status_poll = time.monotonic()
 
     def follow_active(self):
         """Caller holds ``lock``."""
         return self.follow_enabled or self.follow_requested or self.follow_transition
+
+    def note_status_poll(self):
+        with self.lock:
+            self.last_status_poll = time.monotonic()
 
     def snapshot(self):
         with self.lock:
@@ -442,7 +449,7 @@ class RobotController:
             while not self._stop_monitor.wait(15):
                 with self.state.lock:
                     host = self.state.host
-                    busy = self.state.running or self.state.checking
+                    busy = self.state.running or self.state.checking or self.state.follow_active()
                 if busy:
                     continue
                 if host is None or not self._probe(host):
@@ -574,7 +581,8 @@ class RobotController:
             ["ssh", *SSH_OPTIONS, host, remote_command],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
         with self.state.lock:
@@ -753,7 +761,8 @@ class RobotController:
                 ["ssh", *SSH_OPTIONS, host, remote_command],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
             )
             with self.state.lock:
@@ -860,9 +869,15 @@ class RobotController:
             return False
         return True
 
-    def _follow_heartbeat(self, process):
-        # The runner stops by itself when these stop arriving (dashboard or link loss).
-        while process.poll() is None and self._send_follow({"type": "heartbeat"}, process):
+    def _follow_heartbeat(self, process, running):
+        # The runner stops by itself when these stop arriving: the run ended
+        # (``running`` cleared), the process exited, or the dashboard tab that
+        # was watching it stopped polling /api/status (closed or link loss).
+        while running.is_set() and process.poll() is None:
+            with self.state.lock:
+                stale = time.monotonic() - self.state.last_status_poll > 1.5
+            if stale or not self._send_follow({"type": "heartbeat"}, process):
+                return
             time.sleep(FOLLOW_HEARTBEAT_PERIOD)
 
     def _stop_follow(self):
@@ -882,6 +897,8 @@ class RobotController:
 
     def _run_follow(self, host, pid_file):
         return_code = None
+        process = None
+        heartbeat_running = threading.Event()
         try:
             self._deploy(host, FOLLOW_RUNNER, *FOLLOW_MODULES)
             with self.state.lock:
@@ -896,26 +913,39 @@ class RobotController:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
             )
             with self.state.lock:
                 self.state.follow_process = process
+                # A stop may have landed in the window between the re-check above
+                # and storing the process; if so, send it now instead of losing it.
+                should_stop = not self.state.follow_requested
+            if should_stop:
+                self._send_follow({"type": "stop"}, process)
+            heartbeat_running.set()
             threading.Thread(
-                target=self._follow_heartbeat, args=(process,), name="follow-heartbeat", daemon=True
+                target=self._follow_heartbeat, args=(process, heartbeat_running),
+                name="follow-heartbeat", daemon=True,
             ).start()
             assert process.stdout is not None
             for line in process.stdout:
                 self.state.add_follow_log(line)
                 if "follow active" in line:
                     with self.state.lock:
-                        self.state.follow_enabled = True
-                        self.state.follow_transition = False
+                        if self.state.follow_requested:
+                            self.state.follow_enabled = True
+                            self.state.follow_transition = False
             return_code = process.wait()
-        except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+        except Exception as exc:
             with self.state.lock:
                 self.state.error = f"Follow control failed: {exc}"
         finally:
+            heartbeat_running.clear()
+            if process is not None and process.poll() is None:
+                # Closing ssh gives the runner stdin EOF, which is its own stop path.
+                process.terminate()
             with self.state.lock:
                 state = self.state
                 unexpected = state.follow_requested
@@ -1311,6 +1341,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/":
             self._send(PAGE, content_type="text/html; charset=utf-8")
         elif self.path == "/api/status":
+            self.controller.state.note_status_poll()
             self._send(self.controller.state.snapshot())
         elif self.path.startswith("/api/audio/"):
             action_id = self.path.removeprefix("/api/audio/")

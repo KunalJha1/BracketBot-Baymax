@@ -1,5 +1,7 @@
 import math
+import os
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -53,3 +55,36 @@ def test_perceive_with_nobody_there():
 
 def test_runner_imports_without_bbos():
     assert "bbos" not in sys.modules
+
+
+def test_clamped_twist_reclamps_out_of_range_loop_output():
+    cfg = robot_follow.FollowConfig(v_max=0.15, omega_max=0.8)
+    stub_out = SimpleNamespace(v=-0.5, omega=5.0)
+
+    v, omega = robot_follow.clamped_twist(stub_out, cfg)
+
+    assert v == 0.0
+    assert omega == 0.8
+
+
+def test_other_drive_writers_ignores_self_and_parent_pids(monkeypatch):
+    my_pid = os.getpid()
+    parent_pid = os.getppid()
+    other_pid = 999999
+
+    def fake_run(command, **kwargs):
+        if "robot_follow.py" in command:
+            stdout = (
+                f"{my_pid} uv run --no-sync --project ~/bbos python /tmp/robot_follow.py\n"
+                f"{parent_pid} python /tmp/robot_follow.py\n"
+                f"{other_pid} python /tmp/robot_follow.py --gap 1.0\n"
+            )
+        else:
+            stdout = ""
+        return SimpleNamespace(stdout=stdout, returncode=0)
+
+    monkeypatch.setattr(robot_follow.subprocess, "run", fake_run)
+    found = robot_follow.other_drive_writers()
+
+    assert len(found) == 1
+    assert str(other_pid) in found[0]

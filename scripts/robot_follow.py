@@ -31,7 +31,7 @@ import time
 import numpy as np
 
 from follow_core import (
-    FollowConfig, FollowLoop, Perception, PersonObservation, TickInputs, led_color,
+    FollowConfig, FollowLoop, Perception, PersonObservation, TickInputs, clamp, led_color,
     parse_command, start_refusal, status_line, wheel_twist,
 )
 from follow_perception import ClusterConfig, base_to_local, find_people
@@ -44,11 +44,12 @@ WHEEL_ORDER = (0, 1)
 WHEEL_SIGNS = (1.0, 1.0)
 DRIVE_WRITER_PATTERNS = (
     "greeter/main.py", "nav/main.py", "bbapps/teleop.py", "quest_teleop/main.py",
-    "leader_follower_teleop.py", "live_inference.py",
+    "leader_follower_teleop.py", "live_inference.py", "robot_follow.py", "robot_base_mode.py",
 )
 CSV_FIELDS = (
     "t", "state", "rule", "gap", "range", "bearing", "error", "v_cmd", "omega_cmd", "v", "omega",
     "measured_v", "measured_omega", "blocked", "corridor_points", "track_age", "people",
+    "tick_ms", "perception_ms",
 )
 STOP_REQUESTED = False
 
@@ -99,12 +100,15 @@ def wait_fresh(reader, timeout, topic):
 
 
 def other_drive_writers():
+    # robot_follow.py and robot_base_mode.py match our own pattern, and the
+    # `uv run ... python /tmp/robot_follow.py` parent also matches: ignore both.
+    mine = {os.getpid(), os.getppid()}
     found = []
     for pattern in DRIVE_WRITER_PATTERNS:
         result = subprocess.run(["pgrep", "-af", pattern], capture_output=True, text=True)
         found.extend(
             line.strip() for line in result.stdout.splitlines()
-            if line.strip() and int(line.split()[0]) != os.getpid()
+            if line.strip() and int(line.split()[0]) not in mine
         )
     return found
 
@@ -133,6 +137,12 @@ def start_command_reader(commands):
 def write_twist(writer, v, omega):
     with writer.buf() as frame:
         frame["twist"] = np.array([v, omega], dtype=np.float32)
+
+
+def clamped_twist(out, cfg):
+    """Re-clamp what the loop asks for; the runner never writes a negative speed
+    even if the controller or supervisor were ever wrong (Global Constraints)."""
+    return clamp(out.v, 0.0, cfg.v_max), clamp(out.omega, -cfg.omega_max, cfg.omega_max)
 
 
 def write_led(writer, rgb):
@@ -200,7 +210,11 @@ def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width):
             if drive_state.ready():
                 vel = np.asarray(drive_state.data["vel"], dtype=float)
                 measured = wheel_twist(vel[list(WHEEL_ORDER)], wheel_diam, robot_width, WHEEL_SIGNS)
-            perception = perceive(cloud(points.data), t) if points.ready() else None
+            perception = perception_ms = None
+            if points.ready():
+                perception_started = time.monotonic()
+                perception = perceive(cloud(points.data), t)
+                perception_ms = (time.monotonic() - perception_started) * 1000.0
 
             out = loop.tick(TickInputs(
                 t=t, heartbeat_age=t - last_heartbeat,
@@ -209,7 +223,7 @@ def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width):
                 measured_v=measured[0], measured_omega=measured[1], perception=perception,
             ))
             if drive is not None:
-                write_twist(drive, out.v, out.omega)
+                write_twist(drive, *clamped_twist(out, cfg))
             if out.state != state:
                 print(f"[follow] state {out.state}", flush=True)
                 state, state_since = out.state, t
@@ -225,6 +239,8 @@ def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width):
                     "measured_v": measured[0], "measured_omega": measured[1], "blocked": out.blocked,
                     "corridor_points": out.corridor_points, "track_age": out.track_age,
                     "people": "" if perception is None else len(perception.people),
+                    "tick_ms": round((time.monotonic() - t) * 1000, 3),
+                    "perception_ms": "" if perception_ms is None else round(perception_ms, 3),
                 })
                 last_csv = t
             if out.exit:
@@ -283,8 +299,9 @@ def run(args):
                 for _ in range(6):
                     write_twist(drive, 0.0, 0.0)
                     time.sleep(PERIOD)
-                print("[follow] stopped; zero twist sent", flush=True)
             write_led(led, (0, 0, 0))
+            if drive is not None:
+                print("[follow] stopped; zero twist sent", flush=True)
 
 
 def main(argv=None):

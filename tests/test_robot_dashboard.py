@@ -355,3 +355,115 @@ def test_follow_robot_mode_streams_heartbeats_gap_and_stop(monkeypatch):
     state = controller.state.snapshot()
     assert state["follow_phase"] == "Follow off"
     assert state["error"] is None
+
+
+class CrashingFollowProcess:
+    """Stands in for an ssh process whose stdout decoding blows up mid-stream
+    (e.g. a UnicodeDecodeError from non-ASCII remote output with text=True)."""
+
+    def __init__(self, command, **kwargs):
+        self.command = command
+        self.lines = []
+        self.terminated = False
+        self.stdin = self
+        self.stdout = self._output()
+
+    def write(self, text):
+        self.lines.append(json.loads(text))
+
+    def flush(self):
+        pass
+
+    def _output(self):
+        yield "[follow] follow active (v_max 0.15 m/s, gap 1.00 m) - stand in front of the robot\n"
+        raise ValueError("simulated decode failure")
+
+    def poll(self):
+        return 0 if self.terminated else None
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self):
+        return 0
+
+
+def test_crashed_follow_reader_terminates_process_and_stops_heartbeats(monkeypatch):
+    processes = []
+
+    def fake_popen(command, **kwargs):
+        processes.append(CrashingFollowProcess(command, **kwargs))
+        return processes[-1]
+
+    monkeypatch.setattr("scripts.robot_dashboard.subprocess.Popen", fake_popen)
+    controller = RobotController(("bot",), follow_args=("--v-max", "0.15"))
+    controller.state.host = "bot"
+    monkeypatch.setattr(controller, "_deploy", lambda host, *paths: False)
+    monkeypatch.setattr(controller, "_request_remote_stop", lambda *a, **k: None)
+
+    assert controller.set_follow(True) == (True, "Starting follow mode")
+    wait_for(lambda: follow_off(controller))
+
+    process = processes[0]
+    assert process.terminated is True
+    state = controller.state.snapshot()
+    assert state["error"] is not None
+
+    heartbeat_count = sum(line["type"] == "heartbeat" for line in process.lines)
+    time.sleep(0.4)
+    assert sum(line["type"] == "heartbeat" for line in process.lines) == heartbeat_count
+
+
+def test_stop_during_startup_sends_stop_and_never_enables_follow(monkeypatch):
+    processes = []
+    controller = RobotController(("bot",), follow_args=("--v-max", "0.15"))
+    controller.state.host = "bot"
+
+    def fake_popen(command, **kwargs):
+        process = FakeFollowProcess(command, **kwargs)
+        # A stop lands in the window between Popen returning and the dashboard
+        # storing follow_process under the lock (the I2 race).
+        with controller.state.lock:
+            controller.state.follow_requested = False
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr("scripts.robot_dashboard.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(controller, "_deploy", lambda host, *paths: False)
+    monkeypatch.setattr(controller, "_request_remote_stop", lambda *a, **k: None)
+
+    assert controller.set_follow(True) == (True, "Starting follow mode")
+    wait_for(lambda: follow_off(controller))
+
+    process = processes[0]
+    assert {"type": "stop"} in process.lines
+    assert controller.state.snapshot()["follow_enabled"] is False
+
+
+def test_heartbeat_stops_once_the_browser_tab_stops_polling(monkeypatch):
+    processes = []
+
+    def fake_popen(command, **kwargs):
+        processes.append(FakeFollowProcess(command, **kwargs))
+        return processes[-1]
+
+    monkeypatch.setattr("scripts.robot_dashboard.subprocess.Popen", fake_popen)
+    controller = RobotController(("bot",), follow_args=("--v-max", "0.15"))
+    controller.state.host = "bot"
+    monkeypatch.setattr(controller, "_deploy", lambda host, *paths: False)
+    monkeypatch.setattr(controller, "_request_remote_stop", lambda *a, **k: None)
+
+    assert controller.set_follow(True) == (True, "Starting follow mode")
+    wait_for(lambda: controller.state.snapshot()["follow_enabled"])
+    process = processes[0]
+    wait_for(lambda: sum(line["type"] == "heartbeat" for line in process.lines) >= 1)
+
+    with controller.state.lock:
+        controller.state.last_status_poll = time.monotonic() - 2.0
+
+    heartbeat_count = sum(line["type"] == "heartbeat" for line in process.lines)
+    time.sleep(0.5)
+    assert sum(line["type"] == "heartbeat" for line in process.lines) == heartbeat_count
+
+    controller.stop()
+    wait_for(lambda: follow_off(controller))
