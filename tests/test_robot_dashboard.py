@@ -1,3 +1,5 @@
+import json
+import threading
 import time
 from types import SimpleNamespace
 import wave
@@ -7,6 +9,12 @@ from scripts.robot_dashboard import (
     ACTIONS,
     DEFAULT_SSH_HOSTS,
     EFFECT_RUNNER,
+    FOLLOW_GAP_DEFAULT,
+    FOLLOW_GAP_MAX,
+    FOLLOW_GAP_MIN,
+    FOLLOW_MODULES,
+    FOLLOW_RUNNER,
+    FOLLOW_STATUS_PREFIX,
     ROUTINE_LIST,
     ROUTINES,
     ROOT,
@@ -198,3 +206,152 @@ def test_deploy_skips_unchanged_cached_files(tmp_path, monkeypatch):
     asset.write_text("version two")
     assert controller._deploy("bot", asset) is True
     assert len(calls) == 2
+
+
+# --- follow mode ------------------------------------------------------------
+
+
+def wait_for(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError("condition not reached")
+
+
+def follow_off(controller):
+    state = controller.state.snapshot()
+    return not state["follow_enabled"] and not state["follow_transition"]
+
+
+def test_follow_protocol_matches_the_runner():
+    import follow_core
+
+    cfg = follow_core.FollowConfig()
+    assert FOLLOW_STATUS_PREFIX == follow_core.STATUS_PREFIX
+    assert (FOLLOW_GAP_MIN, FOLLOW_GAP_MAX, FOLLOW_GAP_DEFAULT) == (cfg.gap_min, cfg.gap_max, cfg.gap_default)
+
+    controller = RobotController(("not-used",), simulate=True)
+    controller.set_follow(True)
+    wait_for(lambda: controller.state.snapshot()["follow_status"] is not None)
+    simulated = controller.state.snapshot()["follow_status"]
+    controller.stop()
+    wait_for(lambda: follow_off(controller))
+
+    out = follow_core.FollowLoop(cfg).tick(follow_core.TickInputs(0.0, 0.1, False, 0.0, 0.0, 0.0, 0.0))
+    real = json.loads(follow_core.status_line(out)[len(FOLLOW_STATUS_PREFIX):])
+    assert set(simulated) == set(real)
+
+
+def test_follow_simulation_reports_status_and_stops():
+    controller = RobotController(("not-used",), simulate=True)
+
+    assert controller.set_follow(True) == (True, "Starting follow mode")
+    wait_for(lambda: (controller.state.snapshot()["follow_status"] or {}).get("state") == "FOLLOWING")
+    assert controller.state.snapshot()["follow_enabled"] is True
+    assert controller.set_follow(True) == (False, "Follow is already on")
+
+    assert controller.stop() == (True, "Stop requested")
+    wait_for(lambda: follow_off(controller))
+    state = controller.state.snapshot()
+    assert state["follow_phase"] == "Follow off"
+    assert state["follow_status"] is None
+    assert state["error"] is None
+
+
+def test_follow_excludes_actions_and_lean():
+    controller = RobotController(("not-used",), simulate=True)
+    controller.set_follow(True)
+    wait_for(lambda: controller.state.snapshot()["follow_enabled"])
+
+    assert controller.run_action("wave") == (False, "Stop following before running actions")
+    assert controller.run_routine("welcome") == (False, "Stop following before running actions")
+    assert controller.set_lean(True) == (False, "Stop following before enabling lean")
+
+    assert controller.set_follow(False) == (True, "Stopping follow mode")
+    wait_for(lambda: follow_off(controller))
+    assert controller.set_lean(True) == (True, "Lean enabled")
+    assert controller.set_follow(True) == (False, "Return to balance mode before following")
+
+
+def test_follow_gap_validation():
+    controller = RobotController(("not-used",), simulate=True)
+
+    for bad in ("1.2", True, None, float("nan")):
+        assert controller.set_follow_gap(bad) == (False, "gap must be a number of metres")
+    assert controller.set_follow_gap(2.0) == (False, "gap must be between 0.6 and 1.5 m")
+    assert controller.set_follow_gap(1.25) == (True, "Gap set to 1.25 m")
+    assert controller.state.snapshot()["follow_gap"] == 1.25
+
+
+def test_action_bundle_ships_the_follow_runner_and_its_modules():
+    bundle = action_bundle_paths()
+    assert FOLLOW_RUNNER in bundle
+    assert all(module in bundle for module in FOLLOW_MODULES)
+
+
+class FakeFollowProcess:
+    """Stands in for the ssh process: records stdin lines, emits runner output."""
+
+    def __init__(self, command, **kwargs):
+        self.command = command
+        self.lines = []
+        self.done = threading.Event()
+        self.stdin = self
+        self.stdout = self._output()
+
+    def write(self, text):
+        self.lines.append(json.loads(text))
+        if self.lines[-1]["type"] == "stop":
+            self.done.set()
+
+    def flush(self):
+        pass
+
+    def _output(self):
+        yield "[follow] follow active (v_max 0.15 m/s, gap 1.00 m) - stand in front of the robot\n"
+        yield 'FOLLOW_STATUS {"state":"SEARCHING","range":null}\n'
+        self.done.wait(5)
+        yield "[follow] exit: stop\n"
+
+    def poll(self):
+        return 0 if self.done.is_set() else None
+
+    def wait(self):
+        self.done.wait(5)
+        return 0
+
+
+def test_follow_robot_mode_streams_heartbeats_gap_and_stop(monkeypatch):
+    processes, remote_stops = [], []
+
+    def fake_popen(command, **kwargs):
+        processes.append(FakeFollowProcess(command, **kwargs))
+        return processes[-1]
+
+    monkeypatch.setattr("scripts.robot_dashboard.subprocess.Popen", fake_popen)
+    controller = RobotController(("bot",), follow_args=("--v-max", "0.15"))
+    controller.state.host = "bot"
+    monkeypatch.setattr(controller, "_deploy", lambda host, *paths: False)
+    monkeypatch.setattr(controller, "_request_remote_stop",
+                        lambda host, pid_file, name: remote_stops.append(pid_file))
+
+    assert controller.set_follow(True) == (True, "Starting follow mode")
+    wait_for(lambda: controller.state.snapshot()["follow_enabled"])
+    process = processes[0]
+    assert "/tmp/robot_follow.py --gap 1.00 --pid-file /tmp/bracketbot-follow-1.pid --v-max 0.15" in process.command[-1]
+    assert '"$HOME/bbos/.venv/bin/python"' in process.command[-1]
+    wait_for(lambda: sum(line["type"] == "heartbeat" for line in process.lines) >= 2)
+    assert controller.state.snapshot()["follow_status"] == {"state": "SEARCHING", "range": None}
+
+    controller.set_follow_gap(1.3)
+    assert {"type": "gap", "m": 1.3} in process.lines
+
+    assert controller.stop() == (True, "Stop requested")
+    wait_for(lambda: follow_off(controller))
+    assert process.lines[-1] == {"type": "stop"}
+    assert remote_stops == ["/tmp/bracketbot-follow-1.pid"]
+    state = controller.state.snapshot()
+    assert state["follow_phase"] == "Follow off"
+    assert state["error"] is None
