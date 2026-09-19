@@ -99,6 +99,21 @@ RAISE_CLEARANCE_METRES = 0.03
 # lift sign differs per arm (docs/robot-facts.md).
 REST_LIFT_TURNS = 1.0
 REST_SECONDS = 6.0
+# A healthy gripper reads within its URDF range (0..1 rad, a little slack each
+# side). bracketbot-184's right gripper reads ~2.26 rad, so its grasp feedback
+# is meaningless and that arm must not be trusted to report a hold.
+GRIPPER_VALID_RADIANS = (-0.30, 1.20)
+GRIPPER_FIX_SECONDS = 6.0
+GRIPPER_FIX_MAX_AMPS = 1.5
+# Leaning the torso forward buys reach: the shoulder sits ~1.27 m above the
+# wheel axis, so each degree of lean moves it ~22 mm further out. BBOS clamps
+# a lean request to 1-15 deg and expires it after 0.25 s, so it must be
+# republished continuously (docs/robot-facts.md).
+SHOULDER_ABOVE_AXLE_METRES = 1.265
+MAX_LEAN_DEGREES = 10.0
+LEAN_SETTLE_SECONDS = 3.0
+LEAN_PERIOD_SECONDS = 0.05
+LEAN_MODE, BALANCE_MODE = 1, 0
 # Measured on bracketbot-184: grasps solve to 2-6 mm out to ~0.45 m from the
 # shoulder and fail beyond ~0.52 m, where tipping the ~14 cm fingers down
 # costs horizontal reach.
@@ -584,6 +599,118 @@ def plan_adjusted(cfg, side, pregrasp_pose, grasp, lift, quaternion, observation
     return descend, lifted
 
 
+class LeanHold:
+    """Hold a bounded forward lean for as long as the pick needs it.
+
+    The base-mode request expires after ~0.25 s, so a thread republishes it;
+    balance is restored on stop, and by expiry if this process dies.
+    """
+
+    def __init__(self, Type, Writer, degrees):
+        self.Type, self.Writer = Type, Writer
+        self.degrees = float(degrees)
+        self.stop = threading.Event()
+        self.thread = None
+
+    def _run(self):
+        with tr.nonsuppressing(self.Writer("base.mode", self.Type("base_mode"), keeptime=False)) as base:
+            while not self.stop.is_set():
+                with base.buf() as frame:
+                    frame["mode"] = np.uint8(LEAN_MODE)
+                    frame["lean_angle_deg"] = np.float32(self.degrees)
+                time.sleep(LEAN_PERIOD_SECONDS)
+            for _ in range(8):
+                with base.buf() as frame:
+                    frame["mode"] = np.uint8(BALANCE_MODE)
+                    frame["lean_angle_deg"] = np.float32(0.0)
+                time.sleep(LEAN_PERIOD_SECONDS)
+        log("lean", "balance mode restored")
+
+    def __enter__(self):
+        log("lean", f"holding {self.degrees:.1f} deg forward lean for extra reach")
+        self.thread = threading.Thread(target=self._run, name="lean-hold", daemon=True)
+        self.thread.start()
+        time.sleep(LEAN_SETTLE_SECONDS)
+        return self
+
+    def __exit__(self, *_):
+        self.stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=4.0)
+        return False
+
+
+def lean_for_reach(reach):
+    """Extra lean (deg) that would bring ``reach`` inside MAX_REACH_METRES."""
+
+    shortfall = reach - MAX_REACH_METRES + 0.02
+    if shortfall <= 0:
+        return 0.0
+    needed = math.degrees(math.asin(min(1.0, shortfall / SHOULDER_ABOVE_AXLE_METRES)))
+    return min(MAX_LEAN_DEGREES, math.ceil(needed * 2) / 2)
+
+
+def fix_gripper(Config, Reader, Type, Writer, side):
+    """Drive a gripper joint back inside its URDF range, watching current."""
+
+    cfg = Config(f"arm_{side}")
+    with tr.nonsuppressing(Reader(f"arm_{side}.state", keeptime=False)) as reader:
+        start = np.asarray(tr.fresh(reader)["pos"], dtype=np.float64).copy()
+        radians = gripper_radians(cfg, start)
+        log("gripper", f"{side} reads {radians:.3f} rad ({start[GRIPPER_INDEX]:.3f} turns)")
+        goal = start.copy()
+        goal[GRIPPER_INDEX] = float(np.asarray(cfg.home, dtype=np.float64)[GRIPPER_INDEX])
+        log("gripper", f"{side} moving gripper to its home {goal[GRIPPER_INDEX]:.3f} turns "
+                       f"over {GRIPPER_FIX_SECONDS:.0f}s, stopping above {GRIPPER_FIX_MAX_AMPS} A")
+        with ExitStack() as stack:
+            control = stack.enter_context(tr.nonsuppressing(
+                Writer(f"arm_{side}.ctrl", Type("arm_ctrl"), keeptime=False)))
+            torque = stack.enter_context(tr.nonsuppressing(
+                Writer(f"arm_{side}.torque", Type("arm_torque"), keeptime=False)))
+
+            def command(pose):
+                with control.buf() as frame:
+                    frame["pos"][:] = np.asarray(pose, dtype=np.float32)
+                    frame["vel"][:] = 0
+                    frame["tau"][:] = 0
+                    frame["alpha"] = 0.0
+
+            def set_torque(enabled):
+                with torque.buf() as frame:
+                    frame["enable"][:] = enabled
+                    frame["tau_mode"][:] = False
+                    frame["compliance_mode"] = False
+
+            for _ in range(8):
+                command(start)
+                time.sleep(tr.TICK_SECONDS)
+            set_torque(True)
+            began = time.monotonic()
+            pose = start.copy()
+            try:
+                while True:
+                    alpha = min((time.monotonic() - began) / GRIPPER_FIX_SECONDS, 1.0)
+                    pose[GRIPPER_INDEX] = ((1.0 - alpha) * start[GRIPPER_INDEX]
+                                           + alpha * goal[GRIPPER_INDEX])
+                    command(pose)
+                    time.sleep(tr.TICK_SECONDS)
+                    data = reader.data
+                    current = abs(float(np.asarray(data["current"])[GRIPPER_INDEX]))
+                    if current >= GRIPPER_FIX_MAX_AMPS:
+                        log("gripper", f"{side} stopped at {current:.2f} A "
+                                       f"({gripper_radians(cfg, np.asarray(data['pos'])):.3f} rad)")
+                        break
+                    if alpha >= 1.0 or cancel_event.is_set():
+                        break
+            finally:
+                time.sleep(0.3)
+                set_torque(False)
+        final = gripper_radians(cfg, np.asarray(tr.fresh(reader)["pos"], dtype=np.float64))
+    healthy = GRIPPER_VALID_RADIANS[0] <= final <= GRIPPER_VALID_RADIANS[1]
+    log("gripper", f"{side} now reads {final:.3f} rad; in range={healthy}")
+    return healthy
+
+
 def rest_arms(Config, Reader, Type, Writer, sides=("left", "right")):
     """Lower the arms back to their hanging rest pose, then release torque."""
 
@@ -657,7 +784,7 @@ def rest_arms(Config, Reader, Type, Writer, sides=("left", "right")):
 
 
 def execute(plan_only=True, pid_file=None, stop_at=None, adjust=False,
-            grip_torque=GRIP_CLOSE_TORQUE_NM):
+            grip_torque=GRIP_CLOSE_TORQUE_NM, allow_lean=True):
     bbos, Config, Reader, Type, Writer = tr._load_bbos()
     with tr.nonsuppressing(Reader("imu.orientation", keeptime=False)) as imu:
         rpy = np.asarray(tr.fresh(imu)["rpy"], dtype=np.float64)
@@ -666,12 +793,50 @@ def execute(plan_only=True, pid_file=None, stop_at=None, adjust=False,
         raise RuntimeError("robot is not upright")
 
     plane, item = scan(Reader)
+    lean = lean_for_reach(object_reach(item))
+    if lean and allow_lean:
+        with LeanHold(Type, Writer, lean):
+            # Leaning moves the shoulder and the whole depth frame, so the
+            # scene has to be measured again before anything is planned.
+            plane, item = scan(Reader)
+            log("lean", f"after leaning, object reach is {object_reach(item):.3f} m")
+            return pick_with(bbos, Config, Reader, Type, Writer, plane, item,
+                             plan_only, stop_at, adjust, grip_torque)
     check_reach(item)
-    side = "left" if item.center[1] >= 0.0 else "right"
-    cfg = Config(f"arm_{side}")
-    with tr.nonsuppressing(Reader(f"arm_{side}.state", keeptime=False)) as state_reader:
-        start = np.asarray(tr.fresh(state_reader)["pos"], dtype=np.float64).copy()
-    log("state", f"side={side} start={fmt(start)} gripper={gripper_radians(cfg, start):.3f}rad")
+    return pick_with(bbos, Config, Reader, Type, Writer, plane, item,
+                     plan_only, stop_at, adjust, grip_torque)
+
+
+def object_reach(item):
+    shoulder_y = SHOULDER_LATERAL_METRES if item.center[1] >= 0 else -SHOULDER_LATERAL_METRES
+    return math.hypot(item.center[0], item.center[1] - shoulder_y)
+
+
+def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
+              plan_only, stop_at, adjust, grip_torque):
+    check_reach(item)
+    preferred = "left" if item.center[1] >= 0.0 else "right"
+    rejected = []
+    for side in (preferred, "right" if preferred == "left" else "left"):
+        cfg = Config(f"arm_{side}")
+        with tr.nonsuppressing(Reader(f"arm_{side}.state", keeptime=False)) as state_reader:
+            start = np.asarray(tr.fresh(state_reader)["pos"], dtype=np.float64).copy()
+        radians = gripper_radians(cfg, start)
+        log("state", f"side={side} start={fmt(start)} gripper={radians:.3f}rad")
+        if not GRIPPER_VALID_RADIANS[0] <= radians <= GRIPPER_VALID_RADIANS[1]:
+            rejected.append(f"{side} gripper reads {radians:.2f} rad, outside "
+                            f"{GRIPPER_VALID_RADIANS}; its grasp feedback cannot be trusted")
+            log("state", f"side={side} rejected: {rejected[-1]}")
+            continue
+        shoulder_y = SHOULDER_LATERAL_METRES if side == "left" else -SHOULDER_LATERAL_METRES
+        reach = math.hypot(item.center[0], item.center[1] - shoulder_y)
+        if reach > MAX_REACH_METRES:
+            rejected.append(f"{side} arm would need {reach:.2f} m of reach")
+            log("state", f"side={side} rejected: {rejected[-1]}")
+            continue
+        break
+    else:
+        raise RuntimeError("no usable arm: " + "; ".join(rejected))
 
     failures = []
     options = [(pitch, fraction) for fraction in (1.0, 0.5, 0.0) for pitch in GRASP_PITCHES_DEGREES]
@@ -952,6 +1117,10 @@ def main():
     parser.add_argument("--virtual", type=float, nargs=3, metavar=("X", "Y", "TOP"),
                         help="plan-only: plan against a pretend object at arm-frame X,Y "
                              "with this height, on the live table plane")
+    parser.add_argument("--fix-gripper", choices=("left", "right"),
+                        help="drive that gripper back into its valid range and stop")
+    parser.add_argument("--no-lean", action="store_true",
+                        help="never request extra forward lean for out-of-reach objects")
     parser.add_argument("--rest", action="store_true",
                         help="lower both arms back to their hanging rest pose and stop")
     parser.add_argument("--grip-torque", type=float, default=GRIP_CLOSE_TORQUE_NM,
@@ -976,12 +1145,15 @@ def main():
     if args.pid_file:
         args.pid_file.write_text(f"{os.getpid()}\n")
     try:
+        if args.fix_gripper:
+            _, Config, Reader, Type, Writer = tr._load_bbos()
+            return 0 if fix_gripper(Config, Reader, Type, Writer, args.fix_gripper) else 1
         if args.rest:
             _, Config, Reader, Type, Writer = tr._load_bbos()
             rest_arms(Config, Reader, Type, Writer)
             return 0
         execute(plan_only=not args.execute, stop_at=args.stop_at, adjust=args.adjust,
-                grip_torque=args.grip_torque)
+                grip_torque=args.grip_torque, allow_lean=not args.no_lean)
         return 0
     except Exception as exc:  # noqa: BLE001 - report every failure as NOT SAFE
         log("fatal", f"NOT SAFE TO RUN: {type(exc).__name__}: {exc}")

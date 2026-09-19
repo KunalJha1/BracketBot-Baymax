@@ -14,6 +14,7 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+uv.lock
 
 # Models, builds, and generated data
 /artifacts/

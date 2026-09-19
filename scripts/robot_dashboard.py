@@ -18,6 +18,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 import json
+import math
 import os
 from pathlib import Path
 import shlex
@@ -44,6 +45,15 @@ REMOTE_BASE_RUNNER = "/tmp/robot_base_mode.py"
 REMOTE_GREETER_ACTION_RUNNER = "/tmp/greeter_action.py"
 REMOTE_TABLE_REST_RUNNER = "/tmp/table_rest.py"
 REMOTE_DEMO_ARM_RESERVATION = "/tmp/bracketbot-demo-arm-reserved"
+FOLLOW_RUNNER = ROOT / "scripts" / "robot_follow.py"
+FOLLOW_MODULES = (ROOT / "scripts" / "follow_core.py", ROOT / "scripts" / "follow_perception.py")
+REMOTE_FOLLOW_RUNNER = "/tmp/robot_follow.py"
+# Must match follow_core (FollowConfig gap bounds and STATUS_PREFIX); a test checks this.
+FOLLOW_GAP_MIN = 0.6
+FOLLOW_GAP_MAX = 1.5
+FOLLOW_GAP_DEFAULT = 1.0
+FOLLOW_STATUS_PREFIX = "FOLLOW_STATUS "
+FOLLOW_HEARTBEAT_PERIOD = 0.25
 SSH_OPTIONS = (
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=3",
@@ -297,6 +307,8 @@ def action_bundle_paths():
         GREETER_ACTION_RUNNER,
         CAMERA_POINT_RUNNER,
         TABLE_REST_RUNNER,
+        FOLLOW_RUNNER,
+        *FOLLOW_MODULES,
     ]
     paths.extend(
         action_resource_path(action)
@@ -355,6 +367,25 @@ class DashboardState:
         self.demo_started_at = None
         self.demo_ended_at = None
         self.server_id = uuid.uuid4().hex
+        self.follow_enabled = False
+        self.follow_requested = False
+        self.follow_transition = False
+        self.follow_phase = "Follow off"
+        self.follow_status = None
+        self.follow_gap = FOLLOW_GAP_DEFAULT
+        self.follow_process = None
+        self.follow_pid_file = None
+        # Assume a poll "just happened" at start-up so follow can begin normally;
+        # kept fresh by every real /api/status request from here on.
+        self.last_status_poll = time.monotonic()
+
+    def follow_active(self):
+        """Caller holds ``lock``."""
+        return self.follow_enabled or self.follow_requested or self.follow_transition
+
+    def note_status_poll(self):
+        with self.lock:
+            self.last_status_poll = time.monotonic()
 
     def snapshot(self):
         with self.lock:
@@ -399,6 +430,13 @@ class DashboardState:
                     ),
                     "stages": list(DEMO_STAGES),
                 },
+                "follow_enabled": self.follow_enabled,
+                "follow_transition": self.follow_transition,
+                "follow_phase": self.follow_phase,
+                "follow_status": self.follow_status,
+                "follow_gap": self.follow_gap,
+                "follow_gap_min": FOLLOW_GAP_MIN,
+                "follow_gap_max": FOLLOW_GAP_MAX,
             }
 
     def add_log(self, line):
@@ -419,6 +457,23 @@ class DashboardState:
             del self.log[:-500]
             self.lean_phase = line
 
+    def add_follow_log(self, line):
+        line = line.strip()
+        if not line:
+            return
+        if line.startswith(FOLLOW_STATUS_PREFIX):
+            try:
+                status = json.loads(line[len(FOLLOW_STATUS_PREFIX):])
+            except json.JSONDecodeError:
+                return
+            with self.lock:
+                self.follow_status = status
+            return
+        with self.lock:
+            self.log.append(f"[follow] {line.removeprefix('[follow] ')}")
+            del self.log[:-80]
+            self.follow_phase = line.removeprefix("[follow] ")
+
 
 class RobotController:
     def __init__(
@@ -427,6 +482,7 @@ class RobotController:
         simulate=False,
         demo_pack_command=(),
         demo_pack_seconds=55.0,
+        follow_args=(),
     ):
         self._demo_pack_command = tuple(demo_pack_command)
         self._demo_pack_seconds = max(float(demo_pack_seconds), 0.05)
@@ -435,10 +491,13 @@ class RobotController:
             simulate=simulate,
             demo_available=simulate or bool(self._demo_pack_command),
         )
+        self.follow_args = tuple(follow_args)
         self._discover_lock = threading.Lock()
         self._stop_monitor = threading.Event()
         self._operation_counter = 0
         self._lean_counter = 0
+        self._follow_counter = 0
+        self._follow_write_lock = threading.Lock()
         self._deploy_lock = threading.Lock()
         self._deployed_files = set()
 
@@ -564,6 +623,7 @@ class RobotController:
                         self.state.running
                         or self.state.checking
                         or self.state.demo_active
+                        or self.state.follow_active()
                     )
                 if busy:
                     continue
@@ -626,6 +686,8 @@ class RobotController:
                 return False, "Wait for the current action to finish"
             if self.state.lean_enabled or self.state.lean_transition:
                 return False, "Return the robot to balance mode before the demo"
+            if self.state.follow_active():
+                return False, "Stop following before starting the judge demo"
             if self.state.host is None:
                 return False, "Robot is not connected; choose Reconnect"
             self.state.demo_active = True
@@ -826,6 +888,8 @@ class RobotController:
         with self.state.lock:
             if self.state.running:
                 return False, f"{self.state.action} is already running"
+            if self.state.follow_active():
+                return False, "Stop following before running actions"
             host = self.state.host
             if host is None:
                 return False, "Robot is not connected; choose Reconnect"
@@ -944,7 +1008,8 @@ class RobotController:
             ["ssh", *SSH_OPTIONS, host, remote_command],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
         with self.state.lock:
@@ -1116,6 +1181,8 @@ class RobotController:
                 return False, "Wait for the current arm action to finish"
             if self.state.lean_transition:
                 return False, "Lean mode is already changing"
+            if enabled and self.state.follow_active():
+                return False, "Stop following before enabling lean"
             if enabled == self.state.lean_enabled:
                 mode = "Lean" if enabled else "Balance"
                 return False, f"{mode} mode is already active"
@@ -1177,7 +1244,8 @@ class RobotController:
                 ["ssh", *SSH_OPTIONS, host, remote_command],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
             )
             with self.state.lock:
@@ -1226,6 +1294,198 @@ class RobotController:
 
         threading.Thread(target=request_stop, name=thread_name, daemon=True).start()
 
+    def set_follow(self, enabled):
+        if not isinstance(enabled, bool):
+            return False, "enabled must be true or false"
+        with self.state.lock:
+            state = self.state
+            if state.host is None:
+                return False, "Robot is not connected; choose Reconnect"
+            if state.follow_transition:
+                return False, "Follow mode is already changing"
+            if enabled and state.demo_active:
+                return False, "The judge demo is running; stop it before following"
+            if enabled == state.follow_enabled:
+                return False, "Follow is already on" if enabled else "Follow is already off"
+            if enabled:
+                if state.running:
+                    return False, f"{state.action} is running; stop it first"
+                if state.lean_enabled or state.lean_requested or state.lean_transition:
+                    return False, "Return to balance mode before following"
+                self._follow_counter += 1
+                pid_file = f"/tmp/bracketbot-follow-{self._follow_counter}.pid"
+                state.follow_pid_file = pid_file
+                state.follow_requested = True
+                state.follow_transition = True
+                state.follow_status = None
+                state.error = None
+                state.follow_phase = "Starting follow…"
+                host = state.host
+        if not enabled:
+            self._stop_follow()
+            return True, "Stopping follow mode"
+        target = self._simulate_follow if self.state.simulate else self._run_follow
+        threading.Thread(
+            target=target, args=(host, pid_file), name="follow-control", daemon=True
+        ).start()
+        return True, "Starting follow mode"
+
+    def set_follow_gap(self, gap):
+        if isinstance(gap, bool) or not isinstance(gap, (int, float)) or not math.isfinite(gap):
+            return False, "gap must be a number of metres"
+        if not FOLLOW_GAP_MIN <= gap <= FOLLOW_GAP_MAX:
+            return False, f"gap must be between {FOLLOW_GAP_MIN} and {FOLLOW_GAP_MAX} m"
+        with self.state.lock:
+            self.state.follow_gap = round(float(gap), 2)
+            gap = self.state.follow_gap
+        self._send_follow({"type": "gap", "m": gap})
+        return True, f"Gap set to {gap:.2f} m"
+
+    def _send_follow(self, message, process=None):
+        with self.state.lock:
+            process = process or self.state.follow_process
+        if process is None or process.stdin is None:
+            return False
+        try:
+            with self._follow_write_lock:
+                process.stdin.write(json.dumps(message) + "\n")
+                process.stdin.flush()
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def _follow_heartbeat(self, process, running):
+        # The runner stops by itself when these stop arriving: the run ended
+        # (``running`` cleared), the process exited, or the dashboard tab that
+        # was watching it stopped polling /api/status (closed or link loss).
+        while running.is_set() and process.poll() is None:
+            with self.state.lock:
+                stale = time.monotonic() - self.state.last_status_poll > 1.5
+            if stale or not self._send_follow({"type": "heartbeat"}, process):
+                return
+            time.sleep(FOLLOW_HEARTBEAT_PERIOD)
+
+    def _stop_follow(self):
+        with self.state.lock:
+            state = self.state
+            if not state.follow_active():
+                return
+            state.follow_requested = False
+            state.follow_transition = True
+            state.follow_phase = "Stopping follow…"
+            host = state.host
+            pid_file = state.follow_pid_file
+        if self.state.simulate:
+            return
+        self._send_follow({"type": "stop"})
+        self._request_remote_stop(host, pid_file, "follow-stop")
+
+    def _run_follow(self, host, pid_file):
+        return_code = None
+        process = None
+        heartbeat_running = threading.Event()
+        try:
+            self._deploy(host, FOLLOW_RUNNER, *FOLLOW_MODULES)
+            with self.state.lock:
+                if not self.state.follow_requested:
+                    return
+                gap = self.state.follow_gap
+            remote_command = remote_python_command(
+                REMOTE_FOLLOW_RUNNER, "--gap", f"{gap:.2f}", "--pid-file", pid_file, *self.follow_args
+            )
+            process = subprocess.Popen(
+                ["ssh", *SSH_OPTIONS, host, remote_command],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+            with self.state.lock:
+                self.state.follow_process = process
+                # A stop may have landed in the window between the re-check above
+                # and storing the process; if so, send it now instead of losing it.
+                should_stop = not self.state.follow_requested
+            if should_stop:
+                self._send_follow({"type": "stop"}, process)
+            heartbeat_running.set()
+            threading.Thread(
+                target=self._follow_heartbeat, args=(process, heartbeat_running),
+                name="follow-heartbeat", daemon=True,
+            ).start()
+            assert process.stdout is not None
+            for line in process.stdout:
+                self.state.add_follow_log(line)
+                if "follow active" in line:
+                    with self.state.lock:
+                        if self.state.follow_requested:
+                            self.state.follow_enabled = True
+                            self.state.follow_transition = False
+            return_code = process.wait()
+        except Exception as exc:
+            with self.state.lock:
+                self.state.error = f"Follow control failed: {exc}"
+        finally:
+            heartbeat_running.clear()
+            if process is not None and process.poll() is None:
+                # Closing ssh gives the runner stdin EOF, which is its own stop path.
+                process.terminate()
+            with self.state.lock:
+                state = self.state
+                unexpected = state.follow_requested
+                if unexpected and state.error is None:
+                    state.error = f"Follow stopped (status {return_code}): {state.follow_phase}"
+                state.follow_enabled = False
+                state.follow_requested = False
+                state.follow_transition = False
+                state.follow_process = None
+                state.follow_pid_file = None
+                state.follow_status = None
+                state.follow_phase = "Follow stopped unexpectedly" if unexpected else "Follow off"
+
+    def _simulate_follow(self, host, pid_file):
+        started = time.monotonic()
+        simulated_range = 1.6
+        with self.state.lock:
+            self.state.follow_enabled = True
+            self.state.follow_transition = False
+            self.state.follow_phase = "Following (simulation)"
+            self.state.log.append("[follow] simulated follow active")
+        try:
+            while True:
+                with self.state.lock:
+                    if not self.state.follow_requested:
+                        return
+                    gap = self.state.follow_gap
+                searching = time.monotonic() - started < 1.0
+                if not searching:
+                    simulated_range += (gap - simulated_range) * 0.1
+                status = {
+                    "state": "SEARCHING" if searching else "FOLLOWING",
+                    "range": None if searching else round(simulated_range, 3),
+                    "gap": gap,
+                    "error": None if searching else round(simulated_range - gap, 3),
+                    "bearing_deg": None if searching else 0.0,
+                    "v": 0.0,
+                    "w": 0.0,
+                    "blocked": False,
+                    "age_ms": None if searching else 60,
+                    "rule": "no-track" if searching else "ok",
+                }
+                with self.state.lock:
+                    self.state.follow_status = status
+                time.sleep(0.05)
+        finally:
+            with self.state.lock:
+                self.state.follow_enabled = False
+                self.state.follow_requested = False
+                self.state.follow_transition = False
+                self.state.follow_status = None
+                self.state.follow_pid_file = None
+                self.state.follow_phase = "Follow off"
+                self.state.log.append("[follow] simulated follow stopped")
+
     def stop(self):
         with self.state.lock:
             action_running = self.state.running
@@ -1235,7 +1495,13 @@ class RobotController:
                 or self.state.lean_requested
                 or self.state.lean_transition
             )
-            if not action_running and not lean_running and not demo_running:
+            follow_running = self.state.follow_active()
+            if (
+                not action_running
+                and not lean_running
+                and not demo_running
+                and not follow_running
+            ):
                 return False, "No action is running"
             host = self.state.host
             pid_file = self.state.pid_file
@@ -1269,6 +1535,8 @@ class RobotController:
                 if self.state.simulate:
                     self.state.lean_enabled = False
 
+        if follow_running:
+            self._stop_follow()
         if not self.state.simulate:
             if action_running:
                 self._request_remote_stop(host, pid_file, "action-stop")
@@ -1330,7 +1598,7 @@ h1 { margin:0; font-size:clamp(2.1rem,6vw,4rem); line-height:1; letter-spacing:-
 .dot { width:12px; height:12px; flex:none; border-radius:50%; background:var(--warn);
   box-shadow:0 0 0 5px rgba(225,155,35,.13); }
 .dot.good { background:var(--good); } .dot.bad { background:var(--danger); }
-#detail, #base-detail, #latency-detail { color:var(--muted); margin:4px 0 0 24px; font-size:.9rem; }
+#detail, #base-detail, #follow-detail, #latency-detail { color:var(--muted); margin:4px 0 0 24px; font-size:.9rem; }
 .demo { margin:0 0 26px; padding:22px; border:1px solid #efb7ba; border-radius:28px;
   background:linear-gradient(135deg,#fff 0,#fff6f6 100%); box-shadow:var(--shadow); }
 .demo-head { display:flex; align-items:start; justify-content:space-between; gap:18px; }
@@ -1390,7 +1658,7 @@ button:disabled { opacity:.48; cursor:not-allowed; filter:saturate(.4); }
 .desc { display:block; color:var(--muted); font-size:.79rem; line-height:1.4; margin-top:5px; }
 .key { float:right; border:1px solid #e8d9d9; border-radius:7px; padding:1px 7px;
   background:#faf5f4; color:#8b7b7c; font:800 .68rem/1.45 ui-monospace,SFMono-Regular,monospace; }
-.controls { display:grid; grid-template-columns:repeat(2,1fr); gap:12px; margin-top:18px; }
+.controls { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:18px; }
 .positioning { margin-top:24px; padding:20px; border:1px solid var(--line); border-radius:28px;
   background:linear-gradient(145deg,rgba(255,255,255,.88),rgba(255,240,241,.72)); }
 .positioning h2 { display:flex; align-items:center; gap:10px; margin:0 0 5px; color:#4d484c;
@@ -1398,6 +1666,8 @@ button:disabled { opacity:.48; cursor:not-allowed; filter:saturate(.4); }
 .positioning-copy { margin:0 0 14px 38px; color:var(--muted); font-size:.82rem; }
 .positioning-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
 .positioning-grid button { min-height:112px; }
+.follow-gap { display:flex; align-items:center; gap:14px; margin-top:14px; color:var(--muted); font-size:.9rem; font-weight:700; }
+.follow-gap input { flex:1; accent-color:var(--red); }
 .secondary,.stop { min-height:60px; border-radius:18px; text-align:center; font-size:.9rem; font-weight:800; }
 .lean-active { background:#eaf8f2; border-color:#7dccac; color:#14744d; }
 .stop { background:var(--red); border-color:var(--red); color:#fff; }
@@ -1446,6 +1716,7 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:560px; overflow:a
       <div class="status-line"><span id="dot" class="dot" aria-hidden="true"></span><span id="status">Connecting…</span></div>
       <p id="detail" aria-live="polite">Checking Wi-Fi, hotspot, and USB routes</p>
       <p id="base-detail">Base: balance mode</p>
+      <p id="follow-detail">Follow: off</p>
       <p id="latency-detail">Dispatch: waiting for an action</p>
       <p id="error" class="error" role="alert" hidden></p>
     </div>
@@ -1490,7 +1761,13 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:560px; overflow:a
   </section>
   <div class="controls">
     <button id="reconnect" class="secondary">Reconnect</button>
+    <button id="follow" class="secondary" aria-pressed="false"><span class="key">F</span>Follow me</button>
     <button id="stop" class="stop" disabled><span class="key">Esc</span>Stop action</button>
+  </div>
+  <div class="follow-gap">
+    <label for="gap">Following distance</label>
+    <input id="gap" type="range" min="0.6" max="1.5" step="0.1" value="1.0">
+    <output id="gap-value" for="gap">1.0 m</output>
   </div>
   <details class="log-wrap"><summary>Technical details</summary><pre id="log">No activity yet.</pre></details>
 </main>
@@ -1501,6 +1778,18 @@ const stop=document.getElementById('stop'), reconnect=document.getElementById('r
 const lean=document.getElementById('lean'), baseDetail=document.getElementById('base-detail');
 const tableRest=document.getElementById('table-rest');
 const latencyDetail=document.getElementById('latency-detail');
+const follow=document.getElementById('follow'), followDetail=document.getElementById('follow-detail');
+const gap=document.getElementById('gap'), gapValue=document.getElementById('gap-value');
+let gapDragging=false;
+function followText(c) {
+  if(!c.follow_enabled&&!c.follow_transition) return 'Follow: off';
+  const s=c.follow_status;
+  if(!s) return `Follow: ${c.follow_phase}`;
+  if(s.state==='SEARCHING') return 'Follow: stand in front of the robot';
+  const range=s.range==null?'—':`${s.range.toFixed(2)} m`;
+  const err=s.error==null?'':` · ${s.error>=0?'+':''}${Math.round(s.error*100)} cm from target`;
+  return `Follow: ${s.state.toLowerCase()} · ${range}${err}`;
+}
 const log=document.getElementById('log'), catalog=document.getElementById('catalog');
 const demoStart=document.getElementById('demo-start'), demoComplete=document.getElementById('demo-complete');
 const demoMessage=document.getElementById('demo-message'), demoStatus=document.getElementById('demo-status');
@@ -1601,13 +1890,22 @@ async function refresh() {
     }
     current=next; loadedServerId=next.server_id||loadedServerId;
     renderCatalog(); renderDemo();
-    const ready=current.connected&&!current.running&&!current.checking;
-    const packing=current.demo?.active&&current.demo.phase==='packing';
-    const demoTransition=current.demo?.active&&!packing;
+    const followOn=current.follow_enabled||current.follow_transition;
+    const demoOn=!!current.demo?.active;
+    const packing=demoOn&&current.demo.phase==='packing';
+    const demoTransition=demoOn&&!packing;
+    const ready=current.connected&&!current.running&&!current.checking&&!followOn;
     buttons.forEach(b=>b.disabled=!ready||demoTransition||(packing&&usesDemoResource(b)));
-    stop.disabled=!(current.running||current.lean_enabled||current.lean_transition||current.demo?.active);
-    reconnect.disabled=current.running||current.checking||current.lean_enabled||current.lean_transition||current.demo?.active;
-    lean.disabled=!current.connected||current.lean_transition||current.running||current.demo?.active;
+    stop.disabled=!(current.running||current.lean_enabled||current.lean_transition||demoOn||followOn);
+    reconnect.disabled=current.running||current.checking||current.lean_enabled||current.lean_transition||demoOn||followOn;
+    lean.disabled=!current.connected||current.lean_transition||current.running||demoOn||(followOn&&!current.lean_enabled);
+    follow.disabled=!current.connected||current.follow_transition||demoOn||(!current.follow_enabled&&(current.running||current.lean_enabled||current.lean_transition));
+    follow.className='secondary '+(current.follow_enabled?'lean-active':'');
+    follow.setAttribute('aria-pressed',String(current.follow_enabled));
+    follow.innerHTML=`<span class="key">F</span>${current.follow_transition?'Changing follow…':current.follow_enabled?'Stop following':'Follow me'}`;
+    followDetail.textContent=followText(current);
+    gap.min=current.follow_gap_min; gap.max=current.follow_gap_max;
+    if(!gapDragging){ gap.value=current.follow_gap; gapValue.textContent=`${Number(current.follow_gap).toFixed(1)} m`; }
     lean.className='secondary '+(current.lean_enabled?'lean-active':'');
     lean.setAttribute('aria-pressed',String(current.lean_enabled));
     lean.innerHTML=`<span class="key">Z</span><span class="label">${current.lean_transition?'Changing base mode…':current.lean_enabled?'Return to balance':'Lean forward'}</span><span class="desc">${current.lean_enabled?'Restore upright balance mode':'Hold a bounded 4° forward lean'}</span>`;
@@ -1655,14 +1953,18 @@ demoStart.addEventListener('click',()=>post('/api/demo/start').then(refresh));
 demoComplete.addEventListener('click',()=>post('/api/demo/complete').then(refresh));
 lean.addEventListener('click',()=>post('/api/lean',{enabled:!current.lean_enabled}).then(refresh));
 tableRest.addEventListener('click',()=>post('/api/run',{action:'table-rest'}).then(refresh));
+follow.addEventListener('click',()=>post('/api/follow',{enabled:!current.follow_enabled}).then(refresh));
+gap.addEventListener('input',()=>{ gapDragging=true; gapValue.textContent=`${Number(gap.value).toFixed(1)} m`; });
+gap.addEventListener('change',()=>{ gapDragging=false; post('/api/follow/gap',{gap:Number(gap.value)}).then(refresh); });
 stop.addEventListener('click',()=>{
   if(previewAudio){ previewAudio.pause(); previewAudio.currentTime=0; }
   post('/api/stop').then(refresh);
 });
 document.addEventListener('keydown',event=>{
+  if(event.key==='Escape'&&!stop.disabled){ event.preventDefault(); stop.click(); return; }
   if(event.repeat||event.target.matches('input,textarea,select')) return;
-  if(event.key==='Escape'&&(current.running||current.lean_enabled||current.lean_transition||current.demo?.active)){ event.preventDefault(); stop.click(); return; }
   if(event.key.toLowerCase()==='z'&&!lean.disabled){ event.preventDefault(); lean.click(); return; }
+  if(event.key.toLowerCase()==='f'&&!follow.disabled){ event.preventDefault(); follow.click(); return; }
   const action=current.actions?.find(item=>item.key===event.key);
   const routine=current.routines?.find(item=>item.key===event.key);
   const selector=action?`[data-action="${action.id}"]`:routine?`[data-routine="${routine.id}"]`:null;
@@ -1705,6 +2007,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/":
             self._send(PAGE, content_type="text/html; charset=utf-8")
         elif self.path == "/api/status":
+            self.controller.state.note_status_poll()
             self._send(self.controller.state.snapshot())
         elif self.path.startswith("/api/audio/"):
             action_id = self.path.removeprefix("/api/audio/")
@@ -1740,6 +2043,12 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/demo/complete":
             ok, message = self.controller.confirm_demo_packed()
             self._send({"ok": ok, "message": message}, HTTPStatus.ACCEPTED if ok else HTTPStatus.CONFLICT)
+        elif self.path == "/api/follow":
+            ok, message = self.controller.set_follow(self._json_body().get("enabled"))
+            self._send({"ok": ok, "message": message}, HTTPStatus.ACCEPTED if ok else HTTPStatus.CONFLICT)
+        elif self.path == "/api/follow/gap":
+            ok, message = self.controller.set_follow_gap(self._json_body().get("gap"))
+            self._send({"ok": ok, "message": message}, HTTPStatus.ACCEPTED if ok else HTTPStatus.BAD_REQUEST)
         elif self.path == "/api/stop":
             ok, message = self.controller.stop()
             self._send({"ok": ok, "message": message}, HTTPStatus.ACCEPTED if ok else HTTPStatus.CONFLICT)
@@ -1840,14 +2149,31 @@ def main():
         action="store_false",
         help="disable automatic restart when robot_dashboard.py changes",
     )
+    parser.add_argument(
+        "--follow-v-max",
+        type=float,
+        default=0.15,
+        help="follow speed cap in m/s (0.15 until robot gate G4b passes; at most 0.30)",
+    )
+    parser.add_argument(
+        "--follow-rotate-only",
+        action="store_true",
+        help="follow by turning in place only (robot gate G3)",
+    )
     parser.set_defaults(reload=True)
     args = parser.parse_args()
+    if not 0.0 < args.follow_v_max <= 0.30:
+        parser.error("--follow-v-max must be above 0 and at most 0.30 m/s")
+    follow_args = ("--v-max", f"{args.follow_v_max:.2f}")
+    if args.follow_rotate_only:
+        follow_args += ("--rotate-only",)
 
     demo_pack_command = tuple(shlex.split(args.demo_pack_command))
     controller = RobotController(
         args.ssh_hosts,
         simulate=args.simulate,
         demo_pack_command=demo_pack_command,
+        follow_args=follow_args,
     )
     Handler.controller = controller
     server = ThreadingHTTPServer((args.bind, args.port), Handler)
@@ -1886,6 +2212,8 @@ def main():
                 and not state["lean_enabled"]
                 and not state["lean_transition"]
                 and not state["demo"]["active"]
+                and not state["follow_enabled"]
+                and not state["follow_transition"]
             ):
                 break
             time.sleep(0.1)
