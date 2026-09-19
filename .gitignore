@@ -27,6 +27,9 @@ venv/
 *.avi
 *.log
 
+# Recorded pulse traces from laptop_rppg.py are personal data.
+rppg_*.csv
+
 # Editors and operating systems
 .DS_Store
 .idea/

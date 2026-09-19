@@ -46,6 +46,9 @@ or replace qualified care.
   joints with `camera.points`, places the observation in the live SLAM map, and
   cancels autonomous navigation through a deterministic interlock. Physical
   posture calibration is still required before treating it as a safety system.
+- A local contactless heart-rate (rPPG) signal chain with a laptop concept
+  check and a read-only head-camera app for the robot, gated on a camera
+  check and explicitly **not** a medical measurement.
 - An existing Gemini-powered greeter and provider-ready inference code with
   OpenAI and Google client dependencies.
 - Deterministic greeter voice commands for **wave**, **salute**, **handshake**,
@@ -372,6 +375,55 @@ and speaks the routed answer with eSpeak. For microphone debugging only,
 `uv run main.py --voice-backend local --local-always-listen` bypasses the wake
 word and starts on any speech; do not use that mode in a noisy public space.
 
+## Run the contactless heart-rate check
+
+Remote photoplethysmography (rPPG) reads a pulse from the sub-percent colour
+changes skin shows as blood volume changes. `rppg.py` holds the signal chain:
+MediaPipe forehead and cheek ROI, POS projection, bandpass, FFT peak with an
+SNR gate.
+
+**This is not a medical device.** It produces a demo-grade estimate from a
+camera. Do not use it to diagnose, triage, screen, or trigger robot actions,
+and only ever scan someone who has agreed to it. Read
+[`docs/rppg-robot-port.md`](docs/rppg-robot-port.md) before running it on the
+robot or showing it to anyone.
+
+Concept check on a laptop webcam, with a live debug view:
+
+```sh
+uv run --extra rppg python laptop_rppg.py
+```
+
+Sit 50–70 cm from the camera in even front lighting and hold still for about
+ten seconds. The panel shows the raw ROI green trace, the pulse signal, the
+spectrum, and a luminance-drift readout that exposes auto-exposure hunting.
+Press `m` to switch POS to plain green and watch it fail under changing light,
+`r` to record a CSV, and `q` to quit. Re-analyse a recording offline with
+`--replay rppg_*.csv`.
+
+On the robot, check the camera before attempting any measurement:
+
+```sh
+scp scripts/robot_rppg.py rppg.py assets/models/face_landmarker.task bot:/tmp/
+ssh bot 'cd /tmp && ~/.local/bin/uv run robot_rppg.py --check'
+```
+
+The check reports frame rate, the split eye's shape, how often a face was
+found, its pixel width, and `lum_drift_pct`. That last number decides whether a
+measurement is worth attempting: the robot app is read-only and **cannot lock
+the camera's exposure**, and auto-exposure steps are larger than the pulse
+itself. The port doc gives the thresholds. Only if the check passes:
+
+```sh
+ssh bot 'cd /tmp && ~/.local/bin/uv run robot_rppg.py --duration 20'
+```
+
+It opens a `Reader` and never a `Writer`, so it cannot move the robot. It keeps
+no frames: only per-frame mean skin RGB, in memory, for the analysis window.
+Accuracy is known to degrade on darker skin, under motion, and in uneven light.
+Validate against a smartwatch or pulse oximeter across several people before
+trusting any of it.
+
 ## Repository layout
 
 | Path | Purpose |
@@ -388,8 +440,12 @@ word and starts on any speech; do not use that mode in a noisy public space.
 | `scripts/handshake_test.py` | Focused standalone handshake runner |
 | `scripts/wave_test.py` | Focused standalone wave runner |
 | `people_detector.py` | Local YOLO + YuNet + visible-expression pipeline |
+| `rppg.py` | Contactless heart-rate signal chain and ROI extraction |
+| `laptop_rppg.py` | Laptop-webcam rPPG concept check with a live debug view |
+| `scripts/robot_rppg.py` | Read-only head-camera rPPG scan and camera check |
 | `assets/models/` | Documented YuNet and EmotiEffLib ONNX assets |
 | `tests/test_people_detector.py` | Unit tests for detection conversion and smoothing |
+| `tests/test_rppg.py` | Unit tests for the rPPG chain and head-camera split |
 | `bbapps/greeter/` | YOLO/Gemini greeter and gesture recordings |
 | `bbapps/inference/` | Policy and VLM clients, adapters, and task manifest |
 | `bbapps/nav/` | Navigation and relocalization tools |
@@ -400,6 +456,7 @@ word and starts on any speech; do not use that mode in a noisy public space.
 | `docs/robot-facts.md` | Measurements and findings from the physical robot |
 | `docs/dashboard-action-roadmap.md` | Action-family inventory and safe sequencing roadmap |
 | `docs/yolo-robot-port.md` | YOLO compatibility evidence and Jetson port gate |
+| `docs/rppg-robot-port.md` | rPPG camera geometry, exposure risk, and port gate |
 
 Most robot apps target Python 3.10 and declare their robot-only dependencies
 in inline `uv` metadata or their local `pyproject.toml`. The local dashboard
@@ -426,8 +483,9 @@ button or keyboard action.
 ```sh
 python3 -m py_compile scripts/robot_dashboard.py scripts/gesture_test.py \
   scripts/robot_effect.py scripts/robot_base_mode.py scripts/table_rest.py \
-  scripts/check_yolo_runtime.py people_detector.py
-uv run --extra vision --extra dev pytest
+  scripts/check_yolo_runtime.py people_detector.py scripts/robot_rppg.py \
+  rppg.py laptop_rppg.py
+uv run --extra vision --extra rppg --extra dev pytest
 uv run --extra vision python scripts/check_yolo_runtime.py
 git diff --check
 ```
@@ -448,6 +506,8 @@ production robot action path.
 - [ ] Add navigation only after bounded-distance controls and obstacle/stop gates are proven on the robot.
 - [ ] Add action-policy tests proving models cannot bypass the safety gate.
 - [ ] Add health/status telemetry without medical diagnosis claims.
+- [ ] Verify rPPG on the robot: confirm head-camera exposure stability, then
+      validate against a reference pulse across skin tones and lighting.
 - [ ] Package deployment and service management for the Jetson.
 
 ## License
