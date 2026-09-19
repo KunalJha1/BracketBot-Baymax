@@ -9,16 +9,19 @@ an ordered tuple of allowlisted primitive IDs with one shared cancellation path.
 
 | Family | Primitive IDs | Robot resource | Notes |
 | --- | --- | --- | --- |
-| Social gesture | `wave`, `handshake`, `fist-bump`, `hug`, `dance` | arm control/torque | Existing recordings; safe entry/return runner |
+| Social gesture | `wave`, `handshake`, `fist-bump`, `hug`, `namaste`, `dance` | arm control/torque | Existing recordings; safe entry/return runner |
 | Light expression | `light-calm`, `light-ready`, `light-thinking`, `light-celebrate`, `lights-off` | LED writer | Bounded solid, pulse, and blink effects |
 | Sound cue | `sound-processing`, `sound-birthday`, `sound-low-battery` | speaker writer | Bounded PCM assets |
 | Music | `music-calm`, `music-celebration` | speaker writer | Original, deterministic 16 kHz PCM assets |
 | Base mode | Lean / Balance toggle | base-mode writer | Upright gate; 4° hold; balance restoration and expiry fallback |
 | Routine | `welcome`, `thinking`, `celebrate`, `goodbye`, `double-wave`, `calm-moment`, `dance-party` | union of step resources | Sequential, deterministic, cancellable |
+| Reminders | `set-reminder`, `cancel-reminder`, `list-reminders` | local SQLite scheduler | Persistent UTC due times, IANA timezone display, restart recovery, local audit trail |
 
-All of these work through local simulation now. Gestures had already been used
-through the robot safety runner; LED, sound, and multi-step routine execution
-still require the live-robot port gate.
+The dashboard-owned action families work through local simulation now. The
+reminder actions run through the local voice assistant and own no robot writer;
+delivery reuses the assistant's existing speaker and LED owners. Gestures had
+already been used through the robot safety runner; LED, sound, and multi-step
+routine execution still require the live-robot port gate.
 
 ## Best next families
 
@@ -31,7 +34,6 @@ These are ordered by expected product value and safety/dependency cost.
 | Robot status | `check-battery`, `check-upright`, `check-cameras`, `check-arm-health` | Read-only BBOS snapshot schema with freshness and units |
 | More expression | `nod`, `shake-head`, `shrug`, `point-left`, `point-right`, `present-object` | New robot-specific recordings; dry run and entry-distance review for each |
 | Local preferences | `remember-preference`, `forget-preference`, `list-preferences` | Local schema, consent, inspection, deletion, and retention controls |
-| Reminders | `set-reminder`, `cancel-reminder`, `list-reminders` | Persistent scheduler; timezone handling; local audit trail |
 | Media | `play-sound`, `stop-sound`, `set-volume` | Volume bounds and speaker ownership arbitration |
 | Navigation | `turn-in-place`, `move-bounded`, `go-to-named-place`, `dock` | Obstacle sensing, localization freshness, deadman, distance/time bounds, physical e-stop operator |
 | Manipulation | `home-arms`, `open-gripper`, `close-gripper`, `pick-approved-object`, `place-approved-object` | Collision/force limits, possession verification, trained-policy allowlist, workspace bounds |

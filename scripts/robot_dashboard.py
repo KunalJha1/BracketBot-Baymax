@@ -21,6 +21,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -42,6 +43,7 @@ REMOTE_EFFECT_RUNNER = "/tmp/robot_effect.py"
 REMOTE_BASE_RUNNER = "/tmp/robot_base_mode.py"
 REMOTE_GREETER_ACTION_RUNNER = "/tmp/greeter_action.py"
 REMOTE_TABLE_REST_RUNNER = "/tmp/table_rest.py"
+REMOTE_DEMO_ARM_RESERVATION = "/tmp/bracketbot-demo-arm-reserved"
 SSH_OPTIONS = (
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=3",
@@ -68,6 +70,70 @@ DEFAULT_SSH_HOSTS = (
     "botwifi",
     "bracketbot@bracketbot-184.local",
     "bot",
+)
+
+# The judge demo treats manipulation as a long-running capability with a very
+# small adapter boundary: a trusted command supplied when the dashboard starts.
+# While it runs, the policy owns every channel that could contend with packing;
+# expressive lights, sounds, and spoken conversation remain available.
+DEMO_RESERVED_CHANNELS = frozenset(
+    {"left-arm", "right-arm", "camera", "depth-camera"}
+)
+DEMO_CUES = (
+    {
+        "id": "reminder",
+        "at_seconds": 0,
+        "timecode": "0:00",
+        "speaker": "You → BracketBot",
+        "label": "Set the four-minute reminder",
+        "script": "BracketBot, remind me in 4 minutes to take my medication.",
+        "note": "Pause and let BracketBot's spoken confirmation finish.",
+    },
+    {
+        "id": "introduction",
+        "at_seconds": 12,
+        "timecode": "0:12",
+        "speaker": "Presenter → audience",
+        "label": "Introduce BracketBot",
+        "script": (
+            "Hi everyone! Meet BracketBot. BracketBot is an at-home care "
+            "assistant that can answer questions, converse with you, and even "
+            "do tasks for you."
+        ),
+        "note": "The reminder keeps counting down while the robot works.",
+    },
+    {
+        "id": "transition",
+        "at_seconds": 35,
+        "timecode": "0:35",
+        "speaker": "Presenter → audience",
+        "label": "Transition into the live demo",
+        "script": "While that reminder runs, let's see what else BracketBot can do.",
+        "note": "Continue with questions or safe light and sound features.",
+    },
+)
+DEMO_STAGES = (
+    {
+        "id": "opening",
+        "label": "Meet Baymax",
+        "description": "A ready light and wave establish the character.",
+    },
+    {
+        "id": "packing",
+        "label": "Pack while we talk",
+        "description": (
+            "The manipulation policy works in the background. Ask natural "
+            "questions and demonstrate lights or sounds while it packs."
+        ),
+    },
+    {
+        "id": "finale",
+        "label": "Finish together",
+        "description": (
+            "After packing releases the arms, Baymax confirms success with "
+            "celebration lights and music."
+        ),
+    },
 )
 
 
@@ -131,6 +197,8 @@ ACTION_LIST = (
             channels=("right-arm",), key="3", resource="fist bump.json", risk="contact-motion"),
     _action("hug", "Hug", "Open both arms for a hug", "Gestures", "gesture",
             channels=("left-arm", "right-arm"), key="4", resource="hug.json", risk="contact-motion"),
+    _action("namaste", "Namaste", "Bring both hands together at chest height", "Gestures", "gesture",
+            channels=("left-arm", "right-arm"), key="n", resource="namaste.json", risk="motion"),
     _action("salute", "Salute", "Extend the left hand, salute, then wave", "Gestures", "gesture",
             channels=("left-arm",), key="s", resource="salute.json", risk="motion"),
     _action("point-person", "Point at person", "Use the camera to point at the primary visible person",
@@ -252,7 +320,7 @@ def remote_python_command(script, *args):
 
 
 class DashboardState:
-    def __init__(self, ssh_hosts, simulate=False):
+    def __init__(self, ssh_hosts, simulate=False, demo_available=False):
         self.ssh_hosts = tuple(ssh_hosts)
         self.simulate = simulate
         self.lock = threading.Lock()
@@ -277,10 +345,26 @@ class DashboardState:
         self.lean_process = None
         self.lean_pid_file = None
         self.stop_lean_after_action = False
+        self.demo_available = demo_available
+        self.demo_active = False
+        self.demo_phase = "ready"
+        self.demo_message = "Ready for a guided first minute and robot demo"
+        self.demo_cancel_requested = False
+        self.demo_finish_requested = False
+        self.demo_process = None
+        self.demo_started_at = None
+        self.demo_ended_at = None
         self.server_id = uuid.uuid4().hex
 
     def snapshot(self):
         with self.lock:
+            if self.demo_started_at is None:
+                demo_elapsed_seconds = 0.0
+            else:
+                demo_clock = self.demo_ended_at or time.monotonic()
+                demo_elapsed_seconds = round(
+                    max(0.0, demo_clock - self.demo_started_at), 1
+                )
             return {
                 "host": self.host,
                 "checking": self.checking,
@@ -301,6 +385,20 @@ class DashboardState:
                 "lean_enabled": self.lean_enabled,
                 "lean_transition": self.lean_transition,
                 "lean_phase": self.lean_phase,
+                "demo": {
+                    "available": self.demo_available,
+                    "active": self.demo_active,
+                    "phase": self.demo_phase,
+                    "message": self.demo_message,
+                    "elapsed_seconds": demo_elapsed_seconds,
+                    "cues": list(DEMO_CUES),
+                    "can_confirm": (
+                        self.demo_active
+                        and self.demo_phase == "packing"
+                        and not self.demo_finish_requested
+                    ),
+                    "stages": list(DEMO_STAGES),
+                },
             }
 
     def add_log(self, line):
@@ -323,8 +421,20 @@ class DashboardState:
 
 
 class RobotController:
-    def __init__(self, ssh_hosts, simulate=False):
-        self.state = DashboardState(ssh_hosts, simulate=simulate)
+    def __init__(
+        self,
+        ssh_hosts,
+        simulate=False,
+        demo_pack_command=(),
+        demo_pack_seconds=55.0,
+    ):
+        self._demo_pack_command = tuple(demo_pack_command)
+        self._demo_pack_seconds = max(float(demo_pack_seconds), 0.05)
+        self.state = DashboardState(
+            ssh_hosts,
+            simulate=simulate,
+            demo_available=simulate or bool(self._demo_pack_command),
+        )
         self._discover_lock = threading.Lock()
         self._stop_monitor = threading.Event()
         self._operation_counter = 0
@@ -383,7 +493,7 @@ class RobotController:
         if not self._discover_lock.acquire(blocking=False):
             return
         with self.state.lock:
-            if self.state.running:
+            if self.state.running or self.state.demo_active:
                 self._discover_lock.release()
                 return
             self.state.checking = True
@@ -450,7 +560,11 @@ class RobotController:
             while not self._stop_monitor.wait(15):
                 with self.state.lock:
                     host = self.state.host
-                    busy = self.state.running or self.state.checking
+                    busy = (
+                        self.state.running
+                        or self.state.checking
+                        or self.state.demo_active
+                    )
                 if busy:
                     continue
                 if host is None or not self._probe(host):
@@ -464,13 +578,248 @@ class RobotController:
         if action not in ACTIONS:
             return False, "Unknown command"
 
+        conflict = self._demo_resource_conflict((action,))
+        if conflict:
+            return False, conflict
+
         return self._start_operation(action, ACTIONS[action].label, (action,))
 
     def run_routine(self, routine):
         if routine not in ROUTINES:
             return False, "Unknown routine"
         info = ROUTINES[routine]
+        conflict = self._demo_resource_conflict(info.steps)
+        if conflict:
+            return False, conflict
         return self._start_operation(routine, info.label, info.steps)
+
+    def _demo_resource_conflict(self, steps):
+        with self.state.lock:
+            active = self.state.demo_active
+            packing = active and self.state.demo_phase == "packing"
+        if not active:
+            return None
+        if not packing:
+            return "The judge demo is transitioning; wait for the next stage"
+        used = {
+            channel
+            for action_id in steps
+            for channel in ACTIONS[action_id].channels
+        }
+        if used & DEMO_RESERVED_CHANNELS:
+            return (
+                "Packing currently owns the arms and cameras. "
+                "Conversation, lights, sounds, and music are still available."
+            )
+        return None
+
+    def start_demo(self):
+        with self.state.lock:
+            if not self.state.demo_available:
+                return False, (
+                    "No packing command is configured. Restart with "
+                    "--demo-pack-command or use --simulate."
+                )
+            if self.state.demo_active:
+                return False, "The judge demo is already running"
+            if self.state.running:
+                return False, "Wait for the current action to finish"
+            if self.state.lean_enabled or self.state.lean_transition:
+                return False, "Return the robot to balance mode before the demo"
+            if self.state.host is None:
+                return False, "Robot is not connected; choose Reconnect"
+            self.state.demo_active = True
+            self.state.demo_phase = "opening"
+            self.state.demo_message = "Opening with the welcome routine"
+            self.state.demo_cancel_requested = False
+            self.state.demo_finish_requested = False
+            self.state.demo_started_at = time.monotonic()
+            self.state.demo_ended_at = None
+            self.state.error = None
+
+        threading.Thread(
+            target=self._run_demo,
+            name="judge-demo",
+            daemon=True,
+        ).start()
+        return True, "Judge demo started"
+
+    def _wait_for_operation(self):
+        while True:
+            with self.state.lock:
+                running = self.state.running
+                cancelled = self.state.demo_cancel_requested
+            if cancelled or not running:
+                return not cancelled
+            time.sleep(0.04)
+
+    def _start_demo_routine(self, routine):
+        while True:
+            with self.state.lock:
+                cancelled = self.state.demo_cancel_requested
+            if cancelled:
+                return False
+            info = ROUTINES[routine]
+            ok, message = self._start_operation(routine, info.label, info.steps)
+            if ok:
+                return self._wait_for_operation()
+            if "already running" not in message:
+                raise RuntimeError(message)
+            time.sleep(0.05)
+
+    def _run_demo(self):
+        failed = None
+        reservation_set = False
+        try:
+            self._set_demo_arm_reservation(True)
+            reservation_set = True
+            if not self._start_demo_routine("welcome"):
+                return
+            with self.state.lock:
+                if self.state.error:
+                    raise RuntimeError(f"Welcome failed: {self.state.error}")
+            with self.state.lock:
+                self.state.demo_phase = "packing"
+                self.state.demo_message = (
+                    "Packing is active — ask questions or show a light/sound feature"
+                )
+            self.state.add_log("[demo] packing started; arms and cameras reserved")
+
+            return_code = self._run_demo_pack_task()
+            with self.state.lock:
+                cancelled = self.state.demo_cancel_requested
+                confirmed = self.state.demo_finish_requested
+            if cancelled:
+                return
+            if return_code != 0:
+                raise RuntimeError(
+                    f"Packing process exited with status {return_code}"
+                )
+            with self.state.lock:
+                self.state.demo_phase = "finale"
+                self.state.demo_message = (
+                    "Packing complete — waiting for other features, then celebrating"
+                )
+            evidence = "operator confirmed" if confirmed else "process completed"
+            self.state.add_log(f"[demo] packing completion evidence: {evidence}")
+            if not self._start_demo_routine("celebrate"):
+                return
+            self._set_demo_arm_reservation(False)
+            reservation_set = False
+            with self.state.lock:
+                if self.state.error:
+                    raise RuntimeError(f"Finale failed: {self.state.error}")
+                self.state.demo_phase = "complete"
+                self.state.demo_message = "Box packed. Demo complete — bish bash bosh."
+            self.state.add_log("[demo] judge demo complete")
+        except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+            failed = str(exc)
+            with self.state.lock:
+                self.state.error = failed
+                self.state.demo_phase = "failed"
+                self.state.demo_message = "Demo stopped before the finale"
+        finally:
+            if reservation_set:
+                try:
+                    self._set_demo_arm_reservation(False)
+                except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+                    self.state.add_log(
+                        f"[demo] arm reservation cleanup failed safely: {exc}"
+                    )
+            with self.state.lock:
+                cancelled = self.state.demo_cancel_requested
+                self.state.demo_process = None
+                self.state.demo_active = False
+                self.state.demo_cancel_requested = False
+                self.state.demo_finish_requested = False
+                if self.state.demo_started_at is not None:
+                    self.state.demo_ended_at = time.monotonic()
+                if cancelled and failed is None:
+                    self.state.demo_phase = "stopped"
+                    self.state.demo_message = "Demo stopped safely"
+
+    def _set_demo_arm_reservation(self, enabled):
+        if self.state.simulate:
+            return
+        with self.state.lock:
+            host = self.state.host
+        if host is None:
+            raise RobotConnectionError("Robot disconnected before arm reservation")
+        command = (
+            f"umask 077; : > {shlex.quote(REMOTE_DEMO_ARM_RESERVATION)}"
+            if enabled
+            else f"rm -f {shlex.quote(REMOTE_DEMO_ARM_RESERVATION)}"
+        )
+        result = subprocess.run(
+            ["ssh", *SSH_OPTIONS, host, command],
+            capture_output=True,
+            text=True,
+            timeout=6,
+        )
+        if result.returncode != 0:
+            error_type = RobotConnectionError if result.returncode == 255 else RuntimeError
+            detail = result.stderr.strip() or "remote interlock command failed"
+            raise error_type(f"Could not update the arm reservation: {detail}")
+
+    def _run_demo_pack_task(self):
+        if self.state.simulate:
+            self.state.add_log("[demo][simulation] packing policy running")
+            started = time.monotonic()
+            while time.monotonic() - started < self._demo_pack_seconds:
+                with self.state.lock:
+                    if self.state.demo_cancel_requested:
+                        return 0
+                    if self.state.demo_finish_requested:
+                        self.state.demo_message = (
+                            "Packing confirmed — releasing the simulated arm policy"
+                        )
+                        return 0
+                time.sleep(0.04)
+            return 0
+
+        process = subprocess.Popen(
+            self._demo_pack_command,
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+        with self.state.lock:
+            self.state.demo_process = process
+            should_signal = (
+                self.state.demo_cancel_requested or self.state.demo_finish_requested
+            )
+        if should_signal:
+            self._signal_demo_process(process)
+        assert process.stdout is not None
+        for line in process.stdout:
+            self.state.add_log(f"[pack] {line}")
+        return process.wait()
+
+    @staticmethod
+    def _signal_demo_process(process):
+        if process is None or process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+
+    def confirm_demo_packed(self):
+        with self.state.lock:
+            if not self.state.demo_active or self.state.demo_phase != "packing":
+                return False, "The demo is not currently packing"
+            if self.state.demo_finish_requested:
+                return False, "Packing completion is already being handled"
+            self.state.demo_finish_requested = True
+            self.state.demo_message = (
+                "Packing confirmed — asking the policy to release and home safely"
+            )
+            process = self.state.demo_process
+        self._signal_demo_process(process)
+        return True, "Packing completion confirmed"
 
     def _start_operation(self, operation_id, label, steps):
 
@@ -486,7 +835,10 @@ class RobotController:
             self.state.step = None
             self.state.phase = f"Preparing {label}…"
             self.state.error = None
-            self.state.log = []
+            if self.state.demo_active:
+                self.state.log.append(f"[demo] starting {label}")
+            else:
+                self.state.log = []
             self.state.cancel_requested = False
             self._operation_counter += 1
             self.state.pid_file = f"/tmp/bracketbot-action-{self._operation_counter}.pid"
@@ -758,6 +1110,8 @@ class RobotController:
         with self.state.lock:
             if self.state.host is None:
                 return False, "Robot is not connected; choose Reconnect"
+            if self.state.demo_active:
+                return False, "Base mode stays fixed while the judge demo is running"
             if self.state.running:
                 return False, "Wait for the current arm action to finish"
             if self.state.lean_transition:
@@ -875,12 +1229,13 @@ class RobotController:
     def stop(self):
         with self.state.lock:
             action_running = self.state.running
+            demo_running = self.state.demo_active
             lean_running = (
                 self.state.lean_enabled
                 or self.state.lean_requested
                 or self.state.lean_transition
             )
-            if not action_running and not lean_running:
+            if not action_running and not lean_running and not demo_running:
                 return False, "No action is running"
             host = self.state.host
             pid_file = self.state.pid_file
@@ -890,6 +1245,15 @@ class RobotController:
             if action_running:
                 self.state.cancel_requested = True
                 self.state.phase = "Stop requested — finishing safely…"
+            if demo_running:
+                self.state.demo_cancel_requested = True
+                self.state.demo_phase = "stopping"
+                self.state.demo_message = (
+                    "Stop requested — waiting for packing and robot actions to release safely"
+                )
+                demo_process = self.state.demo_process
+            else:
+                demo_process = None
             if defer_lean_stop:
                 # Keep the base geometry stable while table-rest retraces its
                 # checked arm path. _run_operation restores balance afterward.
@@ -910,6 +1274,8 @@ class RobotController:
                 self._request_remote_stop(host, pid_file, "action-stop")
             if lean_running and not defer_lean_stop:
                 self._request_remote_stop(host, lean_pid_file, "lean-stop")
+        if demo_running:
+            self._signal_demo_process(demo_process)
         return True, "Stop requested"
 
 
@@ -965,6 +1331,41 @@ h1 { margin:0; font-size:clamp(2.1rem,6vw,4rem); line-height:1; letter-spacing:-
   box-shadow:0 0 0 5px rgba(225,155,35,.13); }
 .dot.good { background:var(--good); } .dot.bad { background:var(--danger); }
 #detail, #base-detail, #latency-detail { color:var(--muted); margin:4px 0 0 24px; font-size:.9rem; }
+.demo { margin:0 0 26px; padding:22px; border:1px solid #efb7ba; border-radius:28px;
+  background:linear-gradient(135deg,#fff 0,#fff6f6 100%); box-shadow:var(--shadow); }
+.demo-head { display:flex; align-items:start; justify-content:space-between; gap:18px; }
+.demo h2 { margin:0; font-size:1.3rem; letter-spacing:-.025em; }
+.demo-copy { margin:5px 0 0; color:var(--muted); font-size:.88rem; }
+.demo-clock { min-width:92px; padding:10px 14px; border:1px solid #efb7ba; border-radius:16px;
+  background:#fff; color:var(--red-dark); text-align:center; font:900 1.35rem/1 ui-monospace,SFMono-Regular,monospace; }
+.runbook { display:grid; grid-template-columns:minmax(0,1.4fr) minmax(260px,.8fr); gap:12px; margin:18px 0; }
+.current-cue { padding:18px; border-radius:20px; background:#2d292c; color:#fff; }
+.cue-meta { display:flex; align-items:center; gap:9px; margin-bottom:10px; color:#f4c9cc;
+  font-size:.7rem; font-weight:900; letter-spacing:.1em; text-transform:uppercase; }
+.cue-time { padding:4px 7px; border-radius:7px; background:rgba(255,255,255,.12);
+  font-family:ui-monospace,SFMono-Regular,monospace; }
+.cue-label { display:block; font-size:.82rem; color:#f4c9cc; }
+.cue-script { margin:5px 0 8px; font-size:1.08rem; font-weight:800; line-height:1.4; }
+.cue-note { margin:0; color:#c9c2c7; font-size:.76rem; }
+.cue-list { display:grid; gap:7px; margin:0; padding:0; list-style:none; }
+.cue-item { display:grid; grid-template-columns:46px 1fr; gap:9px; align-items:center; padding:9px 11px;
+  border:1px solid var(--line); border-radius:14px; background:#fff; color:var(--muted); }
+.cue-item time { font:800 .72rem/1 ui-monospace,SFMono-Regular,monospace; color:var(--red-dark); }
+.cue-item strong { display:block; color:var(--text); font-size:.76rem; line-height:1.25; }
+.cue-item span { display:block; font-size:.66rem; line-height:1.25; }
+.cue-item.active { border-color:var(--red); box-shadow:0 0 0 3px rgba(230,56,63,.1); }
+.cue-item.done { border-color:#7dccac; background:#f1fbf6; }
+.sequence-label { margin:0 0 8px; color:var(--muted); font-size:.68rem; font-weight:900;
+  letter-spacing:.12em; text-transform:uppercase; }
+.demo-stages { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:18px 0; }
+.demo-stage { padding:13px; border:1px solid var(--line); border-radius:16px; background:#fff; }
+.demo-stage strong { display:block; font-size:.88rem; }
+.demo-stage span { display:block; margin-top:3px; color:var(--muted); font-size:.72rem; line-height:1.35; }
+.demo-stage.active { border-color:var(--red); box-shadow:0 0 0 3px rgba(230,56,63,.1); }
+.demo-stage.done { border-color:#7dccac; background:#f1fbf6; }
+.demo-actions { display:flex; gap:10px; }
+.demo-actions button { min-height:54px; flex:1; border-radius:16px; text-align:center; font-size:.88rem; font-weight:850; }
+.demo-confirm { background:var(--red); border-color:var(--red); color:#fff; }
 #catalog { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:18px; align-items:start; }
 .group { margin:0; padding:20px; border:1px solid var(--line); border-radius:28px;
   background:rgba(255,255,255,.72); }
@@ -1020,6 +1421,8 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:560px; overflow:a
   .group { padding:15px; border-radius:22px; }
   .grid { grid-template-columns:1fr; }
   .controls,.positioning-grid { grid-template-columns:1fr; }
+  .demo-head { display:flex; } .runbook,.demo-stages { grid-template-columns:1fr; }
+  .demo-actions { flex-direction:column; }
   button { min-height:92px; }
 }
 @media (prefers-reduced-motion:reduce) { * { transition:none!important; scroll-behavior:auto!important; }
@@ -1048,6 +1451,34 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:560px; overflow:a
     </div>
     <span class="status-tag">System status</span>
   </section>
+  <section class="demo" aria-labelledby="demo-title">
+    <div class="demo-head">
+      <div>
+        <p class="eyebrow" style="color:var(--red-dark);margin-bottom:4px">Live run of show</p>
+        <h2 id="demo-title">First-minute demo</h2>
+        <p id="demo-message" class="demo-copy" aria-live="polite">Loading demo plan…</p>
+      </div>
+      <div>
+        <div id="demo-clock" class="demo-clock" aria-label="Demo elapsed time">00:00</div>
+        <span id="demo-status" class="status-tag" style="display:block;margin-top:7px;text-align:center">Ready</span>
+      </div>
+    </div>
+    <div class="runbook">
+      <div class="current-cue" aria-live="polite">
+        <div class="cue-meta"><span id="cue-time" class="cue-time">0:00</span><span id="cue-speaker">Presenter</span></div>
+        <span id="cue-label" class="cue-label">Opening cue</span>
+        <p id="cue-script" class="cue-script">Loading presenter script…</p>
+        <p id="cue-note" class="cue-note"></p>
+      </div>
+      <ol id="demo-cues" class="cue-list" aria-label="First-minute cue list"></ol>
+    </div>
+    <p class="sequence-label">Robot sequence</p>
+    <div id="demo-stages" class="demo-stages"></div>
+    <div class="demo-actions">
+      <button id="demo-start" class="secondary">Start first minute + robot demo</button>
+      <button id="demo-complete" class="demo-confirm" disabled>Confirm box is packed</button>
+    </div>
+  </section>
   <div id="catalog" aria-live="polite"></div>
   <section class="positioning" aria-labelledby="positioning-title">
     <h2 id="positioning-title"><span class="group-icon" aria-hidden="true">↗</span>Positioning</h2>
@@ -1071,6 +1502,12 @@ const lean=document.getElementById('lean'), baseDetail=document.getElementById('
 const tableRest=document.getElementById('table-rest');
 const latencyDetail=document.getElementById('latency-detail');
 const log=document.getElementById('log'), catalog=document.getElementById('catalog');
+const demoStart=document.getElementById('demo-start'), demoComplete=document.getElementById('demo-complete');
+const demoMessage=document.getElementById('demo-message'), demoStatus=document.getElementById('demo-status');
+const demoStages=document.getElementById('demo-stages'), demoCues=document.getElementById('demo-cues');
+const demoClock=document.getElementById('demo-clock'), cueTime=document.getElementById('cue-time');
+const cueSpeaker=document.getElementById('cue-speaker'), cueLabel=document.getElementById('cue-label');
+const cueScript=document.getElementById('cue-script'), cueNote=document.getElementById('cue-note');
 // A changed server ID means the Python process hot-reloaded; fetch the new page bundle.
 let current={}, buttons=[], rendered=false, previewAudio=null, loadedServerId=null;
 async function post(path, body={}) {
@@ -1125,6 +1562,37 @@ function renderCatalog() {
   current.routines.forEach(item=>grid.append(makeButton(item,'routine'))); section.append(grid); catalog.append(section);
   buttons=[...catalog.querySelectorAll('button'),tableRest]; rendered=true;
 }
+function renderDemo() {
+  if(!current.demo) return;
+  if(!demoStages.childElementCount) {
+    current.demo.stages.forEach((stage,index)=>{
+      const card=document.createElement('div'); card.className='demo-stage'; card.dataset.stage=stage.id;
+      const title=document.createElement('strong'); title.textContent=`${index+1}. ${stage.label}`;
+      const copy=document.createElement('span'); copy.textContent=stage.description;
+      card.append(title,copy); demoStages.append(card);
+    });
+  }
+  if(!demoCues.childElementCount) {
+    current.demo.cues.forEach(cue=>{
+      const item=document.createElement('li'); item.className='cue-item'; item.dataset.cue=cue.id;
+      const time=document.createElement('time'); time.textContent=cue.timecode;
+      const copy=document.createElement('div');
+      const title=document.createElement('strong'); title.textContent=cue.label;
+      const speaker=document.createElement('span'); speaker.textContent=cue.speaker;
+      copy.append(title,speaker); item.append(time,copy); demoCues.append(item);
+    });
+  }
+}
+function formatDemoTime(value) {
+  const total=Math.max(0,Math.floor(Number(value)||0));
+  return `${String(Math.floor(total/60)).padStart(2,'0')}:${String(total%60).padStart(2,'0')}`;
+}
+function usesDemoResource(button) {
+  const actionId=button.dataset.action, routineId=button.dataset.routine;
+  const specs=actionId?[current.actions.find(item=>item.id===actionId)]:
+    (current.routines.find(item=>item.id===routineId)?.steps||[]).map(id=>current.actions.find(item=>item.id===id));
+  return specs.filter(Boolean).some(spec=>spec.channels.some(channel=>['left-arm','right-arm','camera','depth-camera'].includes(channel)));
+}
 async function refresh() {
   try {
     const next=await (await fetch('/api/status',{cache:'no-store'})).json();
@@ -1132,19 +1600,49 @@ async function refresh() {
       window.location.reload(); return;
     }
     current=next; loadedServerId=next.server_id||loadedServerId;
-    renderCatalog();
+    renderCatalog(); renderDemo();
     const ready=current.connected&&!current.running&&!current.checking;
-    buttons.forEach(b=>b.disabled=!ready); stop.disabled=!(current.running||current.lean_enabled||current.lean_transition);
-    reconnect.disabled=current.running||current.checking||current.lean_enabled||current.lean_transition;
-    lean.disabled=!current.connected||current.lean_transition||current.running;
+    const packing=current.demo?.active&&current.demo.phase==='packing';
+    const demoTransition=current.demo?.active&&!packing;
+    buttons.forEach(b=>b.disabled=!ready||demoTransition||(packing&&usesDemoResource(b)));
+    stop.disabled=!(current.running||current.lean_enabled||current.lean_transition||current.demo?.active);
+    reconnect.disabled=current.running||current.checking||current.lean_enabled||current.lean_transition||current.demo?.active;
+    lean.disabled=!current.connected||current.lean_transition||current.running||current.demo?.active;
     lean.className='secondary '+(current.lean_enabled?'lean-active':'');
     lean.setAttribute('aria-pressed',String(current.lean_enabled));
     lean.innerHTML=`<span class="key">Z</span><span class="label">${current.lean_transition?'Changing base mode…':current.lean_enabled?'Return to balance':'Lean forward'}</span><span class="desc">${current.lean_enabled?'Restore upright balance mode':'Hold a bounded 4° forward lean'}</span>`;
     baseDetail.textContent=`Base: ${current.lean_phase}`;
     latencyDetail.textContent=current.last_dispatch_ms==null?'Dispatch: waiting for runner':`Dispatch: runner ready in ${current.last_dispatch_ms} ms`;
     dot.className='dot '+(current.connected?'good':current.checking?'':'bad');
-    statusEl.textContent=current.running?`${current.action} in progress`:current.mode==='simulation'?'Local simulation':current.connected?`Connected: ${current.host}`:current.checking?'Connecting…':'Robot offline';
+    statusEl.textContent=current.running?`${current.action} in progress`:packing?'Judge demo: packing':current.mode==='simulation'?'Local simulation':current.connected?`Connected: ${current.host}`:current.checking?'Connecting…':'Robot offline';
     detail.textContent=current.phase;
+    demoMessage.textContent=current.demo.message;
+    demoStatus.textContent=current.demo.phase.replace('-', ' ');
+    const elapsed=current.demo.elapsed_seconds||0;
+    demoClock.textContent=formatDemoTime(elapsed);
+    const cues=current.demo.cues||[];
+    const activeCue=[...cues].reverse().find(cue=>elapsed>=cue.at_seconds)||cues[0];
+    if(activeCue) {
+      cueTime.textContent=activeCue.timecode;
+      cueSpeaker.textContent=activeCue.speaker;
+      cueLabel.textContent=activeCue.label;
+      cueScript.textContent=`“${activeCue.script}”`;
+      cueNote.textContent=activeCue.note;
+      demoCues.querySelectorAll('.cue-item').forEach(card=>{
+        const cue=cues.find(item=>item.id===card.dataset.cue);
+        card.classList.toggle('active',cue?.id===activeCue.id);
+        card.classList.toggle('done',Boolean(cue&&cue.at_seconds<activeCue.at_seconds));
+      });
+    }
+    demoStart.disabled=!current.demo.available||current.demo.active||!ready||current.lean_enabled||current.lean_transition;
+    demoStart.textContent=current.demo.available?'Start first minute + robot demo':'Configure packing command to enable';
+    demoComplete.disabled=!current.demo.can_confirm;
+    const stageOrder=['opening','packing','finale'];
+    const currentIndex=stageOrder.indexOf(current.demo.phase);
+    demoStages.querySelectorAll('.demo-stage').forEach((card,index)=>{
+      card.classList.toggle('active',index===currentIndex);
+      card.classList.toggle('done',current.demo.phase==='complete'||index<currentIndex);
+    });
     error.hidden=!current.error; error.textContent=current.error||'';
     log.textContent=current.log.length?current.log.join('\n'):'No activity yet.';
   } catch (_) {
@@ -1153,6 +1651,8 @@ async function refresh() {
   }
 }
 reconnect.addEventListener('click',()=>post('/api/discover').then(refresh));
+demoStart.addEventListener('click',()=>post('/api/demo/start').then(refresh));
+demoComplete.addEventListener('click',()=>post('/api/demo/complete').then(refresh));
 lean.addEventListener('click',()=>post('/api/lean',{enabled:!current.lean_enabled}).then(refresh));
 tableRest.addEventListener('click',()=>post('/api/run',{action:'table-rest'}).then(refresh));
 stop.addEventListener('click',()=>{
@@ -1161,7 +1661,7 @@ stop.addEventListener('click',()=>{
 });
 document.addEventListener('keydown',event=>{
   if(event.repeat||event.target.matches('input,textarea,select')) return;
-  if(event.key==='Escape'&&(current.running||current.lean_enabled||current.lean_transition)){ event.preventDefault(); stop.click(); return; }
+  if(event.key==='Escape'&&(current.running||current.lean_enabled||current.lean_transition||current.demo?.active)){ event.preventDefault(); stop.click(); return; }
   if(event.key.toLowerCase()==='z'&&!lean.disabled){ event.preventDefault(); lean.click(); return; }
   const action=current.actions?.find(item=>item.key===event.key);
   const routine=current.routines?.find(item=>item.key===event.key);
@@ -1234,6 +1734,12 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/lean":
             ok, message = self.controller.set_lean(self._json_body().get("enabled"))
             self._send({"ok": ok, "message": message}, HTTPStatus.ACCEPTED if ok else HTTPStatus.CONFLICT)
+        elif self.path == "/api/demo/start":
+            ok, message = self.controller.start_demo()
+            self._send({"ok": ok, "message": message}, HTTPStatus.ACCEPTED if ok else HTTPStatus.CONFLICT)
+        elif self.path == "/api/demo/complete":
+            ok, message = self.controller.confirm_demo_packed()
+            self._send({"ok": ok, "message": message}, HTTPStatus.ACCEPTED if ok else HTTPStatus.CONFLICT)
         elif self.path == "/api/stop":
             ok, message = self.controller.stop()
             self._send({"ok": ok, "message": message}, HTTPStatus.ACCEPTED if ok else HTTPStatus.CONFLICT)
@@ -1261,8 +1767,8 @@ def start_source_reloader(server, controller, source, reload_requested, stop_eve
     """Restart the dashboard after an idle-safe source change.
 
     A live robot pose is never interrupted for developer convenience. If an
-    action or lean mode is active, the restart remains pending until the robot
-    has returned to an idle/balance state.
+    action, judge demo, or lean mode is active, the restart remains pending
+    until the robot has returned to an idle/balance state.
     """
     initial = file_signature(source)
 
@@ -1284,11 +1790,12 @@ def start_source_reloader(server, controller, source, reload_requested, stop_eve
                 or state["checking"]
                 or state["lean_enabled"]
                 or state["lean_transition"]
+                or state["demo"]["active"]
             )
             if busy:
                 if not announced_wait:
                     print(
-                        "[reload] source changed; waiting for actions and lean mode to stop",
+                        "[reload] source changed; waiting for actions, demo, and lean mode to stop",
                         flush=True,
                     )
                     announced_wait = True
@@ -1320,6 +1827,14 @@ def main():
         help="exercise actions and routines locally without SSH or robot hardware",
     )
     parser.add_argument(
+        "--demo-pack-command",
+        default="",
+        help=(
+            "trusted local command that runs the packing policy until it finishes; "
+            "quoted like a shell command but executed directly without a shell"
+        ),
+    )
+    parser.add_argument(
         "--no-reload",
         dest="reload",
         action="store_false",
@@ -1328,7 +1843,12 @@ def main():
     parser.set_defaults(reload=True)
     args = parser.parse_args()
 
-    controller = RobotController(args.ssh_hosts, simulate=args.simulate)
+    demo_pack_command = tuple(shlex.split(args.demo_pack_command))
+    controller = RobotController(
+        args.ssh_hosts,
+        simulate=args.simulate,
+        demo_pack_command=demo_pack_command,
+    )
     Handler.controller = controller
     server = ThreadingHTTPServer((args.bind, args.port), Handler)
     server.daemon_threads = True
@@ -1361,7 +1881,12 @@ def main():
         deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline:
             state = controller.state.snapshot()
-            if not state["running"] and not state["lean_enabled"] and not state["lean_transition"]:
+            if (
+                not state["running"]
+                and not state["lean_enabled"]
+                and not state["lean_transition"]
+                and not state["demo"]["active"]
+            ):
                 break
             time.sleep(0.1)
         server.server_close()

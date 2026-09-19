@@ -11,6 +11,7 @@ from scripts.robot_dashboard import (
     ACTIONS,
     CAMERA_POINT_RUNNER,
     DEFAULT_SSH_HOSTS,
+    DEMO_CUES,
     EFFECT_RUNNER,
     GREETER_ACTION_RUNNER,
     REMOTE_TABLE_REST_RUNNER,
@@ -39,6 +40,18 @@ def wait_until_idle(controller, timeout=5.0):
     while controller.state.snapshot()["running"] and time.monotonic() < deadline:
         time.sleep(0.02)
     assert not controller.state.snapshot()["running"]
+
+
+def wait_for_demo(controller, phase=None, active=None, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        demo = controller.state.snapshot()["demo"]
+        if (phase is None or demo["phase"] == phase) and (
+            active is None or demo["active"] is active
+        ):
+            return demo
+        time.sleep(0.02)
+    pytest.fail(f"demo did not reach phase={phase!r} active={active!r}")
 
 
 def test_catalog_ids_keys_and_routine_steps_are_valid():
@@ -102,6 +115,23 @@ def test_salute_lifts_holds_then_waves_with_left_arm():
         assert max(generated) <= max(recorded)
     assert all(frame["right"] == frames[0]["right"] for frame in frames)
     assert 5.0 < max(times) < 7.0
+
+
+def test_namaste_uses_a_two_arm_chest_pose_and_bounded_hold():
+    frames = json.loads(action_resource_path(ACTIONS["namaste"]).read_text())
+    times = [frame["t"] for frame in frames]
+    source = json.loads(
+        (ROOT / "bbapps" / "greeter" / "movements" / "hug.json").read_text()
+    )
+
+    assert ACTIONS["namaste"].channels == ("left-arm", "right-arm")
+    assert ACTIONS["namaste"].risk == "motion"
+    assert len(frames) == 134
+    assert all(later > earlier for earlier, later in zip(times, times[1:]))
+    assert frames[:74] == source[:74]
+    assert all(frame["left"] == frames[73]["left"] for frame in frames[74:])
+    assert all(frame["right"] == frames[73]["right"] for frame in frames[74:])
+    assert times[-1] - times[73] == pytest.approx(1.2)
 
 
 def test_public_catalog_hides_execution_details():
@@ -169,6 +199,85 @@ def test_simulation_runs_routine_steps_in_declared_order():
     second = log.index("Step 2/2 — Processing sound")
     assert first < second
     assert ROUTINES["thinking"].steps == ("light-thinking", "sound-processing")
+
+
+def test_judge_demo_layers_safe_side_actions_over_background_packing(monkeypatch):
+    controller = RobotController(
+        ("not-used",),
+        simulate=True,
+        demo_pack_seconds=5.0,
+    )
+
+    def instant_action(info):
+        controller.state.add_log(f"[simulation] {info.executor}: {info.label}")
+
+    monkeypatch.setattr(controller, "_simulate_action", instant_action)
+
+    assert controller.start_demo() == (True, "Judge demo started")
+    demo = wait_for_demo(controller, phase="packing", active=True)
+    assert demo["can_confirm"] is True
+
+    rejected, message = controller.run_action("wave")
+    assert rejected is False
+    assert "owns the arms and cameras" in message
+    assert controller.run_action("light-thinking")[0] is True
+    wait_until_idle(controller)
+
+    assert controller.confirm_demo_packed() == (
+        True,
+        "Packing completion confirmed",
+    )
+    demo = wait_for_demo(controller, phase="complete", active=False)
+    assert demo["message"] == "Box packed. Demo complete — bish bash bosh."
+    log = controller.state.snapshot()["log"]
+    assert any("packing completion evidence: operator confirmed" in line for line in log)
+    assert any("Celebration light" in line for line in log)
+
+
+def test_demo_status_exposes_timed_first_minute_presenter_cues(monkeypatch):
+    controller = RobotController(
+        ("not-used",),
+        simulate=True,
+        demo_pack_seconds=5.0,
+    )
+    monkeypatch.setattr(controller, "_simulate_action", lambda info: None)
+
+    ready = controller.state.snapshot()["demo"]
+    assert ready["elapsed_seconds"] == 0
+    assert ready["cues"] == list(DEMO_CUES)
+    assert ready["cues"][0]["script"] == (
+        "BracketBot, remind me in 4 minutes to take my medication."
+    )
+    assert "at-home care assistant" in ready["cues"][1]["script"]
+
+    assert controller.start_demo()[0]
+    demo = wait_for_demo(controller, phase="packing", active=True)
+    assert demo["elapsed_seconds"] >= 0
+    assert [cue["at_seconds"] for cue in demo["cues"]] == [0, 12, 35]
+    assert controller.stop()[0]
+    wait_for_demo(controller, phase="stopped", active=False)
+
+
+def test_dashboard_page_includes_first_minute_runbook_controls():
+    assert 'id="demo-clock"' in PAGE
+    assert 'id="demo-cues"' in PAGE
+    assert "Start first minute + robot demo" in PAGE
+
+
+def test_global_stop_cancels_judge_demo(monkeypatch):
+    controller = RobotController(
+        ("not-used",),
+        simulate=True,
+        demo_pack_seconds=5.0,
+    )
+    monkeypatch.setattr(controller, "_simulate_action", lambda info: None)
+
+    assert controller.start_demo()[0]
+    wait_for_demo(controller, phase="packing", active=True)
+    assert controller.stop() == (True, "Stop requested")
+
+    demo = wait_for_demo(controller, phase="stopped", active=False)
+    assert demo["message"] == "Demo stopped safely"
 
 
 def test_stop_interrupts_simulated_operation():
