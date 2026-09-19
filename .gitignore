@@ -1,0 +1,34 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Models, builds, and generated data
+/artifacts/
+/datasets/
+/recordings/
+*.engine
+*.onnx
+*.pt
+*.pth
+*.mp4
+*.avi
+*.log
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*~

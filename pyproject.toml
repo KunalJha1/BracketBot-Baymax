@@ -1,0 +1,10 @@
+[project]
+name = "bracketbot-baymax"
+version = "0.1.0"
+description = "Safety-first interaction, gestures, and assistant tooling for BracketBot"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv]
+package = false
