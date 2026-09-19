@@ -20,6 +20,8 @@ or replace qualified care.
 - A prominent stop control; only one dashboard motion may run at a time.
 - Existing BBOS applications for cameras, depth, IMU, audio, LEDs, navigation,
   Quest teleoperation, arm recording/playback, sound, and inference.
+- A fully local vision prototype combining YOLO person detection, YuNet face
+  localization, and smoothed EmotiEffLib visible-expression estimates.
 - An existing Gemini-powered greeter and provider-ready inference code with
   OpenAI and Google client dependencies.
 
@@ -62,6 +64,51 @@ Controls:
 The dashboard uploads the selected recording and `gesture_test.py` to `/tmp`
 on the active robot. It does not require this repository to be cloned on the
 robot.
+
+## Run local person and expression detection
+
+Install the optional vision environment:
+
+```sh
+uv sync --extra vision
+```
+
+Start the laptop-camera prototype:
+
+```sh
+uv run --extra vision python people_detector.py
+```
+
+The preview draws green person boxes and a magenta box around the primary face
+with a smoothed visible-expression label. Press **Q** or **Esc** to quit.
+
+Useful variants:
+
+```sh
+# Person detection without expression analysis
+uv run --extra vision python people_detector.py --no-expression
+
+# Process a video and save an annotated copy
+uv run --extra vision python people_detector.py \
+  --source input.mp4 --output artifacts/annotated.mp4
+
+# Apple Silicon acceleration (CPU is the most portable default)
+uv run --extra vision python people_detector.py --device mps
+```
+
+The pipeline runs locally; camera frames are not sent to an API. Its expression
+label describes visible facial appearance, **not** a person's internal emotion,
+intent, mental state, or health. Predictions can be wrong because of lighting,
+occlusion, pose, disability, culture, or ordinary individual variation. Do not
+use this signal for diagnosis, access control, risk scoring, or autonomous
+decisions about a person. A future assistant may use it only as a low-confidence
+conversation cue and should ask rather than assume how someone feels.
+
+The repository includes the small model files needed for deterministic offline
+startup. Their sources and checksums are documented in
+[`assets/models/README.md`](assets/models/README.md). The YOLO checkpoint is an
+Ultralytics YOLO11 pose model; review upstream Ultralytics licensing before
+redistributing or using it commercially.
 
 ## Safety model
 
@@ -146,6 +193,9 @@ reference for future provider adapters.
 | `scripts/gesture_test.py` | Generic safe robot-side gesture runner |
 | `scripts/handshake_test.py` | Focused standalone handshake runner |
 | `scripts/wave_test.py` | Focused standalone wave runner |
+| `people_detector.py` | Local YOLO + YuNet + visible-expression pipeline |
+| `assets/models/` | Documented YuNet and EmotiEffLib ONNX assets |
+| `tests/test_people_detector.py` | Unit tests for detection conversion and smoothing |
 | `bbapps/greeter/` | YOLO/Gemini greeter and gesture recordings |
 | `bbapps/inference/` | Policy and VLM clients, adapters, and task manifest |
 | `bbapps/nav/` | Navigation and relocalization tools |
@@ -178,7 +228,8 @@ button or keyboard action.
 ## Development checks
 
 ```sh
-python3 -m py_compile scripts/robot_dashboard.py scripts/gesture_test.py
+python3 -m py_compile scripts/robot_dashboard.py scripts/gesture_test.py people_detector.py
+uv run --extra vision --extra dev pytest tests/test_people_detector.py
 git diff --check
 ```
 
@@ -192,6 +243,8 @@ production robot action path.
 - [ ] Add speech interruption and turn-taking tests.
 - [ ] Add authenticated remote access instead of exposing the local dashboard.
 - [ ] Add consent-aware vision and local retention controls.
+- [ ] Feed the local vision result into the assistant as an optional,
+      uncertainty-labelled observation instead of an automatic trigger.
 - [ ] Wrap sound, LED, navigation, and approved routines as typed tools.
 - [ ] Add action-policy tests proving models cannot bypass the safety gate.
 - [ ] Add health/status telemetry without medical diagnosis claims.

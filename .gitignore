@@ -32,3 +32,7 @@ venv/
 .idea/
 .vscode/
 *~
+
+# Small, documented vision models intentionally shipped for offline startup.
+!yolo11n-pose.pt
+!assets/models/*.onnx
