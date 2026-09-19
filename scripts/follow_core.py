@@ -330,3 +330,143 @@ class Tracker:
         else:
             v_radial = 0.0
         return Track(forward, left, rng, math.atan2(left, forward), float(v_radial), self.age(t))
+
+
+def follow_command(track, gap, cfg):
+    """(v, omega) that holds ``gap`` to the tracked person. v is never negative."""
+    v = max(track.v_radial, 0.0) + cfg.k_r * shrink(track.range - gap, cfg.deadband_range)
+    v *= math.cos(track.bearing)
+    if abs(track.bearing) > cfg.turn_in_place_bearing:
+        v = 0.0  # face the person before driving
+    omega = cfg.k_theta * shrink(track.bearing, cfg.deadband_bearing)
+    return clamp(v, 0.0, cfg.v_max), clamp(omega, -cfg.omega_max, cfg.omega_max)
+
+
+class RateLimiter:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.reset()
+
+    def reset(self):
+        self.v = 0.0
+        self.omega = 0.0
+
+    def step(self, v, omega, dt):
+        cfg = self.cfg
+        self.v += clamp(v - self.v, -cfg.accel_down * dt, cfg.accel_up * dt)
+        self.omega += clamp(omega - self.omega, -cfg.alpha_max * dt, cfg.alpha_max * dt)
+        return self.v, self.omega
+
+
+def corridor_count(points, person, cfg):
+    """Points in the drive corridor that are not floor, the robot itself, or the person."""
+    if points is None or len(points) == 0:
+        return 0
+    f, l, z = points[:, 0], points[:, 1], points[:, 2]
+    half = cfg.robot_width / 2 + cfg.corridor_margin
+    keep = (
+        (f > 0) & (f <= cfg.corridor_length) & (np.abs(l) <= half)
+        & (z >= cfg.corridor_z_min) & (z <= cfg.corridor_z_max)
+    )
+    if person is not None:
+        keep &= np.hypot(f - person[0], l - person[1]) > cfg.person_exclusion_radius
+    for f0, f1, l0, l1, z0, z1 in cfg.self_mask:
+        keep &= ~((f >= f0) & (f <= f1) & (l >= l0) & (l <= l1) & (z >= z0) & (z <= z1))
+    return int(np.count_nonzero(keep))
+
+
+class CorridorGuard:
+    """Blocks at once; clears only after ``corridor_clear_time`` below the threshold."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.blocked = False
+        self._clear_since = None
+
+    def update(self, t, count):
+        if count >= self.cfg.corridor_min_points:
+            self.blocked = True
+            self._clear_since = None
+        elif self.blocked:
+            if self._clear_since is None:
+                self._clear_since = t
+            if t - self._clear_since >= self.cfg.corridor_clear_time:
+                self.blocked = False
+                self._clear_since = None
+        return self.blocked
+
+
+class OdometryCheck:
+    """Trips when wheel feedback keeps moving opposite to what was sent (a sign bug)."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self._since = None
+
+    def update(self, t, v_sent, omega_sent, v_meas, omega_meas):
+        wrong = (
+            (abs(v_sent) >= 0.05 and abs(v_meas) >= 0.03 and v_meas * v_sent < 0)
+            or (abs(omega_sent) >= 0.2 and abs(omega_meas) >= 0.1 and omega_meas * omega_sent < 0)
+        )
+        if not wrong:
+            self._since = None
+            return False
+        if self._since is None:
+            self._since = t
+        return t - self._since >= self.cfg.odom_mismatch_time
+
+
+@dataclass(frozen=True)
+class Verdict:
+    v: float
+    omega: float
+    rule: str
+    exit: bool = False
+
+
+def supervise(cfg, *, v, omega, stop_requested, heartbeat_age, roll_deg, pitch_deg,
+              odom_mismatch, tracking, track_age, points_age, blocked, range_m):
+    """Final say over every command. Exit rules first, then restrictions (all applied)."""
+    if stop_requested:
+        return Verdict(0.0, 0.0, "stop", True)
+    if heartbeat_age > cfg.heartbeat_timeout:
+        return Verdict(0.0, 0.0, "heartbeat", True)
+    if abs(roll_deg) >= cfg.upright_deg or abs(pitch_deg) >= cfg.upright_deg:
+        return Verdict(0.0, 0.0, "not-upright", True)
+    if odom_mismatch:
+        return Verdict(0.0, 0.0, "odometry-mismatch", True)
+
+    fired = []
+    if not tracking:
+        v = omega = 0.0
+        fired.append("no-track")
+    if points_age > cfg.points_stale:
+        v = 0.0  # obstacle state unknown: turning in place is still allowed
+        fired.append("points-stale")
+    if track_age is not None and track_age > cfg.perception_stale:
+        v = omega = 0.0
+        fired.append("track-stale")
+    if blocked:
+        v = 0.0
+        fired.append("blocked")
+    if range_m is not None and range_m < cfg.min_range:
+        v = 0.0
+        fired.append("min-range")
+    return Verdict(
+        clamp(v, 0.0, cfg.v_max),
+        clamp(omega, -cfg.omega_max, cfg.omega_max),
+        fired[0] if fired else "ok",
+    )
+
+
+def start_refusal(cfg, *, roll_deg, pitch_deg, voltage, low_battery_v, drive_writers, points_fresh):
+    """Why the runner must not start, or None. ``voltage``/``low_battery_v`` may be None (unknown)."""
+    if abs(roll_deg) >= cfg.upright_deg or abs(pitch_deg) >= cfg.upright_deg:
+        return "robot is not upright"
+    if not points_fresh:
+        return "camera.points is not publishing; start the depth daemon"
+    if drive_writers:
+        return "another app is driving: " + "; ".join(drive_writers)
+    if voltage is not None and low_battery_v is not None and voltage < low_battery_v:
+        return f"battery low ({voltage:.1f} V < {low_battery_v:.1f} V)"
+    return None

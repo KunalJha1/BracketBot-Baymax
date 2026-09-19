@@ -6,12 +6,20 @@ import numpy as np
 import pytest
 
 from follow_core import (
+    CorridorGuard,
     FollowConfig,
     LockOn,
+    OdometryCheck,
     PersonObservation,
     Pose2D,
+    RateLimiter,
+    Track,
     Tracker,
+    corridor_count,
+    follow_command,
     hist_distance,
+    start_refusal,
+    supervise,
 )
 
 CFG = FollowConfig()
@@ -126,3 +134,140 @@ def test_track_view_does_not_modify_the_filter():
     before = tracker.kf.s.copy()
     tracker.track(5.0, Pose2D())
     assert np.array_equal(tracker.kf.s, before)
+
+
+def track(range_m, bearing_deg=0.0, v_radial=0.0, age=0.05):
+    b = math.radians(bearing_deg)
+    return Track(range_m * math.cos(b), range_m * math.sin(b), range_m, b, v_radial, age)
+
+
+def safe_inputs(**overrides):
+    values = dict(
+        v=0.1, omega=0.1, stop_requested=False, heartbeat_age=0.1, roll_deg=0.0,
+        pitch_deg=2.0, odom_mismatch=False, tracking=True, track_age=0.05,
+        points_age=0.05, blocked=False, range_m=1.0,
+    )
+    values.update(overrides)
+    return values
+
+
+# --- controller -----------------------------------------------------------
+
+def test_inside_deadband_the_robot_holds_still():
+    assert follow_command(track(1.04), 1.0, FAST) == (0.0, 0.0)
+
+
+def test_range_error_drives_forward_proportionally():
+    v, omega = follow_command(track(1.25), 1.0, FAST)
+    assert v == pytest.approx(0.8 * 0.20)
+    assert omega == 0.0
+
+
+def test_person_speed_is_fed_forward():
+    v, _ = follow_command(track(1.0, v_radial=0.12), 1.0, FAST)
+    assert v == pytest.approx(0.12)
+
+
+def test_never_reverses_when_the_person_comes_closer():
+    v, _ = follow_command(track(0.6, v_radial=-0.3), 1.0, FAST)
+    assert v == 0.0
+
+
+def test_turns_in_place_beyond_35_degrees():
+    v, omega = follow_command(track(1.5, bearing_deg=40), 1.0, FAST)
+    assert v == 0.0
+    assert omega == FAST.omega_max  # positive: turn left toward the person
+
+
+def test_speeds_are_clamped():
+    v, omega = follow_command(track(3.0, bearing_deg=-60), 1.0, FAST)
+    assert v == 0.0
+    assert omega == -FAST.omega_max
+    v, _ = follow_command(track(3.0), 1.0, CFG)
+    assert v == CFG.v_max
+
+
+def test_rate_limiter_uses_separate_accel_brake_and_turn_limits():
+    limiter = RateLimiter(CFG)
+    assert limiter.step(0.3, 1.0, 0.02) == pytest.approx((0.008, 0.03))
+    limiter.v = 0.3
+    assert limiter.step(0.0, 0.03, 0.02)[0] == pytest.approx(0.3 - 0.016)
+
+
+# --- obstacle corridor ----------------------------------------------------
+
+def test_corridor_ignores_floor_person_and_self_and_counts_obstacles():
+    floor = np.column_stack([np.linspace(0.1, 0.6, 50), np.zeros(50), np.zeros(50)])
+    box = np.column_stack([np.full(40, 0.5), np.linspace(-0.1, 0.1, 40), np.full(40, 0.2)])
+    body = np.column_stack([np.full(40, 0.05), np.zeros(40), np.full(40, 1.0)])
+    cfg = dataclasses.replace(CFG, self_mask=((0.0, 0.1, -0.2, 0.2, 0.3, 1.6),))
+    points = np.vstack([floor, box, body])
+    assert corridor_count(points, None, cfg) == 40
+    assert corridor_count(points, (0.55, 0.0), cfg) == 0  # the box is where the person is
+    assert corridor_count(np.empty((0, 3)), None, cfg) == 0
+
+
+def test_corridor_blocks_at_once_and_clears_with_hysteresis():
+    guard = CorridorGuard(CFG)
+    assert guard.update(0.0, 30) is True
+    assert guard.update(0.1, 0) is True
+    assert guard.update(0.55, 0) is True
+    assert guard.update(0.61, 0) is False
+
+
+def test_odometry_check_needs_a_sustained_opposite_sign():
+    check = OdometryCheck(CFG)
+    assert check.update(0.0, 0.2, 0.0, -0.1, 0.0) is False
+    assert check.update(0.3, 0.2, 0.0, -0.1, 0.0) is False
+    assert check.update(0.6, 0.2, 0.0, -0.1, 0.0) is True
+    assert check.update(0.7, 0.2, 0.0, 0.1, 0.0) is False
+
+
+# --- supervisor -----------------------------------------------------------
+
+@pytest.mark.parametrize("override, rule", [
+    ({"stop_requested": True}, "stop"),
+    ({"heartbeat_age": 1.2}, "heartbeat"),
+    ({"roll_deg": 26.0}, "not-upright"),
+    ({"pitch_deg": -25.0}, "not-upright"),
+    ({"odom_mismatch": True}, "odometry-mismatch"),
+])
+def test_exit_rules(override, rule):
+    verdict = supervise(CFG, **safe_inputs(**override))
+    assert (verdict.v, verdict.omega, verdict.rule, verdict.exit) == (0.0, 0.0, rule, True)
+
+
+def test_exit_rule_priority():
+    verdict = supervise(CFG, **safe_inputs(heartbeat_age=5.0, roll_deg=40.0, blocked=True))
+    assert verdict.rule == "heartbeat"
+
+
+@pytest.mark.parametrize("override, rule, omega", [
+    ({"tracking": False, "track_age": None, "range_m": None}, "no-track", 0.0),
+    ({"points_age": 0.5}, "points-stale", 0.1),
+    ({"track_age": 0.4}, "track-stale", 0.0),
+    ({"blocked": True}, "blocked", 0.1),
+    ({"range_m": 0.4}, "min-range", 0.1),
+])
+def test_restriction_rules(override, rule, omega):
+    verdict = supervise(CFG, **safe_inputs(**override))
+    assert (verdict.v, verdict.omega, verdict.rule, verdict.exit) == (0.0, omega, rule, False)
+
+
+def test_supervisor_passes_safe_commands_and_never_reverses():
+    assert supervise(CFG, **safe_inputs()).rule == "ok"
+    assert supervise(CFG, **safe_inputs(v=0.1)).v == pytest.approx(0.1)
+    assert supervise(CFG, **safe_inputs(v=-0.2)).v == 0.0
+    verdict = supervise(CFG, **safe_inputs(v=0.9, omega=-3.0))
+    assert (verdict.v, verdict.omega) == (CFG.v_max, -CFG.omega_max)
+
+
+def test_start_refusal():
+    ok = dict(roll_deg=0.0, pitch_deg=3.0, voltage=24.0, low_battery_v=21.0,
+              drive_writers=[], points_fresh=True)
+    assert start_refusal(CFG, **ok) is None
+    assert start_refusal(CFG, **{**ok, "pitch_deg": 30.0}) == "robot is not upright"
+    assert "depth daemon" in start_refusal(CFG, **{**ok, "points_fresh": False})
+    assert "greeter" in start_refusal(CFG, **{**ok, "drive_writers": ["123 python greeter/main.py"]})
+    assert start_refusal(CFG, **{**ok, "voltage": 20.0}) == "battery low (20.0 V < 21.0 V)"
+    assert start_refusal(CFG, **{**ok, "voltage": None}) is None
