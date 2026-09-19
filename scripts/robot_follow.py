@@ -1,28 +1,15 @@
-# /// script
-# requires-python = "==3.10.*"
-# dependencies = [
-#   "bbos",
-#   "bbai",
-#   "numpy",
-#   "opencv-python",
-#   "pycuda",
-# ]
-# [tool.uv.sources]
-# bbos = { path = "/home/bracketbot/bbos", editable = true }
-# bbai = { path = "/home/bracketbot/bbai", editable = true }
-# ///
 """Person-follow runner for BracketBot. Copied to /tmp by robot_dashboard.py.
 
-The dependency block mirrors bbapps/greeter/main.py, the app already proven to
-run TensorRT through PyCUDA on this robot (bbai brings the TensorRT bindings).
-While running it is the only writer of drive.ctrl and led.ctrl. Every decision
-lives in follow_core.FollowLoop; this file only moves data between BBOS topics,
-the pose engine, and the loop.
+Depth only: people are person-sized clusters in camera.points (see
+follow_perception.py); no camera image and no neural network. Needs only BBOS
+and numpy, so it runs in the BBOS venv like robot_base_mode.py. While running it
+is the only writer of drive.ctrl and led.ctrl. Every decision lives in
+follow_core.FollowLoop; this file only moves data between BBOS topics and the loop.
 
-    uv run --script /tmp/robot_follow.py --pid-file /tmp/f.pid     # from the dashboard
-    uv run --script /tmp/robot_follow.py --check                   # gate G1
-    uv run --script /tmp/robot_follow.py --dry-run --no-heartbeat  # gate G2
-    uv run --script /tmp/robot_follow.py --rotate-only ...         # gate G3
+    ~/bbos/.venv/bin/python /tmp/robot_follow.py --pid-file /tmp/f.pid     # from the dashboard
+    ~/bbos/.venv/bin/python /tmp/robot_follow.py --check                   # gate G0: list clusters
+    ~/bbos/.venv/bin/python /tmp/robot_follow.py --dry-run --no-heartbeat  # gate G2
+    ~/bbos/.venv/bin/python /tmp/robot_follow.py --rotate-only ...         # gate G3
 """
 
 from __future__ import annotations
@@ -45,17 +32,13 @@ import numpy as np
 
 from follow_core import (
     FollowConfig, FollowLoop, Perception, PersonObservation, TickInputs, led_color,
-    parse_command, start_refusal, status_line, timestamp_to_seconds, wheel_twist,
+    parse_command, start_refusal, status_line, wheel_twist,
 )
-from follow_perception import (
-    PoseEngine, base_to_local, hand_raised, mask_to_image_pixels, person_position,
-    torso_histogram, torso_rect,
-)
+from follow_perception import ClusterConfig, base_to_local, find_people
 
 PERIOD = 0.02  # 50 Hz control loop; drive.ctrl times out after 0.1 s
 STATUS_PERIOD = 0.2
 CSV_PERIOD = 0.05
-PAIR_TOLERANCE = 0.05  # max seconds between the RGB frame and the point cloud it is paired with
 # drive.state.vel -> (left, right) turns/s, forward-positive. Verified at gates G3/G4a.
 WHEEL_ORDER = (0, 1)
 WHEEL_SIGNS = (1.0, 1.0)
@@ -80,13 +63,12 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Follow one person at a held distance")
     parser.add_argument("--gap", type=float, default=cfg.gap_default)
     parser.add_argument("--v-max", type=float, default=cfg.v_max)
-    parser.add_argument("--engine", type=Path, default=Path.home() / ".cache/baymax/yolo11n-pose.engine")
     parser.add_argument("--pid-file", type=Path)
     parser.add_argument("--log-dir", type=Path, default=Path("/tmp"))
     parser.add_argument("--dry-run", action="store_true", help="compute and log; never open drive.ctrl")
     parser.add_argument("--rotate-only", action="store_true", help="forward speed held at 0 (gate G3)")
     parser.add_argument("--no-heartbeat", action="store_true", help="only with --dry-run: no dashboard needed")
-    parser.add_argument("--check", action="store_true", help="gate G1: time the engine on a live frame, then exit")
+    parser.add_argument("--check", action="store_true", help="gate G0: print the clusters seen for 3 s, then exit")
     return parser
 
 
@@ -107,13 +89,6 @@ def loop_config(args):
     return replace(FollowConfig(), v_max=0.0 if args.rotate_only else args.v_max)
 
 
-def field(data, name):
-    try:
-        return data[name]
-    except (KeyError, ValueError, IndexError):
-        return None
-
-
 def wait_fresh(reader, timeout, topic):
     started = time.monotonic()
     while not reader.ready():
@@ -121,16 +96,6 @@ def wait_fresh(reader, timeout, topic):
             raise RuntimeError(f"no fresh {topic} sample; is its daemon running?")
         time.sleep(0.002)
     return reader.data
-
-
-def left_eye(image):
-    # A side-by-side stereo image is more than twice as wide as it is tall.
-    return image[:, : image.shape[1] // 2] if image.shape[1] > 2.5 * image.shape[0] else image
-
-
-def stamp(data, arrival):
-    value = field(data, "timestamp")
-    return arrival if value is None else timestamp_to_seconds(np.asarray(value).item())
 
 
 def other_drive_writers():
@@ -144,24 +109,16 @@ def other_drive_writers():
     return found
 
 
-def perceive(engine, image, points_base, pixels, t):
-    """Pose detections + the point cloud -> located people. ``pixels``: each point's (u, v) in ``image``."""
-    detections = engine.infer(image)
+def perceive(points_base, t, cluster_cfg=ClusterConfig()):
+    """One camera.points frame -> Perception with every person-sized cluster."""
     local = base_to_local(points_base)
-    people = []
-    for det in detections:
-        rect = torso_rect(det)
-        position = person_position(local, pixels, rect)
-        if position is not None:
-            people.append(PersonObservation(
-                position[0], position[1], det.score, hand_raised(det), torso_histogram(image, rect)
-            ))
-    return Perception(t, tuple(people), local)
+    people = tuple(PersonObservation(c.forward, c.left) for c in find_people(local, cluster_cfg))
+    return Perception(t, people, local)
 
 
-def make_pixel_mapper(depth_shape):
-    """Where each camera.points point lands in the detection image: (points_base, mask, image_shape) -> (N, 2)."""
-    return lambda points_base, mask, image_shape: mask_to_image_pixels(mask, depth_shape, image_shape)
+def cloud(data):
+    n = int(data["num_points"])
+    return np.asarray(data["points"][:n])
 
 
 def start_command_reader(commands):
@@ -185,29 +142,24 @@ def write_led(writer, rgb):
         frame["period_ms"] = np.uint16(0)
 
 
-def run_check(engine, reader_cls, image_topic):
-    with reader_cls(image_topic, keeptime=False) as source:
-        image = left_eye(np.asarray(wait_fresh(source, 3.0, image_topic)["rgb"]).copy())
-    timings, detections = [], []
-    for _ in range(20):
-        started = time.perf_counter()
-        detections = engine.infer(image)
-        timings.append((time.perf_counter() - started) * 1000)
-    best = detections[0] if detections else None
-    print(json.dumps({
-        "image_shape": list(image.shape),
-        "latency_ms_p50": round(float(np.median(timings[5:])), 1),
-        "latency_ms_max": round(float(np.max(timings[5:])), 1),
-        "people": len(detections),
-        "best": None if best is None else {
-            "box": [round(float(v)) for v in best.box], "score": round(best.score, 3),
-            "hand_raised": hand_raised(best),
-        },
-    }), flush=True)
+def run_check(reader_cls, seconds=3.0):
+    """Read-only: print the person-sized clusters in each camera.points frame."""
+    with reader_cls("camera.points", keeptime=False) as points:
+        wait_fresh(points, 3.0, "camera.points")
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if points.ready():
+                people = find_people(base_to_local(cloud(points.data)))
+                print(json.dumps({"clusters": [
+                    {"forward": round(c.forward, 2), "left": round(c.left, 2), "points": c.points,
+                     "top": round(c.top, 2), "depth": round(c.depth, 2), "width": round(c.width, 2)}
+                    for c in people
+                ]}), flush=True)
+            time.sleep(0.05)
 
 
-def control_loop(args, cfg, engine, readers, drive, led, to_pixels, wheel_diam, robot_width):
-    camera, points, imu, drive_state = readers
+def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width):
+    points, imu, drive_state = readers
     loop = FollowLoop(cfg, args.gap)
     commands = queue.Queue()
     if not args.no_heartbeat:
@@ -217,7 +169,6 @@ def control_loop(args, cfg, engine, readers, drive, led, to_pixels, wheel_diam, 
     command_stop = False
     rpy = np.zeros(3)
     measured = (0.0, 0.0)
-    rgb_frame = None  # (arrival, stamp, image)
     last_status = last_csv = 0.0
     state, state_since = None, now
     log_path = args.log_dir / f"baymax_follow_{time.strftime('%Y%m%d_%H%M%S')}.csv"
@@ -249,19 +200,7 @@ def control_loop(args, cfg, engine, readers, drive, led, to_pixels, wheel_diam, 
             if drive_state.ready():
                 vel = np.asarray(drive_state.data["vel"], dtype=float)
                 measured = wheel_twist(vel[list(WHEEL_ORDER)], wheel_diam, robot_width, WHEEL_SIGNS)
-            if camera.ready():
-                data = camera.data
-                rgb_frame = (t, stamp(data, t), left_eye(np.asarray(data["rgb"]).copy()))
-            perception = None
-            if points.ready():
-                data = points.data
-                n = int(data["num_points"])
-                cloud_stamp = stamp(data, t)
-                if rgb_frame is not None and abs(rgb_frame[1] - cloud_stamp) <= PAIR_TOLERANCE \
-                        and t - rgb_frame[0] <= PAIR_TOLERANCE:
-                    image, points_base = rgb_frame[2], np.asarray(data["points"][:n])
-                    pixels = to_pixels(points_base, np.asarray(data["mask"][:n]), image.shape)
-                    perception = perceive(engine, image, points_base, pixels, t)
+            perception = perceive(cloud(points.data), t) if points.ready() else None
 
             out = loop.tick(TickInputs(
                 t=t, heartbeat_age=t - last_heartbeat,
@@ -297,65 +236,55 @@ def control_loop(args, cfg, engine, readers, drive, led, to_pixels, wheel_diam, 
 def run(args):
     from bbos import Config, Reader, Type, Writer
 
-    engine = PoseEngine(args.engine)
-    try:
-        image_topic = "camera.rect"
-        if args.check:
-            run_check(engine, Reader, image_topic)
-            return
-        cfg = loop_config(args)
-        drive_cfg = Config("drive")
-        wheel_diam = float(drive_cfg.wheel_diam)
-        robot_width = float(getattr(drive_cfg, "robot_width", cfg.robot_width))
-        low_battery_v = getattr(Config("base"), "low_battery_v", None)
-        with ExitStack() as stack:
-            camera = stack.enter_context(Reader(image_topic, keeptime=False))
-            points = stack.enter_context(Reader("camera.points", keeptime=False))
-            depth = stack.enter_context(Reader("camera.depth", keeptime=False))
-            imu = stack.enter_context(Reader("imu.orientation", keeptime=False))
-            drive_state = stack.enter_context(Reader("drive.state", keeptime=False))
-            drive_status = stack.enter_context(Reader("drive.status", keeptime=False))
+    if args.check:
+        run_check(Reader)
+        return
+    cfg = loop_config(args)
+    drive_cfg = Config("drive")
+    wheel_diam = float(drive_cfg.wheel_diam)
+    robot_width = float(getattr(drive_cfg, "robot_width", cfg.robot_width))
+    low_battery_v = getattr(Config("base"), "low_battery_v", None)
+    with ExitStack() as stack:
+        points = stack.enter_context(Reader("camera.points", keeptime=False))
+        imu = stack.enter_context(Reader("imu.orientation", keeptime=False))
+        drive_state = stack.enter_context(Reader("drive.state", keeptime=False))
+        drive_status = stack.enter_context(Reader("drive.status", keeptime=False))
 
-            depth_shape = np.asarray(wait_fresh(depth, 3.0, "camera.depth")["depth"]).shape
-            rpy = np.asarray(wait_fresh(imu, 2.0, "imu.orientation")["rpy"], dtype=float)
-            try:
-                wait_fresh(points, 2.0, "camera.points")
-                points_fresh = True
-            except RuntimeError:
-                points_fresh = False
-            try:
-                voltage = float(wait_fresh(drive_status, 2.0, "drive.status")["voltage"])
-            except RuntimeError:
-                voltage = None
-            if low_battery_v is None:
-                print("[follow] warning: base.low_battery_v unknown; battery not checked", flush=True)
-            refusal = start_refusal(
-                cfg, roll_deg=float(rpy[0]), pitch_deg=float(rpy[1]), voltage=voltage,
-                low_battery_v=None if low_battery_v is None else float(low_battery_v),
-                drive_writers=other_drive_writers(), points_fresh=points_fresh,
-            )
-            if refusal:
-                raise RuntimeError(f"refusing to start: {refusal}")
-            engine.infer(np.zeros((depth_shape[0], depth_shape[1], 3), dtype=np.uint8))  # warm-up
+        rpy = np.asarray(wait_fresh(imu, 2.0, "imu.orientation")["rpy"], dtype=float)
+        try:
+            wait_fresh(points, 2.0, "camera.points")
+            points_fresh = True
+        except RuntimeError:
+            points_fresh = False
+        try:
+            voltage = float(wait_fresh(drive_status, 2.0, "drive.status")["voltage"])
+        except RuntimeError:
+            voltage = None
+        if low_battery_v is None:
+            print("[follow] warning: base.low_battery_v unknown; battery not checked", flush=True)
+        refusal = start_refusal(
+            cfg, roll_deg=float(rpy[0]), pitch_deg=float(rpy[1]), voltage=voltage,
+            low_battery_v=None if low_battery_v is None else float(low_battery_v),
+            drive_writers=other_drive_writers(), points_fresh=points_fresh,
+        )
+        if refusal:
+            raise RuntimeError(f"refusing to start: {refusal}")
 
-            drive = None
-            if not args.dry_run:
-                drive = stack.enter_context(Writer("drive.ctrl", Type("drive_ctrl"), keeptime=False))
-            led = stack.enter_context(Writer("led.ctrl", Type("led_ctrl"), keeptime=False))
-            mode = "dry run" if args.dry_run else "rotate only" if args.rotate_only else f"v_max {cfg.v_max:.2f} m/s"
-            print(f"[follow] follow active ({mode}, gap {args.gap:.2f} m) - raise a hand", flush=True)
-            try:
-                control_loop(args, cfg, engine, (camera, points, imu, drive_state),
-                             drive, led, make_pixel_mapper(depth_shape), wheel_diam, robot_width)
-            finally:
-                if drive is not None:
-                    for _ in range(6):
-                        write_twist(drive, 0.0, 0.0)
-                        time.sleep(PERIOD)
-                write_led(led, (0, 0, 0))
+        drive = None
+        if not args.dry_run:
+            drive = stack.enter_context(Writer("drive.ctrl", Type("drive_ctrl"), keeptime=False))
+        led = stack.enter_context(Writer("led.ctrl", Type("led_ctrl"), keeptime=False))
+        mode = "dry run" if args.dry_run else "rotate only" if args.rotate_only else f"v_max {cfg.v_max:.2f} m/s"
+        print(f"[follow] follow active ({mode}, gap {args.gap:.2f} m) - stand in front of the robot", flush=True)
+        try:
+            control_loop(args, cfg, (points, imu, drive_state), drive, led, wheel_diam, robot_width)
+        finally:
+            if drive is not None:
+                for _ in range(6):
+                    write_twist(drive, 0.0, 0.0)
+                    time.sleep(PERIOD)
                 print("[follow] stopped; zero twist sent", flush=True)
-    finally:
-        engine.close()
+            write_led(led, (0, 0, 0))
 
 
 def main(argv=None):
