@@ -69,6 +69,7 @@ GESTURE_NAMES = (
     "point",
     "point-left",
     "point-right",
+    "dance",
 )
 
 PERFORM_GESTURE_TOOL = {
@@ -124,6 +125,13 @@ class ModelResponse:
 # Keep this deliberately explicit. Adding an alias here is what grants spoken
 # language permission to start that motion.
 ACTION_ALIASES = {
+    "goodbye": frozenset(
+        {
+            "bye",
+            "goodbye",
+            "bye bye",
+        }
+    ),
     "point": frozenset(
         {
             "point at a person",
@@ -194,6 +202,14 @@ ACTION_ALIASES = {
             "can you salute",
         }
     ),
+    "dance": frozenset(
+        {
+            "dance",
+            "do a dance",
+            "show me a dance",
+            "can you dance",
+        }
+    ),
 }
 
 _WAKE_PREFIX = re.compile(
@@ -239,6 +255,7 @@ _GESTURE_TERMS = {
     "point": ("point", "pointing"),
     "point-left": ("point", "pointing"),
     "point-right": ("point", "pointing"),
+    "dance": ("dance", "dancing"),
 }
 _INFORMATIONAL_PREFIXES = (
     "what ",
@@ -438,6 +455,8 @@ class OpenRouterClient:
         opener: Callable[..., object] = request.urlopen,
         web_search: BrowserbaseSearchClient | None = None,
         max_tool_rounds: int = 2,
+        retry_delays: tuple[float, ...] = (0.25, 0.75, 1.5),
+        sleep: Callable[[float], None] = time.sleep,
     ):
         self.api_key = (
             os.environ.get("OPENROUTER_API_KEY", "") if api_key is None else api_key
@@ -449,6 +468,8 @@ class OpenRouterClient:
         self._opener = opener
         self.web_search = web_search or BrowserbaseSearchClient()
         self.max_tool_rounds = max(1, max_tool_rounds)
+        self.retry_delays = tuple(max(0.0, delay) for delay in retry_delays)
+        self._sleep = sleep
         self._history: list[dict[str, str]] = []
         self._lock = threading.Lock()
 
@@ -456,15 +477,19 @@ class OpenRouterClient:
     def configured(self) -> bool:
         return bool(self.api_key)
 
-    def _completion(self, messages: list[dict[str, object]]) -> dict[str, object]:
+    def _completion(
+        self,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
         payload_body: dict[str, object] = {
             "model": self.model,
             "messages": messages,
             "max_tokens": 180,
             "temperature": 0.4,
         }
-        if self.web_search.configured:
-            payload_body["tools"] = [WEB_SEARCH_TOOL]
+        if tools:
+            payload_body["tools"] = tools
             payload_body["tool_choice"] = "auto"
         payload = json.dumps(payload_body).encode("utf-8")
         api_request = request.Request(
@@ -479,14 +504,15 @@ class OpenRouterClient:
             },
         )
 
-        for attempt in range(2):
+        attempts = len(self.retry_delays) + 1
+        for attempt in range(attempts):
             try:
                 with self._opener(api_request, timeout=self.timeout) as response:
                     body = json.loads(response.read().decode("utf-8"))
                 break
             except error.HTTPError as exc:
-                if attempt == 0 and (exc.code == 429 or exc.code >= 500):
-                    time.sleep(0.25)
+                if attempt < attempts - 1 and (exc.code == 429 or exc.code >= 500):
+                    self._sleep(self.retry_delays[attempt])
                     continue
                 detail = exc.read().decode("utf-8", errors="replace")[:300]
                 raise OpenRouterError(
@@ -500,10 +526,12 @@ class OpenRouterClient:
                 ConnectionError,
                 OSError,
             ) as exc:
-                if attempt == 0:
-                    time.sleep(0.25)
+                if attempt < attempts - 1:
+                    self._sleep(self.retry_delays[attempt])
                     continue
-                raise OpenRouterError(f"OpenRouter request failed: {exc}") from exc
+                raise OpenRouterError(
+                    f"OpenRouter request failed after {attempts} attempts: {exc}"
+                ) from exc
 
         try:
             message = body["choices"][0]["message"]
@@ -522,7 +550,7 @@ class OpenRouterClient:
             )
         return str(content or "").strip()
 
-    def _tool_result(self, tool_call: dict[str, object]) -> dict[str, object]:
+    def _web_tool_result(self, tool_call: dict[str, object]) -> dict[str, object]:
         function = tool_call.get("function")
         if not isinstance(function, dict) or function.get("name") != "web_search":
             return {"error": "Unknown or malformed tool call."}
@@ -536,7 +564,25 @@ class OpenRouterClient:
         except BrowserbaseSearchError as exc:
             return {"error": str(exc)}
 
-    def ask(self, utterance: str) -> str:
+    @staticmethod
+    def _gesture_name(tool_call: dict[str, object]) -> str | None:
+        function = tool_call.get("function")
+        if not isinstance(function, dict) or function.get("name") != "perform_gesture":
+            return None
+        try:
+            arguments = json.loads(str(function.get("arguments", "{}")))
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(arguments, dict):
+            return None
+        gesture = arguments.get("gesture")
+        return str(gesture) if isinstance(gesture, str) else None
+
+    def complete(
+        self,
+        utterance: str,
+        gesture_handler: Callable[[str], tuple[bool, str]] | None = None,
+    ) -> ModelResponse:
         if not self.api_key:
             raise OpenRouterError(
                 "OpenRouter is not configured yet. Set OPENROUTER_API_KEY to enable questions."
@@ -548,9 +594,17 @@ class OpenRouterClient:
                 *self._history,
                 {"role": "user", "content": utterance},
             ]
+            tools = []
+            if self.web_search.configured:
+                tools.append(WEB_SEARCH_TOOL)
+            if gesture_handler is not None:
+                tools.append(PERFORM_GESTURE_TOOL)
             reply = ""
+            selected_action = None
+            action_started = None
+            action_message = None
             for _ in range(self.max_tool_rounds + 1):
-                message = self._completion(messages)
+                message = self._completion(messages, tools)
                 tool_calls = message.get("tool_calls")
                 if not tool_calls:
                     reply = self._message_text(message)
@@ -561,17 +615,54 @@ class OpenRouterClient:
                 for tool_call in tool_calls:
                     if not isinstance(tool_call, dict):
                         continue
+                    function = tool_call.get("function")
+                    function_name = (
+                        str(function.get("name", ""))
+                        if isinstance(function, dict)
+                        else ""
+                    )
+                    if function_name == "web_search":
+                        result = self._web_tool_result(tool_call)
+                    elif function_name == "perform_gesture":
+                        gesture = self._gesture_name(tool_call)
+                        if gesture is None:
+                            result = {
+                                "ok": False,
+                                "message": "The gesture tool arguments were invalid.",
+                            }
+                        elif selected_action is not None:
+                            result = {
+                                "ok": False,
+                                "message": "Only one gesture may run in a voice turn.",
+                            }
+                        else:
+                            selected_action = gesture
+                            try:
+                                action_started, action_message = gesture_handler(gesture)
+                            except Exception as exc:
+                                action_started = False
+                                action_message = f"The gesture safety controller failed: {exc}"
+                            result = {
+                                "ok": action_started,
+                                "gesture": gesture,
+                                "message": action_message,
+                            }
+                    else:
+                        result = {"error": "Unknown or malformed tool call."}
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": str(tool_call.get("id", "")),
-                            "content": json.dumps(self._tool_result(tool_call)),
+                            "content": json.dumps(result),
                         }
                     )
             if not reply:
-                raise OpenRouterError(
-                    "The assistant could not finish after using live web search."
-                )
+                if action_message:
+                    reply = action_message
+                else:
+                    raise OpenRouterError(
+                        "The assistant could not finish after using its tools."
+                    )
 
             self._history.extend(
                 [
@@ -583,14 +674,42 @@ class OpenRouterClient:
                 self._history = self._history[-self.max_history_messages :]
             else:
                 self._history.clear()
-            return reply
+            return ModelResponse(
+                text=reply,
+                action=selected_action,
+                action_started=action_started,
+                action_message=action_message,
+            )
+
+    def ask(self, utterance: str) -> str:
+        """Compatibility chat API; robot tools are unavailable to direct callers."""
+        return self.complete(utterance).text
 
 
 class VoiceRouter:
-    """Route explicit action phrases locally and all other speech to chat."""
+    """Route speech while keeping all model-selected motion behind local policy."""
 
-    def __init__(self, llm: OpenRouterClient):
+    def __init__(
+        self,
+        llm: OpenRouterClient,
+        action_executor: Callable[[str], tuple[bool, str]] | None = None,
+    ):
         self.llm = llm
+        self.action_executor = action_executor
+
+    @staticmethod
+    def _action_reply(action: str) -> str:
+        return {
+            "goodbye": "Goodbye. I will wave, then go limp.",
+            "point": "Okay. I will point at the primary person I can see.",
+            "point-left": "Okay. I will point at the person on the left.",
+            "point-right": "Okay. I will point at the person on the right.",
+        }.get(action, f"Of course. Starting the {action} now.")
+
+    def _execute(self, action: str) -> tuple[bool | None, str]:
+        if self.action_executor is None:
+            return None, self._action_reply(action)
+        return self.action_executor(action)
 
     def route(self, utterance: str) -> RouteDecision:
         utterance = utterance.strip()
@@ -599,21 +718,53 @@ class VoiceRouter:
 
         action = match_action(utterance)
         if action:
-            action_reply = {
-                "point": "Okay. I will point at the primary person I can see.",
-                "point-left": "Okay. I will point at the person on the left.",
-                "point-right": "Okay. I will point at the person on the right.",
-            }.get(action, f"Of course. Starting the {action} now.")
+            started, status = self._execute(action)
             return RouteDecision(
-                RouteKind.ACTION,
+                RouteKind.ACTION if started is not False else RouteKind.ERROR,
                 utterance,
                 action=action,
-                reply=action_reply,
+                reply=self._action_reply(action) if started is not False else status,
+                action_started=started,
             )
 
         kind = RouteKind.QUESTION if is_question(utterance) else RouteKind.CHAT
+
+        def handle_model_gesture(gesture: str) -> tuple[bool, str]:
+            authorized, reason = authorize_gesture_tool(utterance, gesture)
+            if not authorized:
+                return False, reason
+            started, status = self._execute(gesture)
+            # In proposal-only mode, the caller will execute the returned action.
+            return (True, status) if started is None else (started, status)
+
         try:
-            reply = self.llm.ask(utterance)
+            if hasattr(self.llm, "complete"):
+                response = self.llm.complete(utterance, handle_model_gesture)
+            else:
+                response = ModelResponse(text=self.llm.ask(utterance))
         except OpenRouterError as exc:
-            return RouteDecision(RouteKind.ERROR, utterance, reply=str(exc))
-        return RouteDecision(kind, utterance, reply=reply)
+            print(f"[voice-router] OpenRouter unavailable: {exc}", flush=True)
+            return RouteDecision(
+                RouteKind.ERROR,
+                utterance,
+                reply="I'm having trouble connecting right now. Please try again.",
+            )
+        if response.action is not None:
+            # A rejected tool call remains an error even if the model phrases a
+            # cheerful response afterward. The physical controller is authoritative.
+            route_kind = RouteKind.ACTION if response.action_started else RouteKind.ERROR
+            return RouteDecision(
+                route_kind,
+                utterance,
+                action=response.action,
+                reply=(
+                    response.text
+                    if response.action_started
+                    else response.action_message or response.text
+                ),
+                action_started=(
+                    None if self.action_executor is None and response.action_started else
+                    response.action_started
+                ),
+            )
+        return RouteDecision(kind, utterance, reply=response.text)

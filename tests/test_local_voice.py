@@ -2,6 +2,7 @@ import io
 import json
 from types import SimpleNamespace
 import wave
+from contextlib import contextmanager
 
 import numpy as np
 
@@ -12,6 +13,7 @@ from bbapps.greeter.local_voice import (
     LocalVoiceError,
     SpeechSegmenter,
     WhisperCppTranscriber,
+    play_dance_music,
     speaker_chunks,
 )
 
@@ -53,6 +55,31 @@ def test_segmenter_keeps_preroll_and_stops_after_trailing_silence():
     assert len(utterance) == 50
     assert np.max(utterance) == 10000
     assert segmenter.recording is False
+
+
+def test_segmenter_does_not_close_during_post_wake_grace():
+    segmenter = SpeechSegmenter(
+        100,
+        threshold_db=-30,
+        pre_roll_s=0.2,
+        min_utterance_s=0.1,
+        trailing_silence_s=0.2,
+        start_grace_s=0.6,
+        max_utterance_s=2.0,
+    )
+    speech = np.full(10, 10000, dtype=np.int16)
+    quiet = np.zeros(10, dtype=np.int16)
+
+    assert segmenter.push(speech, triggered=True) is None
+    # The wake phrase in pre-roll counts as speech, but 0.2 seconds of silence
+    # must not immediately close the query during the 0.6-second grace period.
+    assert segmenter.push(quiet) is None
+    assert segmenter.push(quiet) is None
+    assert segmenter.recording is True
+    assert segmenter.push(speech) is None
+    assert segmenter.push(quiet) is None
+    assert segmenter.push(quiet) is None
+    assert segmenter.push(quiet) is not None
 
 
 def test_whisper_cpp_writes_wav_and_returns_clean_transcript(tmp_path):
@@ -160,3 +187,41 @@ def test_speaker_chunks_add_lead_in_and_pad():
         [0, 0, 0, 0],
         [1, 2, 3, 0],
     ]
+
+
+def test_dance_music_streams_through_existing_speaker_writer(tmp_path):
+    path = tmp_path / "dance.wav"
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(np.array([1000, -1000, 500, -500], dtype=np.int16).tobytes())
+
+    class FakeWriter:
+        def __init__(self):
+            self.frames = []
+
+        @contextmanager
+        def buf(self):
+            frame = {}
+            yield frame
+            self.frames.append(np.asarray(frame["audio"]).copy())
+
+    writer = FakeWriter()
+    calls = 0
+
+    def is_dancing():
+        nonlocal calls
+        calls += 1
+        return calls == 1
+
+    play_dance_music(
+        writer,
+        path,
+        SimpleNamespace(sample_rate=16000, chunk_size=4, channels=1),
+        is_dancing,
+        volume=0.5,
+    )
+
+    assert len(writer.frames) == 1
+    assert writer.frames[0].reshape(-1).tolist() == [500, -500, 250, -250]

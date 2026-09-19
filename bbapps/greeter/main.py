@@ -54,6 +54,12 @@ from google.genai import types
 from bbos import Reader, Writer, Type, Config
 
 try:
+    from .gesture_safety import depth_clearance, spoken_safety_refusal
+    from .gesture_runtime import (
+        prepare_recorded_movement,
+        play_recorded_movement,
+        set_arms_limp,
+    )
     from .voice_router import OpenRouterClient, RouteKind, VoiceRouter, utterances_match
     from .pointing import (
         PersonTargetTracker,
@@ -62,6 +68,8 @@ try:
         quaternion_slerp,
     )
 except ImportError:  # ``uv run main.py`` executes this as a standalone script.
+    from gesture_safety import depth_clearance, spoken_safety_refusal
+    from gesture_runtime import prepare_recorded_movement, play_recorded_movement, set_arms_limp
     from voice_router import OpenRouterClient, RouteKind, VoiceRouter, utterances_match
     from pointing import PersonTargetTracker, pointing_goal, quaternion_from_z, quaternion_slerp
 
@@ -113,6 +121,14 @@ def _load_movements():
             print(f"[arm] Loaded '{f.stem}': {n} frames, {dur:.1f}s", flush=True)
         except Exception as e:
             print(f"[arm] Failed to load {f}: {e}", flush=True)
+    dance_path = SCRIPT_DIR.parent / "mimic" / "recordings" / "dance.json"
+    if dance_path.is_file():
+        try:
+            data = json.loads(dance_path.read_text())
+            _saved_movements["dance"] = data
+            print(f"[arm] Loaded 'dance': {len(data)} frames", flush=True)
+        except Exception as exc:
+            print(f"[arm] Failed to load {dance_path}: {exc}", flush=True)
 
 
 def _get_arm_shm():
@@ -144,75 +160,49 @@ def _cleanup_arm_shm():
         _arm_shm.clear()
 
 
-def play_movement(name=""):
-    """Play back a saved movement by name."""
-    if name and name in _saved_movements:
-        traj = _saved_movements[name]
-    elif name:
-        print(f"[arm] No movement named '{name}'", flush=True)
-        return
-    else:
-        print("[arm] No movement name given", flush=True)
-        return
-    if not traj:
-        print(f"[arm] Movement '{name}' has no frames", flush=True)
-        return
+def _prepare_movement(name):
+    """Read fresh safety inputs before opening any arm control writer."""
+    return prepare_recorded_movement(_saved_movements[name])
 
-    shm = _get_arm_shm()
 
-    n = len(traj)
-    dur = traj[-1]["t"]
-    print(f"[arm] Playing '{name}': {n} frames ({dur:.1f}s)", flush=True)
-
-    torque_enabled = False
-    try:
-        # Send first position before enabling torque.
-        shm["w_left"]["pos"] = np.array(traj[0]["left"], dtype=np.float32)
-        shm["w_right"]["pos"] = np.array(traj[0]["right"], dtype=np.float32)
-        time.sleep(0.1)
-        # Mark cleanup required before either write, so a partial enable is
-        # still followed by best-effort torque-off writes.
-        torque_enabled = True
-        shm["w_torque_left"]["enable"] = np.ones(DOF, dtype=np.bool_)
-        shm["w_torque_right"]["enable"] = np.ones(DOF, dtype=np.bool_)
-        time.sleep(0.1)
-
-        t0 = time.time()
-        for frame in traj:
-            if stop_event.is_set():
-                break
-            target = t0 + frame["t"]
-            time.sleep(max(0, target - time.time()))
-            shm["w_left"]["pos"] = np.array(frame["left"], dtype=np.float32)
-            shm["w_right"]["pos"] = np.array(frame["right"], dtype=np.float32)
-    finally:
-        torque_off = not torque_enabled
-        if torque_enabled:
-            try:
-                shm["w_torque_left"]["enable"] = np.zeros(DOF, dtype=np.bool_)
-                shm["w_torque_right"]["enable"] = np.zeros(DOF, dtype=np.bool_)
-                torque_off = True
-            except Exception as exc:
-                print(f"[arm] Failed to disable torque: {exc}", flush=True)
-        print(
-            f"[arm] Playback done, torque {'off' if torque_off else 'state uncertain'}",
-            flush=True,
-        )
+def _play_movement_plan(name, plan):
+    """Play one preflighted plan, return to measured starts, then torque off."""
+    play_recorded_movement(
+        name, plan, _movement_cancel_event, stop_event
+    )
 
 
 def start_movement(name):
-    """Start at most one allowlisted movement without blocking the voice loop."""
-    if name not in _saved_movements:
-        return False, f"Movement '{name}' is not installed"
-    if not _saved_movements[name]:
-        return False, f"Movement '{name}' has no frames"
+    """Safety-check and start at most one allowlisted recorded movement."""
+    movement_name = "wave" if name == "goodbye" else name
+    if movement_name not in _saved_movements:
+        return False, f"Movement '{movement_name}' is not installed"
+    if not _saved_movements[movement_name]:
+        return False, f"Movement '{movement_name}' has no frames"
     if not _movement_playback_lock.acquire(blocking=False):
         return False, "Another movement is already running"
 
+    try:
+        plan = _prepare_movement(movement_name)
+    except Exception as exc:
+        print(f"[arm] {name} preflight rejected: {exc}", flush=True)
+        _movement_playback_lock.release()
+        return False, spoken_safety_refusal(name, exc)
+    _movement_cancel_event.clear()
+    _debug["movement_running"] = True
+
     def run():
         try:
-            play_movement(name)
+            _play_movement_plan(name, plan)
+        except Exception as exc:
+            print(f"[arm] Gesture failed safely: {exc}", flush=True)
         finally:
+            if name == "goodbye":
+                try:
+                    set_arms_limp()
+                except Exception as exc:
+                    print(f"[arm] Could not make both arms limp: {exc}", flush=True)
+            _debug["movement_running"] = False
             _movement_playback_lock.release()
 
     threading.Thread(target=run, name=f"voice-movement-{name}", daemon=True).start()
@@ -365,6 +355,24 @@ def start_robot_action(name):
         return False, "I cannot see a person clearly enough to point at right now."
     if not _movement_playback_lock.acquire(blocking=False):
         return False, "Another movement is already running"
+    try:
+        with (
+            Reader("imu.orientation", keeptime=False) as imu,
+            Reader("camera.points", keeptime=False) as depth,
+        ):
+            rpy = np.asarray(_fresh(imu)["rpy"], dtype=np.float64)
+            if (
+                abs(rpy[0]) >= POINT_UPRIGHT_DEGREES
+                or abs(rpy[1]) >= POINT_UPRIGHT_DEGREES
+            ):
+                raise RuntimeError("the robot is not upright")
+            depth_data = _fresh(depth)
+            count = int(depth_data["num_points"])
+            depth_clearance(depth_data["points"][:count], (target.arm,))
+    except Exception as exc:
+        print(f"[point] preflight rejected: {exc}", flush=True)
+        _movement_playback_lock.release()
+        return False, spoken_safety_refusal(name, exc)
     _movement_cancel_event.clear()
     _debug["movement_running"] = True
 
@@ -1300,7 +1308,7 @@ def local_voice_session(args):
         model=args.openrouter_model,
         timeout=args.openrouter_timeout,
     )
-    voice_router = VoiceRouter(llm)
+    voice_router = VoiceRouter(llm, action_executor=start_robot_action)
     _debug["openrouter_configured"] = llm.configured
     _debug["browserbase_configured"] = llm.web_search.configured
     _debug["voice_backend"] = "local"
@@ -1322,6 +1330,7 @@ def local_voice_session(args):
         threshold_db=args.vad_threshold_db,
         pre_roll_s=args.pre_roll,
         trailing_silence_s=args.trailing_silence,
+        start_grace_s=args.wake_grace,
         max_utterance_s=args.max_utterance,
     )
 
@@ -1368,7 +1377,7 @@ def local_voice_session(args):
                 print(f"[local-voice] Heard: {transcript}", flush=True)
                 decision = voice_router.route(transcript)
                 _debug["last_voice_route"] = decision.kind.value
-                if decision.kind == RouteKind.ACTION:
+                if decision.kind == RouteKind.ACTION and decision.action_started is None:
                     started, status = start_robot_action(decision.action)
                     reply = decision.reply if started else status
                 else:
@@ -1396,7 +1405,7 @@ async def gemini_session(args):
         model=args.openrouter_model,
         timeout=args.openrouter_timeout,
     )
-    voice_router = VoiceRouter(llm)
+    voice_router = VoiceRouter(llm, action_executor=start_robot_action)
     _debug["openrouter_configured"] = llm.configured
     _debug["browserbase_configured"] = llm.web_search.configured
 
@@ -1512,7 +1521,10 @@ async def gemini_session(args):
                                     voice_router.route, utterance
                                 )
                                 _debug["last_voice_route"] = decision.kind.value
-                                if decision.kind == RouteKind.ACTION:
+                                if (
+                                    decision.kind == RouteKind.ACTION
+                                    and decision.action_started is None
+                                ):
                                     started, status = start_robot_action(decision.action)
                                     if not started:
                                         result = {
@@ -1526,6 +1538,13 @@ async def gemini_session(args):
                                             "action": decision.action,
                                             "reply": decision.reply,
                                         }
+                                elif decision.kind == RouteKind.ACTION:
+                                    result = {
+                                        "kind": decision.kind.value,
+                                        "status": "started",
+                                        "action": decision.action,
+                                        "reply": decision.reply,
+                                    }
                                 else:
                                     result = {
                                         "kind": decision.kind.value,
@@ -1713,7 +1732,18 @@ def main():
     parser.add_argument("--espeak-speed", type=int, default=165)
     parser.add_argument("--vad-threshold-db", type=float, default=-38.0)
     parser.add_argument("--pre-roll", type=float, default=1.5)
-    parser.add_argument("--trailing-silence", type=float, default=0.9)
+    parser.add_argument(
+        "--trailing-silence",
+        type=float,
+        default=1.5,
+        help="seconds of silence after speech before submitting the turn",
+    )
+    parser.add_argument(
+        "--wake-grace",
+        type=float,
+        default=1.5,
+        help="minimum listening time after the wake-word trigger",
+    )
     parser.add_argument("--max-utterance", type=float, default=8.0)
     parser.add_argument(
         "--local-always-listen",

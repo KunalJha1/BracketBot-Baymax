@@ -24,6 +24,7 @@ import numpy as np
 from bbos import Config, Reader, Type, Writer
 
 try:
+    from .gesture_runtime import RecordedGestureController
     from .local_voice import (
         EspeakSynthesizer,
         FallbackSynthesizer,
@@ -31,10 +32,12 @@ try:
         LocalVoiceError,
         SpeechSegmenter,
         WhisperCppTranscriber,
+        play_dance_music,
         speaker_chunks,
     )
     from .voice_router import OpenRouterClient, RouteKind, VoiceRouter
 except ImportError:
+    from gesture_runtime import RecordedGestureController
     from local_voice import (
         EspeakSynthesizer,
         FallbackSynthesizer,
@@ -42,6 +45,7 @@ except ImportError:
         LocalVoiceError,
         SpeechSegmenter,
         WhisperCppTranscriber,
+        play_dance_music,
         speaker_chunks,
     )
     from voice_router import OpenRouterClient, RouteKind, VoiceRouter
@@ -146,15 +150,10 @@ class LedStatus:
 
 def answer_text(router: VoiceRouter, utterance: str) -> str:
     decision = router.route(utterance)
-    if decision.kind == RouteKind.ACTION:
-        return (
-            "I heard the gesture request, but this question assistant does not "
-            "control the robot's arms."
-        )
     return decision.reply or "I did not understand that."
 
 
-def run_voice(args, router, transcriber, synthesizer) -> None:
+def run_voice(args, router, transcriber, synthesizer, gesture_controller) -> None:
     mic_cfg = Config("mic")
     speaker_cfg = Config("speaker")
     segmenter = SpeechSegmenter(
@@ -162,6 +161,7 @@ def run_voice(args, router, transcriber, synthesizer) -> None:
         threshold_db=args.vad_threshold_db,
         pre_roll_s=args.pre_roll,
         trailing_silence_s=args.trailing_silence,
+        start_grace_s=args.wake_grace,
         max_utterance_s=args.max_utterance,
     )
     last_wake_active = False
@@ -247,10 +247,28 @@ def run_voice(args, router, transcriber, synthesizer) -> None:
                         print("[local-assistant] No speech recognized")
                         continue
                     print(f"[local-assistant] Heard: {transcript}")
-                    reply = answer_text(router, transcript)
+                    decision = router.route(transcript)
+                    reply = decision.reply or "I did not understand that."
                     print(f"[local-assistant] Reply: {reply}")
                     leds.set("speaking")
-                    play_speech(speaker, synthesizer, reply, speaker_cfg, args.volume)
+                    if (
+                        decision.kind == RouteKind.ACTION
+                        and decision.action == "dance"
+                        and decision.action_started is True
+                    ):
+                        play_dance_music(
+                            speaker,
+                            Path(__file__).parent.parent
+                            / "play_sound"
+                            / "wavs"
+                            / "baymax_celebration.wav",
+                            speaker_cfg,
+                            gesture_controller.running,
+                        )
+                    else:
+                        play_speech(
+                            speaker, synthesizer, reply, speaker_cfg, args.volume
+                        )
                 except LocalVoiceError as exc:
                     print(f"[local-assistant] {exc}")
                     leds.set("error")
@@ -278,11 +296,27 @@ def main() -> None:
     parser.add_argument("--env", type=Path, default=Path(__file__).parent.parent / ".env")
     parser.add_argument("--text", help="route one typed query without robot audio")
     parser.add_argument("--speak-text", help="synthesize one phrase on the robot speaker")
+    parser.add_argument(
+        "--preflight-gesture",
+        choices=("wave", "salute", "handshake", "fist bump", "hug", "dance"),
+        help="run fresh IMU, arm-entry, and depth checks without moving",
+    )
     parser.add_argument("--mic-gain", type=float, default=3.0)
     parser.add_argument("--volume", type=float, default=1.0)
     parser.add_argument("--vad-threshold-db", type=float, default=-38.0)
     parser.add_argument("--pre-roll", type=float, default=1.5)
-    parser.add_argument("--trailing-silence", type=float, default=0.6)
+    parser.add_argument(
+        "--trailing-silence",
+        type=float,
+        default=1.5,
+        help="seconds of silence after speech before submitting the turn",
+    )
+    parser.add_argument(
+        "--wake-grace",
+        type=float,
+        default=1.5,
+        help="minimum listening time after the wake-word trigger",
+    )
     parser.add_argument("--max-utterance", type=float, default=8.0)
     parser.add_argument("--always-listen", action="store_true")
     parser.add_argument(
@@ -305,7 +339,12 @@ def main() -> None:
     args = parser.parse_args()
 
     load_env(args.env)
-    router = VoiceRouter(OpenRouterClient())
+    gesture_controller = RecordedGestureController(
+        Path(__file__).parent / "movements"
+    )
+    router = VoiceRouter(
+        OpenRouterClient(), action_executor=gesture_controller.start
+    )
     transcriber = WhisperCppTranscriber(
         args.whisper_bin,
         args.whisper_model,
@@ -329,17 +368,26 @@ def main() -> None:
         f"OpenRouter={'yes' if router.llm.configured else 'no'} "
         f"Browserbase={'yes' if router.llm.web_search.configured else 'no'}"
     )
-    if args.text:
-        print(answer_text(router, args.text))
-        return
-    if args.speak_text:
-        speaker_cfg = Config("speaker")
-        with Writer(
-            "speaker.audio", Type("speaker_audio"), keeptime=False, buf_ms=400
-        ) as speaker:
-            play_speech(speaker, synthesizer, args.speak_text, speaker_cfg, args.volume)
-        return
-    run_voice(args, router, transcriber, synthesizer)
+    try:
+        if args.preflight_gesture:
+            passed, status = gesture_controller.preflight(args.preflight_gesture)
+            print(status)
+            if not passed:
+                raise SystemExit(2)
+            return
+        if args.text:
+            print(answer_text(router, args.text))
+            return
+        if args.speak_text:
+            speaker_cfg = Config("speaker")
+            with Writer(
+                "speaker.audio", Type("speaker_audio"), keeptime=False, buf_ms=400
+            ) as speaker:
+                play_speech(speaker, synthesizer, args.speak_text, speaker_cfg, args.volume)
+            return
+        run_voice(args, router, transcriber, synthesizer, gesture_controller)
+    finally:
+        gesture_controller.close()
 
 
 if __name__ == "__main__":

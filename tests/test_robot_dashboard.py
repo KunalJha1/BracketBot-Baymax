@@ -261,6 +261,19 @@ def test_table_stop_returns_arms_before_restoring_lean_in_simulation():
     assert state["phase"] == "Stopped safely"
 
 
+def test_completed_table_placement_releases_dashboard_for_next_action():
+    controller = RobotController(("not-used",), simulate=True)
+
+    assert controller.run_action("table-rest")[0]
+    wait_until_idle(controller)
+    assert controller.state.snapshot()["phase"] == "Place arms on table complete"
+
+    assert controller.run_action("wave")[0]
+    assert controller.state.snapshot()["action"] == "Wave"
+    assert controller.stop() == (True, "Stop requested")
+    wait_until_idle(controller)
+
+
 def test_unknown_operations_are_rejected():
     controller = RobotController(("not-used",), simulate=True)
 

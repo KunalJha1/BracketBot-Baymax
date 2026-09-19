@@ -4,8 +4,10 @@ The action deliberately has no fixed-height fallback. It requires fresh
 ``camera.points`` frames, finds a broad horizontal surface in the bounded arm
 workspace, plans every end-effector waypoint through the robot's IK solver,
 and validates every motor target against this robot's calibrated limits before
-enabling torque. The arms hold the measured tabletop pose until interrupted,
-then retrace the path and become limp.
+enabling torque. After measured arrival, it releases torque and exits with the
+arms physically supported by the table. That releases the arm controllers so
+another dashboard action can start from, and return to, the table pose. A stop
+during the approach still retraces the checked path before torque is disabled.
 """
 
 from __future__ import annotations
@@ -38,18 +40,25 @@ PLANE_BIN_METRES = 0.015
 PLANE_HALF_WIDTH_METRES = 0.012
 MIN_PLANE_POINTS = 120
 MIN_HAND_SUPPORT_POINTS = 10
-HAND_LATERAL_METRES = 0.20
+HAND_LATERAL_METRES = 0.16
 HAND_CLEARANCE_METRES = 0.055
-APPROACH_CLEARANCE_METRES = 0.16
+APPROACH_CLEARANCE_METRES = 0.10
 MAX_TABLE_VARIATION_METRES = 0.04
 IK_SAMPLES_PER_SEGMENT = 96
-MAX_ROTARY_IK_STEP_TURNS = 0.08
+# IK can occasionally change between two nearby valid branches. Playback is
+# still limited to much smaller steps below, and every inserted pose receives
+# an FK table-clearance check before writers are opened.
+MAX_ROTARY_IK_STEP_TURNS = 0.10
 MAX_LIFT_IK_STEP_TURNS = 0.25
 LIFT_METRES_PER_TURN = 0.0465
+MAX_IK_WAYPOINT_ERROR_METRES = 0.15
+MAX_IK_ENDPOINT_ERROR_METRES = 0.02
+MAX_LIFT_COMMAND_STEP_TURNS = 0.04
+MAX_ROTARY_COMMAND_STEP_TURNS = 0.02
 MAX_TOTAL_MOVE_TURNS = 1.10
 CALIBRATION_MARGIN = 0.02
-MOVE_SECONDS = 5.0
-RETURN_SECONDS = 4.0
+MOVE_SECONDS = 10.0
+RETURN_SECONDS = 10.0
 
 cancel_event = threading.Event()
 
@@ -272,6 +281,7 @@ def detect_table_plane(points, logger=None):
                 {
                     "height": height,
                     "hand_x": hand_x,
+                    "near_edge": near_edge,
                     "points": int(len(plane)),
                     "hand_support": tuple(int(value) for value in hand_support),
                     "flatness": flatness,
@@ -297,6 +307,7 @@ def detect_table_plane(points, logger=None):
     emit(
         "select",
         f"height={selected['height']:.3f} hand_x={selected['hand_x']:.3f} "
+        f"near_edge={selected['near_edge']:.3f} "
         f"points={selected['points']} support={selected['hand_support']} "
         f"flatness={selected['flatness']*1000:.1f}mm",
     )
@@ -393,6 +404,7 @@ def observe_table(reader, logger=table_log):
     return {
         "height": float(np.median(heights)),
         "hand_x": float(np.median([item["hand_x"] for item in observations])),
+        "near_edge": float(np.median([item["near_edge"] for item in observations])),
         "points": min(item["points"] for item in observations),
         "flatness": max(item["flatness"] for item in observations),
     }
@@ -400,7 +412,9 @@ def observe_table(reader, logger=table_log):
 
 def _append_segment(cfg, current_urdf, path, start_position, start_quaternion,
                     end_position, end_quaternion, segment, logger=table_log,
-                    samples=IK_SAMPLES_PER_SEGMENT):
+                    samples=IK_SAMPLES_PER_SEGMENT,
+                    endpoint_error_limit=MAX_IK_ENDPOINT_ERROR_METRES,
+                    clearance_observation=None):
     logger(
         "ik",
         f"segment={segment} samples={samples} start_xyz={format_values(start_position)} "
@@ -428,6 +442,27 @@ def _append_segment(cfg, current_urdf, path, start_position, start_quaternion,
             )
         solved = current_urdf.copy()
         solved[:7] = np.asarray(solution[:7], dtype=np.float64)
+        reached_position, _ = cfg.ik.fk(list(solved[:7]))
+        reached_position = np.asarray(reached_position, dtype=np.float64)
+        position_error = float(np.linalg.norm(reached_position - position))
+        if clearance_observation is not None:
+            edge_guard_x = clearance_observation["near_edge"] - 0.03
+            minimum_safe_z = (
+                clearance_observation["height"] + HAND_CLEARANCE_METRES
+            )
+            if (
+                reached_position[0] >= edge_guard_x
+                and reached_position[2] < minimum_safe_z - 0.002
+            ):
+                logger(
+                    "clearance",
+                    f"segment={segment} waypoint={index}/{samples} reject=table-edge "
+                    f"actual_xyz={format_values(reached_position)} "
+                    f"require_z>={minimum_safe_z:.3f} when_x>={edge_guard_x:.3f}",
+                )
+                raise RuntimeError(
+                    f"{segment} crosses the table edge below its safe height"
+                )
         pose = np.asarray(cfg.urdf2q(solved), dtype=np.float64)
         pose[7] = path[0][7]
         delta = np.abs(pose - path[-1])
@@ -442,6 +477,22 @@ def _append_segment(cfg, current_urdf, path, start_position, start_quaternion,
             )
             raise RuntimeError(
                 f"IK returned non-finite values in {segment} waypoint {index}/{samples}"
+            )
+        allowed_error = (
+            endpoint_error_limit
+            if index == samples
+            else MAX_IK_WAYPOINT_ERROR_METRES
+        )
+        if position_error > allowed_error:
+            logger(
+                "ik",
+                f"segment={segment} waypoint={index}/{samples} reject=position-error "
+                f"requested={format_values(position)} reached={format_values(reached_position)} "
+                f"error={position_error:.4f}m limit={allowed_error:.4f}m",
+            )
+            raise RuntimeError(
+                f"IK position error in {segment} waypoint {index}/{samples}: "
+                f"{position_error:.3f}m"
             )
         if (
             lift_step > MAX_LIFT_IK_STEP_TURNS
@@ -470,36 +521,73 @@ def _append_segment(cfg, current_urdf, path, start_position, start_quaternion,
                 f"segment={segment} waypoint={index}/{samples} max_step={step:.4f} "
                 f"lift_step={lift_step:.4f} ({lift_step * LIFT_METRES_PER_TURN * 1000:.1f}mm) "
                 f"rotary_step={rotary_step:.4f} "
+                f"position_error={position_error*1000:.1f}mm "
                 f"motor={format_values(pose)}",
             )
     logger("ik", f"segment={segment} complete path_points={len(path)}")
     return end_position, end_quaternion
 
 
+def _append_home_segment(cfg, path, home, observation, side, logger=table_log):
+    """Interpolate to the robot's calibrated home pose and prove table clearance."""
+    start = path[-1].copy()
+    minimum_safe_z = observation["height"] + HAND_CLEARANCE_METRES
+    edge_guard_x = observation["near_edge"] - 0.03
+    samples = IK_SAMPLES_PER_SEGMENT
+    logger(
+        "home",
+        f"side={side} samples={samples} start={format_values(start)} "
+        f"goal={format_values(home)} table_edge_x={observation['near_edge']:.3f} "
+        f"edge_guard_x={edge_guard_x:.3f} minimum_safe_z={minimum_safe_z:.3f}",
+    )
+    for index in range(1, samples + 1):
+        alpha = smoothstep(index / samples)
+        pose = (1.0 - alpha) * start + alpha * home
+        urdf = np.asarray(cfg.q2urdf(pose.copy()), dtype=np.float64)
+        xyz, _ = cfg.ik.fk(list(urdf[:7]))
+        xyz = np.asarray(xyz, dtype=np.float64)
+        if xyz[0] >= edge_guard_x and xyz[2] < minimum_safe_z:
+            logger(
+                "home",
+                f"side={side} waypoint={index}/{samples} reject=table-edge "
+                f"xyz={format_values(xyz)} require_z>={minimum_safe_z:.3f} "
+                f"when_x>={edge_guard_x:.3f}",
+            )
+            raise RuntimeError(
+                f"{side} homing path approaches the table edge before clearing its height"
+            )
+        path.append(pose)
+        if index == 1 or index % 12 == 0 or index == samples:
+            logger(
+                "home",
+                f"side={side} waypoint={index}/{samples} xyz={format_values(xyz)} "
+                f"motor={format_values(pose)}",
+            )
+    logger("home", f"side={side} complete path_points={len(path)}")
+
+
 def plan_table_path(cfg, start, side, observation, logger=table_log):
-    current_urdf = np.asarray(cfg.q2urdf(start.copy()), dtype=np.float64)
+    live_urdf = np.asarray(cfg.q2urdf(start.copy()), dtype=np.float64)
     cfg.ik.init()
-    cfg.ik.reset(list(current_urdf[:7]))
-    start_position, start_quaternion = cfg.ik.fk(list(current_urdf[:7]))
-    position = np.asarray(start_position, dtype=np.float64)
-    orientation = np.asarray(start_quaternion, dtype=np.float64)
+    cfg.ik.reset(list(live_urdf[:7]))
+    live_position, live_quaternion = cfg.ik.fk(list(live_urdf[:7]))
+    live_position = np.asarray(live_position, dtype=np.float64)
+    live_quaternion = np.asarray(live_quaternion, dtype=np.float64)
+    home = np.asarray(cfg.home, dtype=np.float64).copy()
+    home[7] = start[7]
+    current_urdf = np.asarray(cfg.q2urdf(home.copy()), dtype=np.float64)
+    home_position, home_quaternion = cfg.ik.fk(list(current_urdf[:7]))
+    position = np.asarray(home_position, dtype=np.float64)
+    orientation = np.asarray(home_quaternion, dtype=np.float64)
+    escape_orientation = orientation if side == "right" else live_quaternion
     lateral = HAND_LATERAL_METRES if side == "left" else -HAND_LATERAL_METRES
     rest_z = observation["height"] + HAND_CLEARANCE_METRES
-    # Rotate toward a shallow, table-facing wrist pose during the clearance
-    # lift. Preserving the hanging pose forces wrist joint 6 beyond this
-    # robot's calibrated range once the hand reaches tabletop height.
-    rest_orientation = quaternion_from_z([1.0, 0.0, 0.36])
-    orient_height = min(0.70, rest_z - 0.10)
-    orient = np.array([
-        float(np.clip(position[0], 0.08, 0.14)),
+    escape = np.array([
+        min(0.13, observation["near_edge"] - 0.05),
         lateral,
-        max(float(position[2]), orient_height),
+        observation["height"] + 0.08,
     ])
-    clear = np.array([
-        float(np.clip(position[0], 0.25, 0.34)),
-        lateral,
-        max(float(position[2]), rest_z + APPROACH_CLEARANCE_METRES),
-    ])
+    rest_orientation = orientation.copy()
     above = np.array([
         observation["hand_x"],
         lateral,
@@ -510,22 +598,54 @@ def plan_table_path(cfg, start, side, observation, logger=table_log):
     logger(
         "plan",
         f"side={side} start_motor={format_values(start)} "
-        f"start_urdf={format_values(current_urdf)} start_xyz={format_values(position)} "
-        f"start_quat={format_values(orientation)}",
+        f"start_urdf={format_values(live_urdf)} start_xyz={format_values(live_position)} "
+        f"start_quat={format_values(live_quaternion)}",
     )
     logger(
         "plan",
         f"side={side} table_z={observation['height']:.3f} rest_z={rest_z:.3f} "
-        f"orient={format_values(orient)} clear={format_values(clear)} "
+        f"escape={format_values(escape)} home_motor={format_values(home)} "
+        f"home_xyz={format_values(position)} "
         f"above={format_values(above)} rest={format_values(rest)} "
-        f"orientation=table-facing quat={format_values(rest_orientation)}",
+        f"escape_orientation={'home' if side == 'right' else 'live'} "
+        f"rest_orientation=preserve-home quat={format_values(rest_orientation)}",
     )
 
     path = [np.asarray(start, dtype=np.float64).copy()]
+    _append_segment(
+        cfg,
+        live_urdf,
+        path,
+        live_position,
+        live_quaternion,
+        escape,
+        escape_orientation,
+        f"{side}:raise-behind-table",
+        logger=logger,
+        endpoint_error_limit=0.03,
+        clearance_observation=observation,
+    )
+    escape_urdf = np.asarray(cfg.q2urdf(path[-1].copy()), dtype=np.float64)
+    escape_position, escape_quaternion = cfg.ik.fk(list(escape_urdf[:7]))
+    _append_segment(
+        cfg,
+        escape_urdf,
+        path,
+        np.asarray(escape_position, dtype=np.float64),
+        np.asarray(escape_quaternion, dtype=np.float64),
+        position,
+        orientation,
+        f"{side}:move-home-above-table",
+        logger=logger,
+        clearance_observation=observation,
+    )
+    current_urdf = np.asarray(cfg.q2urdf(path[-1].copy()), dtype=np.float64)
+    cfg.ik.reset(list(current_urdf[:7]))
+    position, orientation = cfg.ik.fk(list(current_urdf[:7]))
+    position = np.asarray(position, dtype=np.float64)
+    orientation = np.asarray(orientation, dtype=np.float64)
+    rest_orientation = orientation.copy()
     for segment, destination, destination_orientation in (
-        ("raise-for-orientation", orient, orientation),
-        ("orient-in-clear-space", orient, rest_orientation),
-        ("raise-clear", clear, rest_orientation),
         ("move-above", above, rest_orientation),
         ("lower-rest", rest, rest_orientation),
     ):
@@ -539,6 +659,7 @@ def plan_table_path(cfg, start, side, observation, logger=table_log):
             destination_orientation,
             f"{side}:{segment}",
             logger=logger,
+            clearance_observation=observation,
         )
     total = float(np.max(np.abs(np.asarray(path) - start)))
     joint = int(np.argmax(np.max(np.abs(np.asarray(path) - start), axis=0)))
@@ -594,6 +715,87 @@ def validate_calibration(path, low, high, side, logger=table_log):
             f"{side} table path leaves calibrated joint limits at joints={joints}"
         )
     logger("calibration", f"side={side} accepted all {path.shape[0]} path poses")
+
+
+def densify_synchronized_paths(paths, logger=table_log):
+    """Insert synchronized motor poses so playback cannot skip a large IK step."""
+    lengths = {side: len(paths[side]) for side in SIDES}
+    if len(set(lengths.values())) != 1:
+        raise RuntimeError(f"arm path lengths differ before densifying: {lengths}")
+    dense = {side: [paths[side][0].copy()] for side in SIDES}
+    inserted = 0
+    worst_lift = 0.0
+    worst_rotary = 0.0
+    for index in range(1, lengths[SIDES[0]]):
+        subdivisions = 1
+        for side in SIDES:
+            delta = np.abs(paths[side][index] - paths[side][index - 1])
+            worst_lift = max(worst_lift, float(delta[0]))
+            worst_rotary = max(worst_rotary, float(np.max(delta[1:7])))
+            subdivisions = max(
+                subdivisions,
+                int(math.ceil(float(delta[0]) / MAX_LIFT_COMMAND_STEP_TURNS)),
+                int(
+                    math.ceil(
+                        float(np.max(delta[1:7]))
+                        / MAX_ROTARY_COMMAND_STEP_TURNS
+                    )
+                ),
+            )
+        for step in range(1, subdivisions + 1):
+            alpha = step / subdivisions
+            for side in SIDES:
+                before = paths[side][index - 1]
+                after = paths[side][index]
+                dense[side].append((1.0 - alpha) * before + alpha * after)
+        inserted += subdivisions - 1
+    result = {side: np.asarray(dense[side], dtype=np.float64) for side in SIDES}
+    logger(
+        "playback",
+        f"densified points={lengths[SIDES[0]]}->{len(result[SIDES[0]])} "
+        f"inserted={inserted} raw_worst_lift={worst_lift:.4f} "
+        f"raw_worst_rotary={worst_rotary:.4f} "
+        f"command_limits=({MAX_LIFT_COMMAND_STEP_TURNS:.4f},"
+        f"{MAX_ROTARY_COMMAND_STEP_TURNS:.4f}) turns",
+    )
+    return result
+
+
+def validate_playback_clearance(path, cfg, observation, side, logger=table_log):
+    """Prove every final motor command stays above the table at its near edge."""
+    edge_guard_x = observation["near_edge"] - 0.03
+    minimum_safe_z = observation["height"] + HAND_CLEARANCE_METRES
+    checked_over_table = 0
+    smallest_margin = math.inf
+    for index, pose in enumerate(path):
+        urdf = np.asarray(cfg.q2urdf(np.asarray(pose).copy()), dtype=np.float64)
+        xyz, _ = cfg.ik.fk(list(urdf[:7]))
+        xyz = np.asarray(xyz, dtype=np.float64)
+        if not np.isfinite(xyz).all():
+            raise RuntimeError(f"{side} playback FK is non-finite at pose {index}")
+        if xyz[0] < edge_guard_x:
+            continue
+        checked_over_table += 1
+        margin = float(xyz[2] - minimum_safe_z)
+        smallest_margin = min(smallest_margin, margin)
+        if margin < -0.002:
+            logger(
+                "clearance",
+                f"side={side} playback={index}/{len(path)-1} reject=table-edge "
+                f"actual_xyz={format_values(xyz)} margin={margin*1000:.1f}mm "
+                f"require_z>={minimum_safe_z:.3f} when_x>={edge_guard_x:.3f}",
+            )
+            raise RuntimeError(
+                f"{side} interpolated playback crosses the table edge below its safe height"
+            )
+    margin_text = (
+        "n/a" if checked_over_table == 0 else f"{smallest_margin*1000:.1f}mm"
+    )
+    logger(
+        "clearance",
+        f"side={side} accepted playback_poses={len(path)} "
+        f"over_table={checked_over_table} minimum_margin={margin_text}",
+    )
 
 
 def write_pid_file(path):
@@ -678,9 +880,16 @@ def execute(pid_file=None, scan_only=False, plan_only=False):
                 side,
                 logger=table_log,
             )
-        if len(paths["left"]) != len(paths["right"]):
-            raise RuntimeError(
-                f"arm path lengths differ: left={len(paths['left'])} right={len(paths['right'])}"
+        paths = densify_synchronized_paths(paths, logger=table_log)
+        for side in SIDES:
+            validate_playback_clearance(
+                paths[side], configs[side], observation, side, logger=table_log
+            )
+            validate_calibration(
+                paths[side],
+                *calibration_limits(bbos, side, logger=table_log),
+                side,
+                logger=table_log,
             )
         table_log("plan", f"both paths accepted points={len(paths['left'])}")
         if plan_only:
@@ -758,6 +967,7 @@ def execute(pid_file=None, scan_only=False, plan_only=False):
                 time.sleep(TICK_SECONDS)
 
         enabled = False
+        placement_complete = False
         last_index = 0
         try:
             table_log("motion", "seeding both controllers at measured start poses")
@@ -790,27 +1000,39 @@ def execute(pid_file=None, scan_only=False, plan_only=False):
                 worst = max(float(np.max(errors[side])) for side in SIDES)
                 if worst > 0.10:
                     raise RuntimeError(f"arms did not reach the table pose ({worst:.3f} turns)")
-                table_log("hold", "arms at table pose; press Stop to return")
-                next_hold_log = time.monotonic() + 5.0
-                while not cancel_event.wait(0.10):
-                    command({side: paths[side][-1] for side in SIDES})
-                    if time.monotonic() >= next_hold_log:
-                        table_log("hold", "table pose still active; controller heartbeat healthy")
-                        next_hold_log = time.monotonic() + 5.0
+                placement_complete = True
                 last_index = len(paths["left"]) - 1
+                table_log(
+                    "placement",
+                    "verified table pose; releasing arm torque and controller ownership",
+                )
         finally:
             if enabled:
-                table_log(
-                    "cleanup",
-                    f"returning along checked path from index={last_index} "
-                    f"cancelled={cancel_event.is_set()}",
-                )
-                return_indices = list(range(last_index, -1, -1))
-                play(return_indices, RETURN_SECONDS, False, "return")
-                command(starts)
-                time.sleep(0.20)
-                torque(False)
-                table_log("cleanup", "start pose restored; arm torque off")
+                if placement_complete:
+                    command({side: paths[side][-1] for side in SIDES})
+                    time.sleep(0.20)
+                    torque(False)
+                    table_log(
+                        "cleanup",
+                        "arms left supported on table; torque off and controllers released",
+                    )
+                    table_log(
+                        "handoff",
+                        "dashboard is free; the next arm action will read this live pose "
+                        "and return to it when finished",
+                    )
+                else:
+                    table_log(
+                        "cleanup",
+                        f"returning along checked path from index={last_index} "
+                        f"cancelled={cancel_event.is_set()}",
+                    )
+                    return_indices = list(range(last_index, -1, -1))
+                    play(return_indices, RETURN_SECONDS, False, "return")
+                    command(starts)
+                    time.sleep(0.20)
+                    torque(False)
+                    table_log("cleanup", "start pose restored; arm torque off")
             else:
                 table_log("cleanup", "torque was never enabled; no arm cleanup motion needed")
         table_log("complete", "table-rest action completed cleanly")

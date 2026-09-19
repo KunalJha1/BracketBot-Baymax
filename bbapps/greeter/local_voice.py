@@ -14,6 +14,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 from urllib import error, request
 import wave
 
@@ -41,7 +42,8 @@ class SpeechSegmenter:
         threshold_db: float = -38.0,
         pre_roll_s: float = 1.5,
         min_utterance_s: float = 0.5,
-        trailing_silence_s: float = 0.9,
+        trailing_silence_s: float = 1.5,
+        start_grace_s: float = 0.0,
         max_utterance_s: float = 8.0,
     ):
         self.sample_rate = sample_rate
@@ -49,6 +51,7 @@ class SpeechSegmenter:
         self.pre_roll_samples = max(0, int(pre_roll_s * sample_rate))
         self.min_samples = max(1, int(min_utterance_s * sample_rate))
         self.silence_samples_required = max(1, int(trailing_silence_s * sample_rate))
+        self.start_grace_samples = max(0, int(start_grace_s * sample_rate))
         self.max_samples = max(self.min_samples, int(max_utterance_s * sample_rate))
         self._pre_roll: deque[np.ndarray] = deque()
         self._pre_roll_size = 0
@@ -56,10 +59,15 @@ class SpeechSegmenter:
         self._recording_size = 0
         self._speech_seen = False
         self._silence_samples = 0
+        self._after_trigger_samples = 0
 
     @property
     def recording(self) -> bool:
         return self._recording is not None
+
+    @property
+    def speech_seen(self) -> bool:
+        return self._speech_seen
 
     def reset(self) -> None:
         self._pre_roll.clear()
@@ -68,6 +76,7 @@ class SpeechSegmenter:
         self._recording_size = 0
         self._speech_seen = False
         self._silence_samples = 0
+        self._after_trigger_samples = 0
 
     def _remember(self, audio: np.ndarray) -> None:
         self._pre_roll.append(audio)
@@ -100,6 +109,7 @@ class SpeechSegmenter:
 
         self._recording.append(chunk)
         self._recording_size += len(chunk)
+        self._after_trigger_samples += len(chunk)
         if _dbfs(chunk) >= self.threshold_db:
             self._speech_seen = True
             self._silence_samples = 0
@@ -111,6 +121,7 @@ class SpeechSegmenter:
         if (
             self._speech_seen
             and self._recording_size >= self.min_samples
+            and self._after_trigger_samples >= self.start_grace_samples
             and self._silence_samples >= self.silence_samples_required
         ):
             return self._finish()
@@ -122,7 +133,7 @@ class WhisperCppTranscriber:
 
     DEFAULT_PROMPT = (
         "Hey BracketBot. Baymax. Weather in Waterloo. Wave. Handshake. "
-        "Fist bump. Hug. Salute."
+        "Fist bump. Hug. Salute. Dance."
     )
 
     def __init__(
@@ -339,3 +350,42 @@ def speaker_chunks(
             chunk = np.repeat(chunk[:, None], channels, axis=1).reshape(-1)
         chunks.append(chunk)
     return chunks
+
+
+def play_dance_music(writer, path: Path, speaker_cfg, is_dancing, volume=0.55) -> None:
+    """Stream the local upbeat WAV while the independently safe dance runs."""
+    with wave.open(str(path), "rb") as source:
+        if (
+            source.getsampwidth() != 2
+            or source.getcomptype() != "NONE"
+            or source.getframerate() != speaker_cfg.sample_rate
+        ):
+            raise LocalVoiceError("The dance music format is not supported.")
+        source_channels = source.getnchannels()
+        period = speaker_cfg.chunk_size / speaker_cfg.sample_rate
+        due = time.monotonic()
+        loops = 0
+        while is_dancing() and loops < 4:
+            raw = source.readframes(speaker_cfg.chunk_size)
+            if not raw:
+                loops += 1
+                source.rewind()
+                continue
+            samples = np.frombuffer(raw, dtype="<i2").reshape(-1, source_channels)
+            if source_channels == 1 and speaker_cfg.channels > 1:
+                samples = np.repeat(samples, speaker_cfg.channels, axis=1)
+            elif source_channels > 1 and speaker_cfg.channels == 1:
+                samples = samples.mean(axis=1, dtype=np.float32)[:, None]
+            samples = (samples.astype(np.float32) * volume).clip(
+                -32768, 32767
+            ).astype(np.int16)
+            if len(samples) < speaker_cfg.chunk_size:
+                padding = np.zeros(
+                    (speaker_cfg.chunk_size - len(samples), speaker_cfg.channels),
+                    dtype=np.int16,
+                )
+                samples = np.concatenate((samples, padding))
+            with writer.buf() as data:
+                data["audio"] = samples
+            due += period
+            time.sleep(max(0.0, due - time.monotonic()))

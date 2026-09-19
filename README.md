@@ -20,8 +20,11 @@ or replace qualified care.
 - A stateful 4° **Lean / Balance** toggle with continuous BBOS refresh,
   upright gating, disconnect fallback, and explicit balance restoration.
 - **Place arms on table** uses fresh depth points to detect a broad reachable
-  tabletop, validates both hand locations and the complete IK path, then holds
-  the pose until Stop returns the arms along the checked path.
+  tabletop and validates both hand locations and the complete IK path. After
+  measured arrival it releases torque and controller ownership, leaving the
+  arms supported on the table so another gesture can start there and return to
+  that same live pose. Stop during the approach still returns the arms along
+  the checked path.
   Its Technical details log includes camera-to-arm frame conversion, point and
   surface counts, rejection gates, per-hand support, IK waypoints, calibration
   bounds, motion progress, measured arrival, and cleanup. For perception-only
@@ -39,6 +42,10 @@ or replace qualified care.
   Quest teleoperation, arm recording/playback, sound, and inference.
 - A fully local vision prototype combining YOLO person detection, YuNet face
   localization, and smoothed EmotiEffLib visible-expression estimates.
+- A depth-grounded **possible person on ground** prototype that aligns YOLO pose
+  joints with `camera.points`, places the observation in the live SLAM map, and
+  cancels autonomous navigation through a deterministic interlock. Physical
+  posture calibration is still required before treating it as a safety system.
 - An existing Gemini-powered greeter and provider-ready inference code with
   OpenAI and Google client dependencies.
 - Deterministic greeter voice commands for **wave**, **salute**, **handshake**,
@@ -211,6 +218,8 @@ Current gesture protections include:
 - automatic active-arm detection so unused arms remain untouched;
 - current lift-height preservation;
 - a maximum entry-distance check;
+- a fresh depth-cloud clearance check around each active arm before voice
+  gestures open motor writers;
 - smooth three-second entry and return paths;
 - `SIGINT`, `SIGTERM`, and SSH-disconnect handling;
 - single-motion locking in the dashboard.
@@ -270,23 +279,28 @@ transport, not a requirement for GPT-OSS or Browserbase.
 
 ### Voice commands and OpenRouter
 
-The greeter uses Gemini Live for its existing microphone/speaker transport and
-finalized speech transcription. Every spoken human turn is verified against
-that transcript and passed to `bbapps/greeter/voice_router.py` before anything
-happens; a model-authored tool argument cannot independently authorize motion:
+The greeter uses local Whisper by default, with Gemini Live available as an
+optional microphone/speaker transport. Every spoken human turn is bound to its
+finalized transcript and passed to `bbapps/greeter/voice_router.py`; a
+model-authored tool argument cannot independently authorize motion:
 
 1. An exact, normalized phrase from the local allowlist starts one installed
-   gesture. Examples include “Baymax, give me a hug”, “Baymax, fist bump me”,
-   “shake my hand”, “give me a salute”, “wave at me”, and “point at a person”.
-   Only one movement can run at a time.
-2. Questions and other conversation are sent as text to OpenRouter. When a
-   question needs current information (for example, weather), GPT-OSS calls the
-   read-only Browserbase Search tool and formats the returned sources as a short
-   spoken answer. The LLM never receives a robot-action tool and cannot create a
-   motion.
-3. Similar but unapproved text, such as “tell me about fist bumps”, cannot
-   trigger a gesture. Add new voice authority deliberately in
-   `ACTION_ALIASES`, not in an LLM prompt.
+   gesture without depending on network availability. Examples include
+   “Baymax, give me a hug”, “give me a salute”, “wave at me”, “BracketBot,
+   bye” (wave, then disable torque on both arms), “BracketBot,
+   dance”, and “point at a person”.
+2. For a natural but still explicit request such as “Could you do a friendly
+   wave hello?”, GPT-OSS can call the typed `perform_gesture` tool. The tool
+   only accepts named allowlisted gestures, re-checks the finalized transcript,
+   and rejects discussion, negation, mismatched names, or multiple motions.
+3. The same deterministic executor handles both paths. It permits only one
+   movement at a time and checks fresh IMU, arm positions, bounded entry motion,
+   and depth points in a conservative active-arm clearance volume before any
+   gesture writer is opened. Missing depth fails closed. The real started or
+   rejected result is sent back to the LLM before it speaks.
+4. Questions can use the separate read-only Browserbase Search tool. Similar
+   but unapproved text, such as “tell me about fist bumps”, cannot trigger a
+   gesture. Add new voice authority in code and tests, not only in a prompt.
 
 The point gesture combines the greeter's live head-camera detections with one
 arm. “Point at a person” selects the largest visible person; “point at the
@@ -329,8 +343,9 @@ cd bbapps/greeter
 uv run main.py
 ```
 
-For the lightweight weather/question assistant without YOLO or Gemini, connect
-the robot over USB and run this from the development machine:
+For the lightweight local voice assistant without YOLO or Gemini, connect the
+robot over USB and run this from the development machine. It supports the same
+safety-gated recorded gestures plus OpenRouter conversation:
 
 ```sh
 ./scripts/run_robot_local_voice.sh
@@ -349,9 +364,11 @@ an OpenRouter key, allowlisted gestures still work and questions receive a
 short configuration message. Run all gesture tests in simulation/dry-run first
 and keep a person beside the physical e-stop when voice motion is enabled.
 
-Local voice waits for the installed “Hey BracketBot” wake-word daemon, records
-until roughly one second of silence, transcribes with the English Whisper base
-model, and speaks the routed answer with eSpeak. For microphone debugging only,
+Local voice waits for the installed “Hey BracketBot” wake-word daemon, keeps a
+1.5-second post-wake listening grace period, then records until 1.5 seconds of
+silence. This prevents the wake phrase or a short mid-sentence pause from
+submitting the query early. It transcribes with the English Whisper base model
+and speaks the routed answer with eSpeak. For microphone debugging only,
 `uv run main.py --voice-backend local --local-always-listen` bypasses the wake
 word and starts on any speech; do not use that mode in a noisy public space.
 

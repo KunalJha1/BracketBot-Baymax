@@ -62,6 +62,20 @@ fi
 
 echo "Proxy ready on the private BracketBot USB link."
 echo "Natural voice ready on the private BracketBot USB link."
+echo "Syncing the voice router and safety-gated gesture runtime..."
+scp -q \
+  bbapps/greeter/local_assistant.py \
+  bbapps/greeter/local_voice.py \
+  bbapps/greeter/voice_router.py \
+  bbapps/greeter/gesture_safety.py \
+  bbapps/greeter/gesture_runtime.py \
+  "$robot_host:/home/bracketbot/bbapps/greeter/"
+scp -q bbapps/greeter/movements/*.json \
+  "$robot_host:/home/bracketbot/bbapps/greeter/movements/"
+scp -q bbapps/mimic/recordings/dance.json \
+  "$robot_host:/home/bracketbot/bbapps/mimic/recordings/dance.json"
+scp -q bbapps/play_sound/wavs/baymax_celebration.wav \
+  "$robot_host:/home/bracketbot/bbapps/play_sound/wavs/baymax_celebration.wav"
 echo "Starting Gemini-free voice assistant on ${robot_host}..."
 ssh -tt "$robot_host" \
   "cd /home/bracketbot/bbapps/greeter && env HTTPS_PROXY='$proxy_url' https_proxy='$proxy_url' LOCAL_TTS_URL='$tts_url' /home/bracketbot/.local/bin/uv run --offline local_assistant.py"

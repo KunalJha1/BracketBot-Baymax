@@ -140,7 +140,7 @@ ACTION_LIST = (
             channels=("left-arm", "right-arm"), key="d", resource="dance.json",
             source="bbapps/mimic/recordings/dance.json", risk="motion"),
     _action("table-rest", "Place arms on table",
-            "Detect the tabletop, raise both arms, and rest them on its surface",
+            "Detect the tabletop and leave both arms resting there for the next action",
             "Positioning", "table-rest", channels=("depth-camera", "left-arm", "right-arm"),
             key="r", risk="contact-motion"),
     _action("light-calm", "Calm light", "Slow cyan breathing light", "Lights", "led",
@@ -1054,7 +1054,7 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:560px; overflow:a
     <p class="positioning-copy">Set the base first, then place the arms using the live depth view.</p>
     <div class="positioning-grid">
       <button id="lean" class="secondary"><span class="key">Z</span><span class="label">Lean forward</span><span class="desc">Hold a bounded 4° forward lean</span></button>
-      <button id="table-rest" class="action-card" data-action="table-rest"><span class="key">R</span><span class="label">Place arms on table</span><span class="desc">Adapt both arm heights to the detected tabletop; Stop returns them</span></button>
+      <button id="table-rest" class="action-card" data-action="table-rest"><span class="key">R</span><span class="label">Place arms on table</span><span class="desc">Place, release control, then run another action from that pose</span></button>
     </div>
   </section>
   <div class="controls">

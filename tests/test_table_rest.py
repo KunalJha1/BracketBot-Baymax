@@ -1,7 +1,14 @@
 import numpy as np
 import pytest
 
-from scripts.table_rest import detect_table_plane, nonsuppressing
+from scripts.table_rest import (
+    MAX_LIFT_COMMAND_STEP_TURNS,
+    MAX_ROTARY_COMMAND_STEP_TURNS,
+    densify_synchronized_paths,
+    detect_table_plane,
+    nonsuppressing,
+    validate_playback_clearance,
+)
 
 
 def tabletop(seed=7, height=0.74, count=2500):
@@ -80,3 +87,49 @@ def test_bbos_context_cannot_suppress_runner_failure():
         with nonsuppressing(SuppressingManager()) as value:
             assert value == "reader"
             raise RuntimeError("visible failure")
+
+
+def test_densify_keeps_both_arms_synchronized_and_bounds_motor_steps():
+    left_start = np.zeros(8)
+    right_start = np.zeros(8)
+    left_end = np.array([0.13, 0.05, 0, 0, 0, 0, 0, 0])
+    right_end = np.array([-0.02, 0, 0, 0.07, 0, 0, 0, 0])
+
+    dense = densify_synchronized_paths(
+        {
+            "left": np.stack((left_start, left_end)),
+            "right": np.stack((right_start, right_end)),
+        },
+        logger=lambda *_: None,
+    )
+
+    assert len(dense["left"]) == len(dense["right"])
+    assert len(dense["left"]) > 2
+    for path in dense.values():
+        delta = np.abs(np.diff(path, axis=0))
+        assert np.max(delta[:, 0]) <= MAX_LIFT_COMMAND_STEP_TURNS + 1e-12
+        assert np.max(delta[:, 1:7]) <= MAX_ROTARY_COMMAND_STEP_TURNS + 1e-12
+
+
+def test_final_playback_clearance_checks_inserted_motor_poses():
+    class FakeIK:
+        @staticmethod
+        def fk(values):
+            return [values[0], 0.0, values[1]], [0.0, 0.0, 0.0, 1.0]
+
+    class FakeConfig:
+        ik = FakeIK()
+
+        @staticmethod
+        def q2urdf(pose):
+            return pose
+
+    path = np.zeros((3, 8))
+    path[:, 0] = [0.10, 0.25, 0.30]
+    path[:, 1] = [0.50, 0.70, 0.80]
+    observation = {"near_edge": 0.24, "height": 0.70}
+
+    with pytest.raises(RuntimeError, match="interpolated playback"):
+        validate_playback_clearance(
+            path, FakeConfig(), observation, "left", logger=lambda *_: None
+        )

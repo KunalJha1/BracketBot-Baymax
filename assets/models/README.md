@@ -14,3 +14,7 @@
   model, distributed with EmotiEffLib under Apache-2.0. Source:
   <https://github.com/sb-ai-lab/EmotiEffLib/tree/main/models/affectnet_emotions/onnx>
   SHA-256: `7aa2ea31c1311f4f8aa9d3fdb085d418dd4e7a48c4b9ed41df8c044f91d0213f`
+- `enet_b0_8_va_mtl.onnx` is the EmotiEffLib multi-task (expression plus
+  valence/arousal) AffectNet model, Apache-2.0, from the same source. The robot
+  averages it with `enet_b0_8_best_afew.onnx`.
+  SHA-256: `c43e056ad388d4a8dc911832b8291435b2af537f967e5870ebd731574ec7e812`

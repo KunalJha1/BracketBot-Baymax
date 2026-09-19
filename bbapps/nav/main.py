@@ -62,6 +62,7 @@ from reloc_planner import (
     quat_yaw, w2g, g2w,
     _dijkstra_backward, _extract_path_jit, _warmup_jit,
 )
+from safety_interlock import GroundSafetyInterlock
 
 CFG_M = Config('mapping')
 
@@ -475,6 +476,24 @@ _shared_pos = np.zeros(3, dtype=np.float32)  # control writes, planner reads
 _map_gen = 0             # bumped on wipe so the browser drops the old cloud + SLAM trail
 _wiping = False          # one wipe at a time
 _rebuild = {'count': 0, 'frame': 0, 'moved': 0, 'emptied': 0, 'filled': 0, 't': 0.0, 'in_progress': False}
+
+# Perception interlock. The vision owner atomically writes this observation;
+# navigation never infers human state itself. A confirmed observation cancels
+# autonomous motion and requires an operator to start a new route after the
+# vision service has positively cleared it. Manual teleop remains an explicit
+# operator override.
+GROUND_ALERT_FILE = Path(
+    os.environ.get("BRACKETBOT_GROUND_ALERT_FILE", "/tmp/bracketbot_ground_alert.json")
+)
+_ground_interlock = GroundSafetyInterlock(
+    GROUND_ALERT_FILE,
+    logger=lambda message: print(f"[safety] {message}", flush=True),
+)
+
+
+def ground_safety_alert(now=None):
+    """Return the latest confirmed possible-person-on-ground interlock state."""
+    return _ground_interlock.read(now)
 
 # --- Freshness watchdog: empirical logging to tell "SLAM/mapping stalled" apart from
 # "wifi/client fell behind" apart from "resync is just slow" — set from each reader's own
@@ -904,6 +923,7 @@ def _control_loop_impl():
         stuck_rotations = 0
         aligning = False                                # final turn-in-place to the waypoint heading
         prev_cte = 0.0
+        ground_stop_announced = False
         # Diagnostics
         diag = {}
 
@@ -1294,6 +1314,30 @@ def _control_loop_impl():
                 if min_dist < 0.15:  # within 15cm of edge or outside
                     smooth_v = 0.0
                     robot_status = "stopped — at bounds edge"
+
+            # A sustained depth-grounded observation always wins over autonomous
+            # routing. Cancel rather than pause so clearing the observation cannot
+            # silently make the robot resume near a person on the floor.
+            ground_stop, ground_alerts = ground_safety_alert(now)
+            if ground_stop and not manual_drive:
+                was_autonomous = patrol_running or goal is not None
+                smooth_v = smooth_w = 0.0
+                patrol_running = False
+                goal = None
+                path = []
+                aligning = False
+                stuck_rotating = False
+                _replan_needed = False
+                ids = [str(item.get("track_id", "?")) for item in ground_alerts]
+                robot_status = (
+                    "SAFETY STOP — possible person on ground"
+                    + (f" (track {', '.join(ids)})" if ids else "")
+                )
+                if was_autonomous and not ground_stop_announced:
+                    print(f"[safety] {robot_status}; autonomous route cancelled", flush=True)
+                ground_stop_announced = True
+            else:
+                ground_stop_announced = False
 
             if not os.path.exists("/dev/shm/drive.ctrl"):   # a full `restart` rm's /dev/shm/*.ctrl: our segment is an orphan inode
                 w_drive.__exit__(None, None, None)
