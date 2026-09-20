@@ -9,8 +9,8 @@ from dataclasses import dataclass, replace
 import math
 
 from follow_core import (
-    FollowConfig, CorridorGuard, OdometryCheck, RateLimiter, TickOutput,
-    clamp, corridor_count, supervise,
+    FollowConfig, FollowController, CorridorGuard, OdometryCheck, RateLimiter, TickOutput,
+    Track, corridor_count, supervise,
 )
 
 GROUND_LINE = "hello specimen, are you in trouble"
@@ -21,6 +21,7 @@ STANDOFF = 1.0
 def approach_config(v_max=0.05):
     return replace(
         FollowConfig(), v_max=min(v_max, 0.05), omega_max=0.20,
+        turn_in_place_bearing=math.radians(15.0),
         accel_up=0.04, accel_down=0.2, alpha_max=0.30,
         perception_stale=TARGET_MAX_AGE, corridor_z_min=0.03,
         corridor_length=0.85, corridor_margin=0.20, corridor_min_points=10,
@@ -90,40 +91,13 @@ def target_from_payload(payload, wall_now, left_sign=-1.0):
         return None
 
 
-class PID:
-    """Bounded integral and filtered derivative; reset whenever motion is inhibited."""
-
-    def __init__(self, kp, ki, kd, low, high):
-        self.kp, self.ki, self.kd = kp, ki, kd
-        self.low, self.high = low, high
-        self.reset()
-
-    def reset(self):
-        self.integral = self.derivative = 0.0
-        self.previous = None
-
-    def step(self, error, dt):
-        if not 0 < dt <= 0.2:
-            self.reset()
-            dt = 0.0
-        raw_d = 0.0 if self.previous is None or not dt else (error - self.previous) / dt
-        self.derivative += (dt / (0.25 + dt)) * (raw_d - self.derivative)
-        integral = clamp(self.integral + error * dt, -0.5, 0.5)
-        output = self.kp * error + self.ki * integral + self.kd * self.derivative
-        # Conditional integration prevents windup at either actuator limit.
-        if self.low <= output <= self.high or (output > self.high and error < 0) or (output < self.low and error > 0):
-            self.integral = integral
-        self.previous = error
-        return clamp(self.kp * error + self.ki * self.integral + self.kd * self.derivative,
-                     self.low, self.high)
-
-
 class GroundApproachLoop:
     def __init__(self, cfg):
         self.cfg = cfg
         self.gap = STANDOFF
-        self.range_pid = PID(0.12, 0.01, 0.025, 0, cfg.v_max)
-        self.turn_pid = PID(0.65, 0.015, 0.05, -cfg.omega_max, cfg.omega_max)
+        # Share the tuned motion law and gains with normal follow. Only the
+        # approach limits and destination differ; future PID tuning applies here too.
+        self.controller = FollowController(cfg)
         self.limiter = RateLimiter(cfg)
         self.corridor = CorridorGuard(cfg)
         self.odom_check = OdometryCheck(cfg, v_sent_min=0.01, v_measured_min=0.01,
@@ -191,7 +165,7 @@ class GroundApproachLoop:
             rule = "blocked"
         elif not self.arrived:
             error = clearance - STANDOFF
-            if error <= 0.05:
+            if error <= cfg.deadband_range:
                 # Brake first; speak only after wheels have actually settled.
                 rule = "settling"
                 if abs(inp.measured_v) < 0.015 and abs(inp.measured_omega) < 0.04:
@@ -203,11 +177,16 @@ class GroundApproachLoop:
                     self.settled_since = None
             else:
                 self.settled_since = None
-                omega_cmd = self.turn_pid.step(bearing if abs(bearing) > math.radians(3) else 0, dt)
-                if abs(bearing) <= math.radians(15):
-                    v_cmd = self.range_pid.step(error - 0.05, dt) * math.cos(bearing)
-                else:
-                    self.range_pid.reset()
+                control_dt = dt
+                if not 0 < dt <= 0.2:
+                    self.controller.reset()
+                    control_dt = 0.0
+                # Track uses distance to the body centre, so add the conservative
+                # radius to the desired gap. No target-velocity feedforward: this
+                # mode approaches a ground pose, it does not chase a walking person.
+                track = Track(target.forward, target.left, target.distance, bearing,
+                              v_radial=0.0, age=age)
+                v_cmd, omega_cmd = self.controller.command(track, STANDOFF + self.radius, control_dt)
         verdict = supervise(
             cfg, v=v_cmd, omega=omega_cmd, stop_requested=inp.stop_requested,
             heartbeat_age=inp.heartbeat_age, roll_deg=inp.roll_deg, pitch_deg=inp.pitch_deg,
@@ -220,8 +199,7 @@ class GroundApproachLoop:
         if rule != "ok" or exiting or self.arrived:
             # Safety stops bypass the acceleration ramp, including angular motion.
             self.limiter.reset()
-            self.range_pid.reset()
-            self.turn_pid.reset()
+            self.controller.reset()
             if rule not in ("settling", "ok"):
                 self.settled_since = None
             v = omega = 0.0

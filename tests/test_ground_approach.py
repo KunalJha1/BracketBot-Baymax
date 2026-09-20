@@ -4,9 +4,9 @@ import math
 import numpy as np
 import pytest
 
-from follow_core import Perception, TickInputs
+from follow_core import FollowConfig, FollowController, Perception, TickInputs, Track
 from ground_approach import (
-    GroundApproachLoop, GroundTarget, PID, approach_config, target_from_payload,
+    GroundApproachLoop, GroundTarget, approach_config, target_from_payload,
 )
 
 
@@ -169,12 +169,15 @@ def test_stale_pose_cannot_satisfy_stationary_dwell():
     assert not loop.arrived
 
 
-def test_straight_approach_simulation_reaches_body_standoff():
+@pytest.mark.parametrize("vision_interval", [1, 12])
+def test_straight_approach_simulation_reaches_body_standoff(vision_interval):
     loop = GroundApproachLoop(approach_config())
     distance, speed = 3.3, 0
     for i in range(6000):
         t = i * 0.02
-        out = tick(loop, t, target(t, forward=distance), measured_v=speed)
+        if i % vision_interval == 0:
+            observation = target(t, forward=distance)
+        out = tick(loop, t, observation, measured_v=speed)
         assert not out.exit
         speed = out.v
         distance -= speed * 0.02
@@ -185,13 +188,60 @@ def test_straight_approach_simulation_reaches_body_standoff():
     assert 1.0 <= distance - 0.8 <= 1.06
 
 
-def test_pid_does_not_wind_up_and_resets_derivative():
-    pid = PID(1, 1, 0.1, 0, 0.05)
-    for _ in range(500):
-        assert pid.step(10, 0.02) == 0.05
-    assert pid.integral == 0
-    pid.reset()
-    assert pid.step(0, 0.02) == 0
+def test_approach_inherits_follow_tuning_but_retains_creep_limits():
+    cfg, follow = approach_config(), FollowConfig()
+    for name in ("v_kp", "v_ki", "v_kd", "v_i_max", "v_i_zone", "v_d_tau",
+                 "w_kp", "w_ki", "w_kd", "w_i_max", "w_i_zone", "w_d_tau",
+                 "deadband_range", "deadband_bearing"):
+        assert getattr(cfg, name) == getattr(follow, name)
+    assert cfg.v_max == 0.05 and cfg.omega_max == 0.2
+    assert cfg.turn_in_place_bearing == pytest.approx(math.radians(15))
+
+
+def test_commands_match_shared_follow_controller_through_a_changing_approach():
+    cfg = approach_config()
+    loop, reference = GroundApproachLoop(cfg), FollowController(cfg)
+    for i in range(120):
+        t = i * 0.02
+        distance = 2.1 - 0.0015 * i
+        bearing = math.radians(20 - 0.15 * i)
+        obs = target(t, forward=distance * math.cos(bearing), left=distance * math.sin(bearing))
+        out = tick(loop, t, obs)
+        expected = reference.command(Track(obs.forward, obs.left, obs.distance, obs.bearing, 0, 0),
+                                     1 + obs.radius, 0 if i == 0 else 0.02)
+        assert (out.v_cmd, out.omega_cmd) == pytest.approx(expected)
+        assert out.rule == "ok"
+
+
+def test_small_errors_use_tuned_gains_and_continuous_bearing_deadband():
+    cfg = approach_config()
+    loop = GroundApproachLoop(cfg)
+    angle, distance = math.radians(4), 1.86  # 1 cm outside the body arrival band
+    out = tick(loop, 0, target(0, forward=distance * math.cos(angle), left=distance * math.sin(angle)))
+    assert out.v_cmd == pytest.approx(cfg.v_kp * 0.01 * math.cos(angle))
+    assert out.omega_cmd == pytest.approx(cfg.w_kp * math.radians(1))
+
+
+def test_saturation_and_hazard_cannot_leave_integral_or_derivative_history():
+    loop, _ = moving_loop()
+    assert loop.controller.range_pid.integral == 0
+    for i in range(100):
+        t = 2 + i * 0.02
+        tick(loop, t, target(t, forward=3 - i * 0.011, left=0.2))
+    assert loop.controller.bearing_pid.integral > 0
+    out = tick(loop, 4, None)
+    assert out.v == out.omega == 0
+    for pid in (loop.controller.range_pid, loop.controller.bearing_pid):
+        assert pid.integral == pid.rate == 0
+
+
+def test_long_control_gap_resets_pid_history_before_restart():
+    loop, _ = moving_loop(0.3)
+    out = tick(loop, 2.5, target(2.5, left=0.3))
+    reference = FollowController(loop.cfg)
+    obs = target(2.5, left=0.3)
+    expected = reference.command(Track(obs.forward, obs.left, obs.distance, obs.bearing, 0, 0), 1.8, 0)
+    assert (out.v_cmd, out.omega_cmd) == pytest.approx(expected)
 
 
 @pytest.mark.parametrize("turning", [True, False])

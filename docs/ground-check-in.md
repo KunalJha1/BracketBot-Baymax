@@ -15,7 +15,7 @@ The action never starts on boot or as a side effect of a navigation alert.
 1. Deploy both updated vision files to the existing robot app directory:
 
    ```sh
-   scp bbapps/emotion_greeter/main.py bbapps/emotion_greeter/ground_safety.py bot:~/bbapps/emotion_greeter/
+   scripts/bot push bbapps/emotion_greeter/main.py bbapps/emotion_greeter/ground_safety.py --to '~/bbapps/emotion_greeter/'
    ```
 
    Restart the vision service using the robot's normal service workflow while
@@ -45,13 +45,23 @@ The action never starts on boot or as a side effect of a navigation alert.
 
 ## Controller and stop behavior
 
-`scripts/ground_approach.py` contains separate range and bearing PID controllers
-with bounded integrals, filtered derivatives, anti-windup, and reset on motion
-inhibition. Default gains `(P, I, D)` are `(0.12, 0.01, 0.025)` for range and
-`(0.65, 0.015, 0.05)` for bearing. These are initial conservative gains, not
-hardware-tuned values. Limits are 0.05 m/s forward, 0.20 rad/s yaw, 0.04 m/s²
+`scripts/ground_approach.py` uses the same `FollowController` and `FollowConfig`
+PID tuning as normal following in `scripts/follow_core.py`. Current gains
+`(P, I, D)` are `(0.6, 0.3, 0.15)` for range and `(1.2, 0.2, 0.12)` for bearing.
+Future changes to that shared tuning also apply to ground check-in.
+Ground approach limits remain 0.05 m/s forward, 0.20 rad/s yaw, 0.04 m/s²
 acceleration, and 0.30 rad/s² angular acceleration. It never reverses and first
 aligns within 15° before advancing.
+
+The shared controller subtracts a continuous deadband from each error, filters
+the derivative (0.25 s for range, 0.15 s for bearing), and only accumulates the
+integral near the target (0.3 m range error, 20° bearing error). Integral output
+contributions are bounded at 0.2 m/s and ±0.15 rad/s; the final creep-speed caps
+still apply, with anti-windup at saturation. Ground mode resets both PIDs when
+motion is inhibited or the control clock has a long gap. The desired distance
+to the body centre is `body_radius + 1.0 m`; angular target-velocity feedforward
+is zero because this is a ground-pose approach. It also inherits the runner's
+background depth processing and calibrated output turning sign (`omega_sign`).
 
 The envelope is the furthest depth-associated joint from the median body
 position plus 0.25 m. Its radius can grow but cannot shrink during an attempt.

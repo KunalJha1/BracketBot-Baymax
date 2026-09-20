@@ -114,7 +114,8 @@ def test_old_vision_service_refused_before_motion(tmp_path):
 
 
 @pytest.mark.parametrize("arrive", [True, False])
-def test_ground_runner_holds_zero_while_speaking_and_stops_on_signal(tmp_path, monkeypatch, arrive):
+@pytest.mark.parametrize("omega_sign", [1, -1])
+def test_ground_runner_holds_zero_while_speaking_and_stops_on_signal(tmp_path, monkeypatch, arrive, omega_sign):
     import threading
     from ground_approach import GroundTarget
 
@@ -131,10 +132,23 @@ def test_ground_runner_holds_zero_while_speaking_and_stops_on_signal(tmp_path, m
     monkeypatch.setattr(robot_follow.time, "sleep", sleep)
     monkeypatch.setattr(robot_follow, "STOP_REQUESTED", False)
     monkeypatch.setattr(robot_follow, "read_ground_target", lambda *_: GroundTarget(
-        "test", 1, 100 + clock[0], 1.8 if arrive else 3, 0, 0.8))
+        "test", 1, 100 + clock[0], 1.8 if arrive else 3, 0.3, 0.8))
     writes = []
     monkeypatch.setattr(robot_follow, "write_twist", lambda _writer, v, w: writes.append((v, w)))
     monkeypatch.setattr(robot_follow, "write_led", lambda *_: None)
+
+    class SteppedWorker(robot_follow.PerceptionWorker):
+        # The fake clock advances without wall-clock waits. Process camera frames
+        # on demand so thread scheduling cannot decide whether a frame is stale.
+        # Real worker handoff and errors have separate asynchronous tests below.
+        def __enter__(self):
+            return self
+
+        def take(self):
+            self.step()
+            return super().take()
+
+    monkeypatch.setattr(robot_follow, "PerceptionWorker", SteppedWorker)
 
     class Reader:
         data = {"rpy": np.zeros(3), "vel": np.zeros(2), "num_points": 200,
@@ -158,11 +172,14 @@ def test_ground_runner_holds_zero_while_speaking_and_stops_on_signal(tmp_path, m
     args = robot_follow.parse_args(["--ground-approach", "--dry-run", "--no-heartbeat", "--log-dir", str(tmp_path)])
     speech = Speech()
     robot_follow.control_loop(args, robot_follow.loop_config(args), [Reader(), Reader(), Reader()],
-                              object(), object(), 0.2, 0.3, speech=speech)
+                              object(), object(), 0.2, 0.3,
+                              calibration=robot_follow.Calibration(omega_sign=omega_sign), speech=speech)
     assert speech.calls == int(arrive)
     assert writes[-1] == (0, 0)
     if not arrive:
         assert any(v > 0 for v, _ in writes)
+        assert any(w * omega_sign > 0 for _, w in writes)
+        assert all(0 <= v <= 0.05 and 0 <= w * omega_sign <= 0.2 for v, w in writes)
 
 
 class OneFrame:
