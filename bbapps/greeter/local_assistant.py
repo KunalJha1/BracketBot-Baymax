@@ -391,6 +391,7 @@ def run_voice(args, router, transcriber, synthesizer, action_controller) -> None
                         mic_last_update = time.monotonic()
                         segmenter.reset()
                         pending_wake = True
+                        action_controller.listening.set()
                         leds.set("listening")
                         print("[local-assistant] Wake phrase detected; recording...")
 
@@ -429,6 +430,7 @@ def run_voice(args, router, transcriber, synthesizer, action_controller) -> None
                 utterance_audio = segmenter.push(audio, triggered=triggered)
                 if utterance_audio is None:
                     continue
+                action_controller.listening.clear()
                 leds.set("processing")
                 try:
                     # Normalize instead of clipping, and do not hand whisper

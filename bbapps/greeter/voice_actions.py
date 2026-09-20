@@ -103,6 +103,12 @@ FOLLOW_STATE_MESSAGES = {
     "LOST": "I lost you. Please stand in front of me.",
     "BLOCKED": "Something is in my way.",
 }
+# A short chirp while driving behind someone, so they can tell it is still there
+# without looking back. Silent while searching or lost: those states speak.
+FOLLOW_CHIRP_SOUND = "follow_chirp.wav"
+FOLLOW_CHIRP_STATES = frozenset({"FOLLOWING", "BLOCKED"})
+FOLLOW_CHIRP_PERIOD_S = 2.5
+FOLLOW_CHIRP_VOLUME = 0.5
 SCAN_LED = ((72, 205, 220), "pulse")
 REMINDER_LED = ((255, 185, 40), "blink", 8.0)
 # A reminder can land while the audience is watching the arms rather than
@@ -375,6 +381,9 @@ class VoiceActionController:
         self.leds = None
         self.announce = print
         self.speaker_lock = threading.Lock()
+        # Set by the assistant while it records a wake-word turn, so background
+        # sounds stay out of the audio whisper has to understand ("stop").
+        self.listening = threading.Event()
         self._operation_lock = threading.Lock()
         self._cancel = threading.Event()
         self._last_find: dict = {}
@@ -678,8 +687,24 @@ class VoiceActionController:
                 if not self._face_person("look", check_distance=False):
                     return
                 spoken = set()
+                current = [""]
+                ended = threading.Event()
+
+                def chirp():
+                    path = self.assets_dir / FOLLOW_CHIRP_SOUND
+                    while not ended.wait(FOLLOW_CHIRP_PERIOD_S) and not self._cancel.is_set():
+                        if current[0] not in FOLLOW_CHIRP_STATES or self.listening.is_set():
+                            continue
+                        try:
+                            self._play_sound(path, volume=FOLLOW_CHIRP_VOLUME)
+                        except Exception as exc:
+                            print(f"[voice-action] follow chirp off: {exc}", flush=True)
+                            return
+
+                threading.Thread(target=chirp, name="follow-chirp", daemon=True).start()
 
                 def on_state(state):
+                    current[0] = state
                     if leds is not None and state in FOLLOW_STATE_LED:
                         leds.start_effect(*FOLLOW_STATE_LED[state], 3600.0)
                     if state == "SEARCHING":
@@ -692,7 +717,10 @@ class VoiceActionController:
                     spoken.add(state)
                     self.announce(message)
 
-                last = runner.follow(self._cancel, on_state=on_state)
+                try:
+                    last = runner.follow(self._cancel, on_state=on_state)
+                finally:
+                    ended.set()
                 if leds is not None:
                     leds.clear_effect()
                 print(f"[voice-action] follow ended: {last}", flush=True)

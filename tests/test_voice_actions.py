@@ -586,6 +586,33 @@ def test_follow_me_faces_the_person_then_follows_until_stopped(tmp_path):
     assert leds.effects[1][:2] == voice_actions.FOLLOW_STATE_LED["FOLLOWING"]
 
 
+def test_follow_me_chirps_only_while_following_and_not_while_listening(tmp_path, monkeypatch):
+    monkeypatch.setattr(voice_actions, "FOLLOW_CHIRP_PERIOD_S", 0.02)
+    finder = FakeFinder({"found": True, "distance": "far", "turned_deg": 3})
+    played = []
+
+    def run(states, listening=False):
+        controller = voice_actions.VoiceActionController(
+            FakeGestureController(), tmp_path, person_finder=finder,
+            follow_runner=FakeFollowRunner(states=states),
+        )
+        controller.bind(FakeSpeaker(), SimpleNamespace(), FakeLeds(), announce=lambda _: None)
+        monkeypatch.setattr(controller, "_play_sound", lambda path, **_: played.append(path.name))
+        if listening:
+            controller.listening.set()
+        assert controller.start("follow-me")[0] is True
+        time.sleep(0.2)
+        controller.stop()
+        wait_for_controller(controller)
+        count = len(played)
+        played.clear()
+        return count
+
+    assert run(("SEARCHING", "FOLLOWING")) >= 2
+    assert run(("SEARCHING", "FOLLOWING", "LOST")) == 0
+    assert run(("SEARCHING", "FOLLOWING"), listening=True) == 0
+
+
 def test_follow_me_does_not_start_when_nobody_is_found(tmp_path):
     announced = []
     runner = FakeFollowRunner()
