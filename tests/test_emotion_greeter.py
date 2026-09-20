@@ -547,6 +547,22 @@ def test_check_in_asks_listens_and_replies_with_llm(monkeypatch):
     assert check_in.status == "idle"
 
 
+def test_check_in_shows_listening_leds_while_waiting_for_an_answer(monkeypatch):
+    monkeypatch.setattr("check_in.time.sleep", lambda _s: None)
+    shown = []
+    check_in, _synthesizer, _spoken = check_in_for(
+        [spoken_answer()],
+        ["my exam went badly"],
+        FakeLlm(),
+        max_turns=1,
+        answer_timeout=0.05,
+        show_led=shown.append,
+    )
+    check_in.converse()
+
+    assert shown == ["speaking", "listening", "processing", "speaking", None]
+
+
 def test_check_in_is_gentle_when_nobody_answers(monkeypatch):
     monkeypatch.setattr("check_in.time.sleep", lambda _s: None)
     check_in, _synthesizer, spoken = check_in_for([[]], [], FakeLlm(), answer_timeout=0.01)

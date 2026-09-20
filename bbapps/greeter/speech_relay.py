@@ -36,6 +36,11 @@ SPOOL_DIR = Path("/tmp/bracketbot_speech")
 REQUEST_TTL_S = 45.0
 # How long a requester waits for the owner to finish speaking before giving up.
 DEFAULT_TIMEOUT_S = 30.0
+# led.ctrl has the same single-writer rule as the speaker, so a relayed
+# conversation also posts its state here for the owner's LEDs to mirror. The
+# hint expires on its own in case the requester dies mid-conversation.
+LED_STATUS_FILE = "led_status"
+LED_STATUS_TTL_S = 30.0
 
 
 def _write_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -91,6 +96,37 @@ def request(
     finally:
         pending.unlink(missing_ok=True)
         done.unlink(missing_ok=True)
+
+
+def post_led_status(
+    status: str | None,
+    ttl: float = LED_STATUS_TTL_S,
+    spool: Path = SPOOL_DIR,
+) -> None:
+    """Ask the LED owner to show ``status``; None or "idle" releases the LEDs."""
+
+    path = spool / LED_STATUS_FILE
+    try:
+        if not status or status == "idle":
+            path.unlink(missing_ok=True)
+        else:
+            _write_atomic(path, {"status": status, "expires": time.time() + ttl})
+    except OSError:
+        pass
+
+
+def read_led_status(
+    spool: Path = SPOOL_DIR, now: Callable[[], float] = time.time
+) -> str | None:
+    """Return the status another app asked the LEDs to show, if still fresh."""
+
+    try:
+        payload = json.loads((spool / LED_STATUS_FILE).read_text())
+        if now() < float(payload["expires"]):
+            return str(payload["status"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
 
 
 def _pending_requests(spool: Path) -> list[Path]:
@@ -151,4 +187,11 @@ def serve_pending(
     return spoken
 
 
-__all__ = ["REQUEST_TTL_S", "SPOOL_DIR", "request", "serve_pending"]
+__all__ = [
+    "REQUEST_TTL_S",
+    "SPOOL_DIR",
+    "post_led_status",
+    "read_led_status",
+    "request",
+    "serve_pending",
+]

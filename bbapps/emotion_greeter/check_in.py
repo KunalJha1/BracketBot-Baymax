@@ -66,6 +66,12 @@ CHECK_IN_SYSTEM_PROMPT = (
     "care and encourage them to contact someone they trust right now or call "
     "or text 988 (the Suicide and Crisis Lifeline in the US and Canada)."
 )
+# Check-in states as the assistant's LedStatus names them.
+LED_STATUS = {
+    "speaking": "speaking",
+    "listening": "listening",
+    "thinking": "processing",
+}
 # Splitting a reply on sentence ends lets the first sentence start playing
 # while the rest is still being synthesized.
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
@@ -120,6 +126,7 @@ class SadCheckIn:
         max_utterance: float = 12.0,
         speaker_drain: float = 0.4,
         openings: Sequence[str] = OPENING_LINES,
+        show_led: Callable[[str | None], None] = lambda status: None,
         log: Callable[[str], None] = lambda line: print(line, flush=True),
     ) -> None:
         self.synthesizer = synthesizer
@@ -138,9 +145,10 @@ class SadCheckIn:
         self.max_utterance = max_utterance
         self.speaker_drain = speaker_drain
         self.openings = tuple(openings) or (OPENING_LINE,)
+        self.show_led = show_led
         self.log = log
         self.lock = threading.Lock()
-        self.status = "idle"
+        self._status = "idle"
         # Pre-rendered openers so a frown is answered without waiting on TTS.
         self._voice_cache: dict[str, np.ndarray] = {}
         self._cache_lock = threading.Lock()
@@ -148,6 +156,19 @@ class SadCheckIn:
         self._synth_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="check-in-tts"
         )
+
+    @property
+    def status(self) -> str:
+        return self._status
+
+    @status.setter
+    def status(self, value: str) -> None:
+        if value == self._status:
+            return
+        self._status = value
+        # The voice assistant owns led.ctrl; it mirrors this on the neck with
+        # its own colors, so waiting for an answer glows blue like a wake turn.
+        self.show_led(LED_STATUS.get(value))
 
     @property
     def busy(self) -> bool:
@@ -367,6 +388,7 @@ def build_check_in(args, Config, Reader, Type, Writer) -> SadCheckIn:
         answer_timeout=args.check_in_answer_timeout,
         mic_gain=args.mic_gain,
         trailing_silence=args.check_in_trailing_silence,
+        show_led=speech_relay.post_led_status,
     )
 
 

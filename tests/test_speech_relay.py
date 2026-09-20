@@ -137,3 +137,13 @@ def test_requests_are_served_in_the_order_they_were_posted(tmp_path):
 def test_request_requires_something_to_say(tmp_path):
     with pytest.raises(ValueError):
         speech_relay.request(spool=tmp_path)
+
+
+def test_led_status_round_trips_and_expires(tmp_path):
+    speech_relay.post_led_status("listening", ttl=10.0, spool=tmp_path)
+    assert speech_relay.read_led_status(spool=tmp_path) == "listening"
+    later = lambda: time.time() + 11.0
+    assert speech_relay.read_led_status(spool=tmp_path, now=later) is None
+
+    speech_relay.post_led_status("idle", spool=tmp_path)
+    assert speech_relay.read_led_status(spool=tmp_path) is None

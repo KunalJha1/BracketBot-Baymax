@@ -251,6 +251,12 @@ class LedStatus:
                     # Do not publish an idle frame. The LED daemon treats a
                     # quiet controller as released and restores the robot's
                     # configured idle color after its short stale timeout.
+                    if status == "idle":
+                        # Another app's relayed conversation (the emotion
+                        # greeter's check-in) shows the same colors here.
+                        status = speech_relay.read_led_status() or "idle"
+                        if status not in self.COLORS:
+                            status = "idle"
                     if status != "idle":
                         color = self.COLORS[status]
                     elif effect is not None:
