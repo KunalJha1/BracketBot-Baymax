@@ -224,18 +224,13 @@ def test_heart_rate_is_rejected_when_scanner_is_not_installed(tmp_path):
     assert not controller._operation_lock.locked()
 
 
-def test_rppg_scanner_parses_script_json(tmp_path):
+def test_rppg_scanner_parses_script_json(tmp_path, python_instead_of_uv):
     script = tmp_path / "robot_rppg.py"
     script.write_text(
         "import json, sys\n"
         "print(json.dumps({'result': {'bpm': 66.0, 'confident': True}}))\n"
     )
-    uv = tmp_path / "uv"
-    # Stand-in for `uv run --quiet robot_rppg.py --duration N`.
-    uv.write_text(f"#!/bin/sh\nexec {sys.executable} \"$3\"\n")
-    uv.chmod(0o755)
-
-    scanner = voice_actions.RppgScanner(script, uv_bin=str(uv), duration_s=1)
+    scanner = voice_actions.RppgScanner(script, uv_bin=python_instead_of_uv, duration_s=1)
 
     assert scanner.scan(threading.Event()) == {"bpm": 66.0, "confident": True}
 

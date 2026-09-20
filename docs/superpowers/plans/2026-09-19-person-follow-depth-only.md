@@ -1,5 +1,10 @@
 # Person-Follow Depth-Only Follow-Up Implementation Plan
 
+**Calibration update:** This is a historical implementation plan. For deployment
+and Task 5 calibration, use [Follow readiness](../../follow-readiness.md).
+Do not copy its old source constants or auto-mask the probe's nearby bounding
+box. Calibration now lives in the robot's `~/.config/baymax/follow.json`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Switch person-follow from the YOLO-pose detector to depth-only clustering (no neural network, no camera image), then finish the dashboard, gate tooling, and robot gates.

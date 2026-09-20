@@ -46,7 +46,9 @@ REMOTE_GREETER_ACTION_RUNNER = "/tmp/greeter_action.py"
 REMOTE_TABLE_REST_RUNNER = "/tmp/table_rest.py"
 REMOTE_DEMO_ARM_RESERVATION = "/tmp/bracketbot-demo-arm-reserved"
 FOLLOW_RUNNER = ROOT / "scripts" / "robot_follow.py"
-FOLLOW_MODULES = (ROOT / "scripts" / "follow_core.py", ROOT / "scripts" / "follow_perception.py")
+FOLLOW_MODULES = tuple(ROOT / "scripts" / name for name in (
+    "follow_core.py", "follow_perception.py", "follow_calibration.py",
+))
 REMOTE_FOLLOW_RUNNER = "/tmp/robot_follow.py"
 # Must match follow_core (FollowConfig gap bounds and STATUS_PREFIX); a test checks this.
 FOLLOW_GAP_MIN = 0.6
@@ -2096,11 +2098,13 @@ def start_source_reloader(server, controller, source, reload_requested, stop_eve
                 or state["lean_enabled"]
                 or state["lean_transition"]
                 or state["demo"]["active"]
+                or state["follow_enabled"]
+                or state["follow_transition"]
             )
             if busy:
                 if not announced_wait:
                     print(
-                        "[reload] source changed; waiting for actions, demo, and lean mode to stop",
+                        "[reload] source changed; waiting for actions, demo, lean, and follow to stop",
                         flush=True,
                     )
                     announced_wait = True
@@ -2132,7 +2136,6 @@ def main():
         help="exercise actions and routines locally without SSH or robot hardware",
     )
     parser.add_argument(
-<<<<<<< HEAD
         "--demo-pack-command",
         default="",
         help=(
@@ -2147,7 +2150,7 @@ def main():
         help="disable automatic restart when robot_dashboard.py changes",
     )
     parser.set_defaults(reload=True)
-=======
+    parser.add_argument(
         "--follow-v-max",
         type=float,
         default=0.15,
@@ -2158,7 +2161,6 @@ def main():
         action="store_true",
         help="follow by turning in place only (robot gate G3)",
     )
->>>>>>> origin/feature/person-follow
     args = parser.parse_args()
     if not 0.0 < args.follow_v_max <= 0.30:
         parser.error("--follow-v-max must be above 0 and at most 0.30 m/s")
@@ -2166,16 +2168,13 @@ def main():
     if args.follow_rotate_only:
         follow_args += ("--rotate-only",)
 
-<<<<<<< HEAD
     demo_pack_command = tuple(shlex.split(args.demo_pack_command))
     controller = RobotController(
         args.ssh_hosts,
         simulate=args.simulate,
         demo_pack_command=demo_pack_command,
+        follow_args=follow_args,
     )
-=======
-    controller = RobotController(args.ssh_hosts, simulate=args.simulate, follow_args=follow_args)
->>>>>>> origin/feature/person-follow
     Handler.controller = controller
     server = ThreadingHTTPServer((args.bind, args.port), Handler)
     server.daemon_threads = True
@@ -2208,17 +2207,14 @@ def main():
         deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline:
             state = controller.state.snapshot()
-<<<<<<< HEAD
             if (
                 not state["running"]
                 and not state["lean_enabled"]
                 and not state["lean_transition"]
                 and not state["demo"]["active"]
+                and not state["follow_enabled"]
+                and not state["follow_transition"]
             ):
-=======
-            if not (state["running"] or state["lean_enabled"] or state["lean_transition"]
-                    or state["follow_enabled"] or state["follow_transition"]):
->>>>>>> origin/feature/person-follow
                 break
             time.sleep(0.1)
         server.server_close()
