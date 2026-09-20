@@ -301,12 +301,12 @@ def test_reminder_fires_while_a_gesture_owns_the_action_lock(tmp_path):
     started, reply = controller.schedule_reminder(reminder)
 
     assert started is True
-    assert reply == "Okay. I'll remind you in 0.02 seconds to take my meds."
+    assert reply == "Okay. I'll remind you in 0.02 seconds to take your meds."
     deadline = time.monotonic() + 1.0
     while not announcements and time.monotonic() < deadline:
         time.sleep(0.005)
-    assert announcements == ["Reminder: take my meds."]
-    assert leds.effects == [voice_actions.REMINDER_LED]
+    assert announcements == ["Reminder: take your meds."]
+    assert leds.effects == [voice_actions.REMINDER_SET_LED, voice_actions.REMINDER_LED]
     controller.stop()
     controller.close()
 
@@ -909,3 +909,77 @@ def test_ground_watcher_ignores_stale_ambiguous_and_mid_conversation_alerts(tmp_
     assert starter.calls == 0
     starter.listening.clear()
     assert watcher.poll() is True
+
+
+def test_reminder_replies_are_speakable(tmp_path):
+    controller = voice_actions.VoiceActionController(
+        SimpleNamespace(running=lambda: False, stop=lambda: None),
+        tmp_path,
+        reminder_db_path=tmp_path / "reminders.sqlite3",
+        reminder_timezone="America/Toronto",
+    )
+    try:
+        assert controller._duration_text(5400) == "1 hour 30 minutes"
+        assert controller._duration_text(90) == "1 minute 30 seconds"
+        assert controller._second_person("call my mom and tell her i'm fine") == (
+            "call your mom and tell her you're fine"
+        )
+        _, reply = controller.schedule_reminder(
+            SimpleNamespace(
+                delay_seconds=7200.0,
+                message="the meeting",
+                connector="about",
+                due_text="5 PM",
+            )
+        )
+        assert reply == "Okay. I'll remind you at 5 PM about the meeting."
+        _, reply = controller.schedule_reminder(
+            SimpleNamespace(delay_seconds=600.0, message=None)
+        )
+        assert reply == "Okay. Your timer is set for 10 minutes."
+        listed, reply = controller.list_reminders()
+        assert listed is True
+        assert "the meeting, at " in reply
+        assert "a timer, in 10 minutes" in reply
+        # ISO timestamps are unreadable through text to speech.
+        assert "T" not in reply.split("You have", 1)[1].replace("PM", "").replace("AM", "")
+    finally:
+        controller.close()
+
+
+def test_setting_a_reminder_plays_a_confirmation_ding(tmp_path):
+    frames = []
+
+    class RecordingSpeaker:
+        def buf(self):
+            speaker = self
+
+            class Frame(dict):
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    frames.append(self["audio"])
+
+            return Frame()
+
+    controller = voice_actions.VoiceActionController(
+        SimpleNamespace(running=lambda: False, stop=lambda: None),
+        tmp_path,
+        reminder_db_path=tmp_path / "reminders.sqlite3",
+        reminder_timezone="America/Toronto",
+    )
+    try:
+        controller.bind(
+            RecordingSpeaker(),
+            SimpleNamespace(sample_rate=16000, chunk_size=320, channels=1),
+            None,
+        )
+        started, _reply = controller.schedule_reminder(
+            SimpleNamespace(kind="timer", delay_seconds=600.0, message=None)
+        )
+        assert started is True
+        assert frames and all(frame.shape == (320, 1) for frame in frames)
+        assert max(int(abs(frame).max()) for frame in frames) > 3000
+    finally:
+        controller.close()

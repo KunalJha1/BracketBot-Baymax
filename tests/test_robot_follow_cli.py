@@ -220,3 +220,24 @@ def test_perception_worker_failure_reaches_the_control_thread():
         assert isinstance(wait_for(worker), RuntimeError)
         with pytest.raises(RuntimeError):
             worker.take()
+
+
+def test_ground_perception_levels_the_ramped_floor_so_only_real_obstacles_block():
+    from follow_calibration import Calibration
+    from follow_core import corridor_count
+    from ground_approach import approach_config
+
+    rng = np.random.default_rng(0)
+    forward = rng.uniform(0.2, 1.8, 6000)
+    right = rng.uniform(-0.9, 0.9, 6000)
+    floor = np.column_stack([right, forward, 0.10 * forward + 0.02 + rng.normal(0, 0.008, 6000)])
+    shin = np.column_stack([rng.uniform(-0.1, 0.1, 60), rng.uniform(0.5, 0.6, 60), rng.uniform(0.07, 0.11, 60) + 0.07])
+
+    def perceive(points):
+        data = {"timestamp": np.datetime64(int(99.9e9), "ns"), "num_points": len(points), "points": points}
+        return robot_follow.ground_perception(data, 5.0, 100.0, Calibration())
+
+    cfg = approach_config()
+    assert corridor_count(robot_follow.base_to_local(floor), None, cfg) > 300    # the bug: floor read as obstacle
+    assert corridor_count(perceive(floor).points, None, cfg) < cfg.corridor_min_points
+    assert corridor_count(perceive(np.vstack([floor, shin])).points, None, cfg) >= cfg.corridor_min_points

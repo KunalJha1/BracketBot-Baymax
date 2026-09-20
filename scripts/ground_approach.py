@@ -5,6 +5,7 @@ fresh, currently observed low pose with the same session and track ID. The
 standoff is measured outside a conservative body envelope, not to the torso.
 """
 
+from collections import deque
 from dataclasses import dataclass, replace
 import math
 
@@ -14,11 +15,17 @@ from follow_core import (
 )
 
 GROUND_LINE = "hello specimen, are you in trouble"
-# The vision app's frames are 0.3-0.7 s old when published and are re-read until
-# the next one lands. At 0.65 s the target kept expiring, and every expiry resets
-# the 0.04 m/s^2 ramp, so the base never got moving. A motionless person seen
-# 1 s ago is at most 5 cm off at creep speed; obstacles use 0.3 s depth instead.
-TARGET_MAX_AGE = 1.0
+# The vision app shares a saturated CPU: its frames arrive 0.3-1.5 s old, and a
+# body on the floor drops out of detection for a frame now and then. Demanding a
+# fresh pose every tick meant the target kept expiring, every expiry reset the
+# 0.04 m/s^2 ramp, and the base never got moving. The person is not moving, so
+# the loop pins them in the odometry frame when a frame arrives and tracks its
+# own wheel motion in between. That also takes the vision delay out of the
+# bearing loop. Obstacles still use depth no older than 0.3 s.
+TARGET_MAX_AGE = 2.0       # oldest camera frame a target may come from
+PUBLISH_MAX_AGE = 1.0      # the vision app must still be publishing
+TARGET_HOLD = 1.0          # how long a missing observation may be bridged
+TARGET_JUMP = 0.4          # a pinned target that moves this far is a different body
 # Gap kept outside the body envelope (furthest joint + 0.25 m), so the wheels stay
 # about 0.85 m from the nearest limb. 1.0 m left the robot too far away to check on
 # anyone. It must stay above FollowConfig.min_range (0.45 m), which stops forward motion.
@@ -30,7 +37,13 @@ def approach_config(v_max=0.05):
         FollowConfig(), v_max=min(v_max, 0.05), omega_max=0.20,
         turn_in_place_bearing=math.radians(15.0),
         accel_up=0.04, accel_down=0.2, alpha_max=0.30,
-        perception_stale=TARGET_MAX_AGE, corridor_z_min=0.03,
+        perception_stale=TARGET_MAX_AGE,
+        # Depth arrives 0.21-0.24 s old on the loaded CPU, so the follow limit of 0.3 s
+        # tripped on 14% of ticks and each trip resets the ramp. 0.5 s is 2.5 cm at creep.
+        points_stale=0.5,
+        # Measured on the robot: the levelled floor leaves 10-20 points between 3 and
+        # 5 cm and none above. 6 cm still catches a forearm or shin lying in the way.
+        corridor_z_min=0.06,
         corridor_length=0.85, corridor_margin=0.20, corridor_min_points=10,
         # Creep speed: opposite travel never accumulates, so trip on time alone.
         odom_mismatch_travel=0.0, odom_mismatch_turn=0.0,
@@ -67,8 +80,10 @@ def target_from_payload(payload, wall_now, left_sign=-1.0):
             return None
         captured = payload["camera_timestamp_ns"] / 1e9
         published = payload["published_at"]
-        if not all(math.isfinite(v) and 0 <= wall_now - v <= TARGET_MAX_AGE
-                   for v in (captured, published)):
+        if not all(math.isfinite(v) for v in (captured, published)):
+            return None
+        if not (0 <= wall_now - captured <= TARGET_MAX_AGE
+                and 0 <= wall_now - published <= PUBLISH_MAX_AGE):
             return None
         session = payload["session_id"]
         if not isinstance(session, str) or not session:
@@ -117,9 +132,24 @@ class GroundApproachLoop:
         self.fault = None
         self.corridor_points = 0
         self.target = None
+        # Wheel odometry since start: x forward, y left, heading, at each wall time.
+        self.pose = (0.0, 0.0, 0.0)
+        self.poses = deque(maxlen=400)
+        self.anchor = None          # the person, pinned in the odometry frame
+        self.anchor_captured = None
+        self.last_seen_wall = None
 
     def set_gap(self, _gap):
         return self.gap  # fixed standoff; the follow slider cannot shorten it
+
+    def _pose_at(self, wall_time):
+        """Odometry pose when a camera frame was taken (the newest pose not after it)."""
+        chosen = self.poses[0][1] if self.poses else self.pose
+        for stamp, pose in self.poses:
+            if stamp > wall_time:
+                break
+            chosen = pose
+        return chosen
 
     def observe(self, target):
         self.target = target
@@ -130,15 +160,28 @@ class GroundApproachLoop:
             self.identity = identity
         elif identity != self.identity:
             self.fault = "target-changed"
-        if self.last_target and target.captured > self.last_target.captured:
-            if math.hypot(target.forward - self.last_target.forward,
-                          target.left - self.last_target.left) > 0.4:
-                self.fault = "target-jumped"
-        elif self.last_target and target.captured < self.last_target.captured:
+        if self.anchor_captured is not None and target.captured < self.anchor_captured:
             self.fault = "camera-clock-reset"
+        elif self.anchor_captured is None or target.captured > self.anchor_captured:
+            x, y, heading = self._pose_at(target.captured)
+            cosine, sine = math.cos(heading), math.sin(heading)
+            anchor = (x + cosine * target.forward - sine * target.left,
+                      y + sine * target.forward + cosine * target.left)
+            # Compared where the person lies, not in the base frame: a slow vision
+            # frame while the robot turns moves the base-frame position legitimately.
+            if self.anchor is not None and math.dist(anchor, self.anchor) > TARGET_JUMP:
+                self.fault = "target-jumped"
+            self.anchor, self.anchor_captured = anchor, target.captured
         self.last_target = target
         # A disappearing limb must never reduce the standoff during this attempt.
         self.radius = max(self.radius, target.radius)
+
+    def _pinned(self):
+        """The pinned person in today's base frame: (forward, left)."""
+        x, y, heading = self.pose
+        dx, dy = self.anchor[0] - x, self.anchor[1] - y
+        cosine, sine = math.cos(heading), math.sin(heading)
+        return cosine * dx + sine * dy, -sine * dx + cosine * dy
 
     def tick(self, inp, wall_now):
         cfg, target = self.cfg, self.target
@@ -154,10 +197,26 @@ class GroundApproachLoop:
             self.corridor_points = corridor_count(inp.perception.points, None, cfg)
             self.corridor.update(inp.perception.t, self.corridor_points)
         points_age = math.inf if self.last_points_t is None else inp.t - self.last_points_t
-        age = None if target is None else wall_now - target.captured
-        valid = target is not None and 0 <= age <= TARGET_MAX_AGE
-        clearance = None if target is None else target.distance - self.radius
-        bearing = None if target is None else target.bearing
+        step = dt if 0 < dt <= 0.2 else 0.0
+        x, y, heading = self.pose
+        heading += inp.measured_omega * step
+        self.pose = (x + inp.measured_v * math.cos(heading) * step,
+                     y + inp.measured_v * math.sin(heading) * step, heading)
+        self.poses.append((wall_now, self.pose))
+        if target is not None:
+            self.last_seen_wall = wall_now
+        observed = target is not None
+        age = None if self.anchor_captured is None else wall_now - self.anchor_captured
+        valid = (
+            self.anchor is not None and 0 <= age <= TARGET_MAX_AGE
+            and wall_now - self.last_seen_wall <= TARGET_HOLD
+        )
+        if self.anchor is None:
+            forward = left = clearance = bearing = None
+        else:
+            forward, left = self._pinned()
+            clearance = math.hypot(forward, left) - self.radius
+            bearing = math.atan2(left, forward)
         v_cmd = omega_cmd = 0.0
         rule = "ok"
         if self.fault:
@@ -175,7 +234,8 @@ class GroundApproachLoop:
             if error <= cfg.deadband_range:
                 # Brake first; speak only after wheels have actually settled.
                 rule = "settling"
-                if abs(inp.measured_v) < 0.015 and abs(inp.measured_omega) < 0.04:
+                # Arrival is only ever declared on a pose the camera has just confirmed.
+                if observed and abs(inp.measured_v) < 0.015 and abs(inp.measured_omega) < 0.04:
                     if self.settled_since is None:
                         self.settled_since = inp.t
                     if inp.t - self.settled_since >= 0.6:
@@ -191,7 +251,7 @@ class GroundApproachLoop:
                 # Track uses distance to the body centre, so add the conservative
                 # radius to the desired gap. No target-velocity feedforward: this
                 # mode approaches a ground pose, it does not chase a walking person.
-                track = Track(target.forward, target.left, target.distance, bearing,
+                track = Track(forward, left, math.hypot(forward, left), bearing,
                               v_radial=0.0, age=age)
                 v_cmd, omega_cmd = self.controller.command(track, STANDOFF + self.radius, control_dt)
         verdict = supervise(

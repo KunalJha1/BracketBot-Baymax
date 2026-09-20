@@ -621,6 +621,36 @@ def test_stop_ends_the_check_in_and_snoozes_the_next_one(monkeypatch):
     assert not check_in.start_async()
 
 
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "No.",
+        "Not now.",
+        "Maybe later.",
+        "I don't wanna talk.",
+        "I don't feel like talking.",
+        "I'd rather not.",
+        "Give me some space.",
+        "I need quiet.",
+    ],
+)
+def test_natural_no_talk_answers_are_respected(answer):
+    assert is_dismissal(answer)
+
+
+def test_silence_also_starts_the_quiet_period(monkeypatch):
+    monkeypatch.setattr("check_in.time.sleep", lambda _s: None)
+    check_in, _synthesizer, spoken = check_in_for(
+        [[]], [], FakeLlm(), answer_timeout=0.01, dismiss_snooze=1800
+    )
+
+    check_in.converse()
+
+    assert spoken == [OPENING_LINE, NO_ANSWER_REPLY]
+    assert check_in.quiet_until >= time.monotonic() + 1799
+    assert not check_in.start_async()
+
+
 def test_wake_phrase_hands_the_turn_to_the_voice_assistant(monkeypatch):
     monkeypatch.setattr("check_in.time.sleep", lambda _s: None)
     llm = FakeLlm()
@@ -641,6 +671,8 @@ def test_only_a_whole_answer_dismisses_the_check_in():
     assert is_dismissal("Stop.")
     assert is_dismissal("No, I'm fine, thanks.")
     assert is_dismissal("Okay, stop talking please")
+    assert is_dismissal("Nope")
+    assert is_dismissal("I don't want to chat")
     assert not is_dismissal("I can't stop crying")
     assert not is_dismissal("I'm fine I guess, but my exam went badly")
     assert addresses_assistant("hey, Bracket Bot do a wave")

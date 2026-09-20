@@ -39,27 +39,35 @@ from voice_router import BrowserbaseSearchClient, OpenRouterClient  # noqa: E402
 import speech_relay  # noqa: E402
 
 
-# Short openers keep the first spoken moment quick and stop the robot from
-# saying the exact same sentence every time it reads a frown. The first line
-# matches the recorded ``sad_prompt.wav`` fallback.
+# Short, consent-based openers keep the first spoken moment quick, make it
+# clear that silence/space is a valid answer, and stop the robot from saying
+# the exact same sentence every time it reads a frown.
 OPENING_LINES = (
-    "Hey, why are you sad? What's up?",
-    "Hey, you okay? What's going on?",
-    "You look a little down. What happened?",
-    "Hey. Rough moment? I'm listening.",
-    "That looked like a heavy sigh. What's up?",
+    "Hey, quick check-in. Want to talk, or would you rather have some space?",
+    "Hey, you okay? We can talk, or I can give you some space.",
+    "You seem a little down. Want to talk about it, or should I leave you be?",
+    "Hey. Rough moment? I'm here if you want to talk, and it's okay if you don't.",
+    "Just checking in. Want to talk, or would you rather have some quiet?",
 )
 OPENING_LINE = OPENING_LINES[0]
 FALLBACK_REPLY = "I'm sorry you're feeling down. I'm right here if you want to talk."
 NO_ANSWER_REPLY = "That's okay. I'm here whenever you want to talk."
-DISMISSED_REPLY = "Okay. I'm here if you need me."
+DISMISSED_REPLY = (
+    "Okay. I'll give you some space. Just say Hey BracketBot if you need me."
+)
 # The check-in has no wake word, so without a way out the person is held in it
 # for every remaining turn: "stop" reaches only the voice assistant, which
 # answers "No voice action is running" while Baymax keeps asking follow-ups.
 _DISMISSAL = re.compile(
     r"^(?:no |okay |ok |please |baymax )*"
-    r"(?:stop(?: it| talking| that)?|be quiet|quiet|shut up|go away|"
+    r"(?:no|nah|nope|not (?:now|right now|today)|maybe later|"
+    r"stop(?: it| talking| that)?|be quiet|quiet|shut up|go away|"
     r"leave me alone|never ?mind|that s all|that is all|"
+    r"(?:give|leave) me (?:some )?space|let me be|"
+    r"i (?:want|need) (?:some )?(?:space|quiet)|"
+    r"i (?:would|d) rather not|"
+    r"i (?:do not|don t|dont) (?:really )?(?:want to |wanna |feel like )?"
+    r"(?:talk|talking|chat|chatting)|"
     r"i m (?:fine|okay|ok|good|all right|alright)|"
     r"i am (?:fine|okay|ok|good|all right|alright)|"
     r"no thanks|no thank you|bye|goodbye)"
@@ -83,7 +91,10 @@ CHECK_IN_SYSTEM_PROMPT = (
     "this conversation, so never act out or describe a hug or any other "
     "gesture; if they ask for one, tell them to say \"Hey BracketBot, do a "
     "hug.\" Listen and validate "
-    "their feelings, and when it fits ask one gentle follow-up question. Do "
+    "their feelings. Do not ask a follow-up unless their answer clearly says "
+    "they want to keep talking; if they sound brief, unsure, or reluctant, "
+    "close warmly instead. Ask at most one follow-up question in the entire "
+    "conversation. Do "
     "not diagnose, lecture, or claim to know how they feel; the camera cue "
     "can be wrong, so if they say they are fine, accept it kindly. If they "
     "mention wanting to hurt themselves or being in danger, tell them you "
@@ -154,7 +165,7 @@ class SadCheckIn:
         mic_config,
         open_speaker: Callable[[], Any],
         open_mic: Callable[[], Any],
-        max_turns: int = 3,
+        max_turns: int = 2,
         answer_timeout: float = 8.0,
         mic_gain: float = 3.0,
         volume: float = 1.0,
@@ -162,7 +173,7 @@ class SadCheckIn:
         trailing_silence: float = 0.7,
         max_utterance: float = 12.0,
         speaker_drain: float = 0.4,
-        dismiss_snooze: float = 300.0,
+        dismiss_snooze: float = 1800.0,
         openings: Sequence[str] = OPENING_LINES,
         show_led: Callable[[str | None], None] = lambda status: None,
         log: Callable[[str], None] = lambda line: print(line, flush=True),
@@ -183,8 +194,9 @@ class SadCheckIn:
         self.max_utterance = max_utterance
         self.speaker_drain = speaker_drain
         self.dismiss_snooze = dismiss_snooze
-        # No new check-in starts before this; set when the person sends Baymax
-        # away so the same resting face does not reopen the conversation.
+        # No new check-in starts before this. Every completed check-in gets a
+        # quiet period, whether the person talks, declines, or stays silent,
+        # so one expression cannot turn into a loop of interruptions.
         self.quiet_until = 0.0
         self.openings = tuple(openings) or (OPENING_LINE,)
         self.show_led = show_led
@@ -373,11 +385,9 @@ class SadCheckIn:
                     return
                 self.log(f"[check-in] Heard: {answer}")
                 if addresses_assistant(answer):
-                    self.quiet_until = time.monotonic() + self.dismiss_snooze
                     self.log("[check-in] Wake phrase heard; leaving it to the assistant")
                     return
                 if is_dismissal(answer):
-                    self.quiet_until = time.monotonic() + self.dismiss_snooze
                     self.speak(DISMISSED_REPLY)
                     self.log("[check-in] Dismissed; ending conversation")
                     return
@@ -396,6 +406,12 @@ class SadCheckIn:
             # A failed provider must end only this conversation, never vision.
             self.log(f"[check-in] Conversation failed: {type(exc).__name__}: {exc}")
         finally:
+            # A check-in should never immediately chase the person with a new
+            # one. The regular wake-word assistant remains available during
+            # this frown-triggered quiet period.
+            self.quiet_until = max(
+                self.quiet_until, time.monotonic() + self.dismiss_snooze
+            )
             self.status = "idle"
             self.lock.release()
 
@@ -441,6 +457,7 @@ def build_check_in(args, Config, Reader, Type, Writer) -> SadCheckIn:
         open_mic=lambda: Reader("mic.audio", keeptime=False),
         max_turns=args.check_in_turns,
         answer_timeout=args.check_in_answer_timeout,
+        dismiss_snooze=args.check_in_quiet_seconds,
         mic_gain=args.mic_gain,
         trailing_silence=args.check_in_trailing_silence,
         show_led=speech_relay.post_led_status,

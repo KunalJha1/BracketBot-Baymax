@@ -104,14 +104,44 @@ def test_aligns_before_forward_motion():
     assert out.omega < 0
 
 
-@pytest.mark.parametrize("failure", ["missing", "stale", "points", "obstacle", "stop", "heartbeat", "tilt"])
+def test_a_dropped_detection_is_bridged_briefly_then_stops_the_robot():
+    loop, before = moving_loop(0.4)
+    out = tick(loop, 2.52, None)
+    assert out.rule == "ok" and out.v > 0 and out.omega > 0   # one missed frame: keep going
+    for i in range(2, 60):
+        out = tick(loop, 2.5 + i * 0.02, None)
+    assert out.rule == "target-unavailable"                  # over TARGET_HOLD without a sighting
+    assert out.v == out.omega == 0
+    assert not loop.arrived
+
+
+def test_pinned_target_tracks_wheel_odometry_between_vision_frames():
+    loop = GroundApproachLoop(approach_config())
+    seen = target(0, forward=3.0, left=0.0)
+    out = tick(loop, 0, seen)
+    for i in range(1, 51):                                   # 1 s, same camera frame re-read
+        out = tick(loop, i * 0.02, seen, measured_v=0.05, measured_omega=0.1)
+    assert out.rule == "ok"
+    assert out.bearing == pytest.approx(-0.1, abs=0.01)      # turned left 0.1 rad: target now to the right
+    assert out.range == pytest.approx(3.0 - 0.05 - 0.8, abs=0.01)
+
+
+def test_turning_under_slow_vision_is_not_mistaken_for_a_jump():
+    loop = GroundApproachLoop(approach_config())
+    tick(loop, 0, target(0, forward=3.0, left=0.0))
+    for i in range(1, 76):
+        tick(loop, i * 0.02, target(0, forward=3.0, left=0.0), measured_omega=0.2)
+    # 1.5 s later the body is 0.9 m to the right in the base frame, exactly as odometry predicts.
+    out = tick(loop, 1.52, target(1.52, forward=3.0 * math.cos(0.3), left=-3.0 * math.sin(0.3)), measured_omega=0.2)
+    assert loop.fault is None and out.rule == "ok"
+
+
+@pytest.mark.parametrize("failure", ["stale", "points", "obstacle", "stop", "heartbeat", "tilt"])
 def test_hazards_zero_both_commands_immediately(failure):
     loop, before = moving_loop(0.4)
     assert before.v > 0 and before.omega > 0
     kwargs = {}
-    if failure == "missing":
-        kwargs["observation"] = None
-    elif failure == "stale":
+    if failure == "stale":
         kwargs["observation"] = target(0, left=0.4)
     elif failure == "points":
         kwargs["points"] = False
@@ -233,7 +263,7 @@ def test_saturation_and_hazard_cannot_leave_integral_or_derivative_history():
         t = 2 + i * 0.02
         tick(loop, t, target(t, forward=3 - i * 0.011, left=0.2))
     assert loop.controller.bearing_pid.integral > 0
-    out = tick(loop, 4, None)
+    out = tick(loop, 4, target(4, forward=3 - 1.1, left=0.2), points=np.tile([0.5, 0, 0.08], (30, 1)))
     assert out.v == out.omega == 0
     for pid in (loop.controller.range_pid, loop.controller.bearing_pid):
         assert pid.integral == pid.rate == 0

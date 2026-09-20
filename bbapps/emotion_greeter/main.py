@@ -1878,7 +1878,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="play the recorded prompt instead of a spoken LLM check-in",
     )
-    parser.add_argument("--check-in-turns", type=int, default=3)
+    parser.add_argument(
+        "--check-in-turns",
+        type=int,
+        default=2,
+        help="maximum answers in one check-in (default: 2, so at most one follow-up)",
+    )
     parser.add_argument(
         "--check-in-answer-timeout",
         type=float,
@@ -1890,6 +1895,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.7,
         help="silence that ends an answer and starts Baymax's reply",
+    )
+    parser.add_argument(
+        "--check-in-quiet-seconds",
+        type=float,
+        default=1800.0,
+        help="seconds without another automatic check-in after one ends",
     )
     parser.add_argument("--env", type=Path, default=SCRIPT_DIR.parent / ".env")
     parser.add_argument("--mic-gain", type=float, default=3.0)
@@ -1956,6 +1967,8 @@ def main() -> int:
         )
     if args.check_in_trailing_silence <= 0:
         raise SystemExit("--check-in-trailing-silence must be greater than zero")
+    if args.check_in_quiet_seconds < 0:
+        raise SystemExit("--check-in-quiet-seconds cannot be negative")
     for name in ("sad_hold_seconds", "sad_cooldown", "sad_reset_seconds"):
         if getattr(args, name) < 0:
             raise SystemExit(f"--{name.replace('_', '-')} cannot be negative")

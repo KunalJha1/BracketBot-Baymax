@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import datetime, time as dt_time, timedelta
 from enum import Enum
 import hashlib
 from http import client as http_client
@@ -22,6 +23,12 @@ import threading
 import time
 from typing import Callable
 from urllib import error, request
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+try:
+    from .reminders import default_timezone_name
+except ImportError:
+    from reminders import default_timezone_name
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -140,6 +147,9 @@ class RouteDecision:
     action: str | None = None
     reply: str | None = None
     action_started: bool | None = None
+    # The reply is a question; the assistant should listen for the answer
+    # without a second wake phrase and pass it to ``route_follow_up``.
+    expects_reply: bool = False
 
 
 @dataclass(frozen=True)
@@ -157,6 +167,12 @@ class ReminderRequest:
     kind: str
     delay_seconds: float
     message: str | None = None
+    # How the message attaches to "remind you": "to call mom", "that the oven
+    # is on", "about the meeting".
+    connector: str = "to"
+    # Spoken wall-clock time ("5:30 PM tomorrow") when the person named a time
+    # rather than a delay, so the confirmation can repeat what was understood.
+    due_text: str | None = None
 
 
 _NUMBER_WORDS = {
@@ -186,34 +202,152 @@ _NUMBER_WORDS = {
     "forty": 40,
     "fifty": 50,
     "sixty": 60,
+    "seventy": 70,
+    "eighty": 80,
+    "ninety": 90,
+}
+_VAGUE_COUNTS = {"a couple": 2, "a couple of": 2, "a few": 3}
+
+_ONES = "one|two|three|four|five|six|seven|eight|nine"
+_TENS = "twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety"
+_COUNT = (
+    rf"(?:\d+|a couple(?: of)?|a few|(?:{_TENS}) (?:{_ONES})|"
+    + "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True))
+    + ")"
+)
+_UNIT = r"(?:seconds?|secs?|minutes?|mins?|hours?|hrs?)"
+_DURATION_PART = rf"{_COUNT}(?: and a half)? {_UNIT}(?: and a half)?"
+_DURATION = (
+    rf"(?:half an? hour|{_DURATION_PART}(?:(?: and)? {_DURATION_PART})?)"
+)
+_DURATION_PART_GROUPS = re.compile(
+    rf"(?P<count>{_COUNT})(?P<half_before> and a half)? "
+    rf"(?P<unit>{_UNIT})(?P<half_after> and a half)?"
+)
+
+_HOUR_WORDS = "one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve"
+_MINUTE_WORDS = (
+    rf"(?:oh (?:{_ONES})|(?:twenty|thirty|forty|fifty) (?:{_ONES})|"
+    r"ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
+    r"nineteen|twenty|thirty|forty|fifty)"
+)
+_DAY = r"(?:tomorrow|today|tonight)"
+_DAY_PART = r"(?:morning|afternoon|evening|night)"
+# "at 5", "at 5 30 pm", "at five thirty", "at noon", "tomorrow at 9 am",
+# "at 7 in the morning". Normalization has already turned "5:30 p.m." into
+# "5 30 p m".
+_CLOCK = (
+    rf"(?:(?P<day_before>{_DAY}) (?:{_DAY_PART} )?)?"
+    r"(?:__PREP__) "
+    rf"(?:(?P<named>noon|midnight|midday)|"
+    rf"(?P<hour>\d{{1,2}}|{_HOUR_WORDS})"
+    rf"(?: (?P<minute>\d{{2}}|{_MINUTE_WORDS}))?(?: o'?clock)?"
+    r"(?: ?(?P<meridiem>am|pm|a m|p m))?)"
+    rf"(?: (?:in the |this |at )?(?P<day_part>{_DAY_PART}))?"
+    rf"(?: (?P<day_after>{_DAY})(?: {_DAY_PART})?)?"
+)
+# A day with no clock time gets a stated default hour; the confirmation says
+# the time back so a wrong guess is heard immediately.
+_DAY_ONLY = (
+    r"(?P<day_only>tomorrow(?: (?:morning|afternoon|evening|night))?|tonight|"
+    r"this (?:afternoon|evening))"
+)
+_DAY_ONLY_HOURS = {
+    "tomorrow": 9,
+    "tomorrow morning": 9,
+    "tomorrow afternoon": 15,
+    "tomorrow evening": 19,
+    "tomorrow night": 20,
+    "tonight": 20,
+    "this afternoon": 15,
+    "this evening": 19,
 }
 
-_REMINDER_REQUEST = re.compile(
-    r"^(?:remind me|set (?:me )?(?:a )?reminder) in "
-    r"(?P<amount>[a-z0-9 -]+?) (?P<unit>seconds?|minutes?|hours?) "
-    r"(?:to|that) (?P<message>.+)$"
+_REMINDER_LEAD = (
+    r"(?:(?:can|could|will|would) you )?(?:please )?"
+    r"(?:remind me|(?:set|make|create|add|give)(?: me)?(?: up)? (?:a |an |another )?reminder|"
+    r"i (?:need|want|would like|'d like) (?:a |an |another )?reminder|"
+    r"i (?:need|want) you to remind me)"
 )
-_TIMER_REQUEST = re.compile(
-    r"^(?:set|start) (?:a )?timer (?:for )?"
-    r"(?P<amount>[a-z0-9 -]+?) (?P<unit>seconds?|minutes?|hours?)$"
+_CONNECTOR = r"(?P<connector>to|that|about)"
+_WHEN_LEADING = (
+    rf"(?:(?:in|for) (?P<duration>{_DURATION})(?: from now)?|"
+    + _CLOCK.replace("__PREP__", "at|for|by|around")
+    + rf"|{_DAY_ONLY})"
+)
+# Only "at" may introduce a trailing clock time: "buy gifts for 5" and "be done
+# by 2" are part of the message, not a schedule.
+_WHEN_TRAILING = (
+    rf"(?:in (?P<duration>{_DURATION})(?: from now)?|"
+    + _CLOCK.replace("__PREP__", "at|around")
+    + rf"|{_DAY_ONLY})"
+)
+_REMINDER_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        # "remind me in 5 minutes to call mom"
+        rf"^{_REMINDER_LEAD} {_WHEN_LEADING} {_CONNECTOR} (?P<message>.+)$",
+        # "remind me to call mom in 5 minutes"
+        rf"^{_REMINDER_LEAD} {_CONNECTOR} (?P<message>.+) {_WHEN_TRAILING}$",
+        # "in 5 minutes remind me to call mom"
+        rf"^{_WHEN_LEADING} {_REMINDER_LEAD} {_CONNECTOR} (?P<message>.+)$",
+    )
+)
+_WAKE_UP_REQUEST = re.compile(rf"^wake me(?: up)? {_WHEN_LEADING}$")
+_TIMER_NOUN = r"(?:timer|countdown|alarm)"
+_TIMER_VERB = r"(?:(?:can|could|will|would) you )?(?:set|start|begin|put on|give me|make|create)"
+_TIMER_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        # "set a timer for four minutes", "start a countdown of 30 seconds"
+        rf"^(?:{_TIMER_VERB} )?(?:me )?(?:a |an |the |another )?{_TIMER_NOUN} "
+        rf"(?:for |of |in )?(?P<duration>{_DURATION})(?: from now)?$",
+        # "set a 5 minute timer", "ten minute timer"
+        rf"^(?:{_TIMER_VERB} )?(?:me )?(?:a |an |another )?(?P<duration>{_DURATION}) "
+        rf"{_TIMER_NOUN}$",
+        # "set an alarm for 7 am"
+        rf"^(?:{_TIMER_VERB} )?(?:me )?(?:a |an |the |another )?{_TIMER_NOUN} "
+        + _CLOCK.replace("__PREP__", "for|at")
+        + "$",
+    )
+)
+_REMINDER_INTENT = re.compile(
+    rf"^{_REMINDER_LEAD}(?: {_CONNECTOR} (?P<message>.+))?$"
+)
+_TIMER_INTENT = re.compile(
+    rf"^(?:{_TIMER_VERB} )?(?:me )?(?:a |an |the |another )?{_TIMER_NOUN}$"
 )
 REMINDER_CANCEL_ALIASES = frozenset(
     {
-        "cancel my reminder",
-        "cancel the reminder",
-        "cancel all reminders",
-        "cancel my timer",
-        "cancel the timer",
-        "cancel all timers",
+        f"{verb} {what}"
+        for verb in ("cancel", "delete", "clear", "remove")
+        for what in (
+            "my reminder", "the reminder", "my reminders", "the reminders",
+            "all reminders", "all my reminders", "reminders",
+            "my timer", "the timer", "my timers", "the timers", "all timers",
+            "all my timers", "my alarm", "the alarm", "my alarms", "all alarms",
+        )
     }
 )
 REMINDER_LIST_ALIASES = frozenset(
     {
         "list my reminders",
         "list reminders",
+        "list my timers",
+        "show my reminders",
+        "show me my reminders",
+        "read my reminders",
+        "tell me my reminders",
         "what are my reminders",
+        "what are my timers",
         "what reminders do i have",
+        "what timers do i have",
         "do i have any reminders",
+        "do i have any timers",
+        "do i have a reminder",
+        "do i have a timer",
+        "what reminders are set",
+        "what timers are set",
     }
 )
 
@@ -224,33 +358,177 @@ def _parse_spoken_number(value: str) -> float | None:
         return float(value)
     except ValueError:
         pass
+    if value in _VAGUE_COUNTS:
+        return float(_VAGUE_COUNTS[value])
     words = value.split()
+    if words and words[0] == "oh":
+        words = words[1:]
     if not words or any(word not in _NUMBER_WORDS for word in words):
         return None
     if len(words) == 1:
         return float(_NUMBER_WORDS[words[0]])
-    if len(words) == 2 and _NUMBER_WORDS[words[0]] >= 20:
+    if len(words) == 2 and _NUMBER_WORDS[words[0]] >= 20 and _NUMBER_WORDS[words[1]] < 10:
         return float(_NUMBER_WORDS[words[0]] + _NUMBER_WORDS[words[1]])
     return None
 
 
-def match_reminder_request(text: str) -> ReminderRequest | None:
+def _parse_duration(text: str) -> float | None:
+    """Seconds in "two and a half hours", "1 hour 30 mins", "half an hour"."""
+    if re.fullmatch(r"half an? hour", text):
+        return 1800.0
+    total = 0.0
+    parts = list(_DURATION_PART_GROUPS.finditer(text))
+    if not parts:
+        return None
+    for part in parts:
+        count = _parse_spoken_number(part.group("count"))
+        if count is None:
+            return None
+        if part.group("half_before") or part.group("half_after"):
+            count += 0.5
+        unit = part.group("unit")
+        total += count * (1 if unit.startswith("s") else 60 if unit.startswith("m") else 3600)
+    return total
+
+
+def _local_now(timezone_name: str | None) -> datetime:
+    try:
+        return datetime.now(ZoneInfo(timezone_name or default_timezone_name()))
+    except ZoneInfoNotFoundError:
+        return datetime.now().astimezone()
+
+
+def _clock_text(due: datetime, now: datetime) -> str:
+    hour = due.hour % 12 or 12
+    text = f"{hour}:{due.minute:02d}" if due.minute else f"{hour}"
+    text += " AM" if due.hour < 12 else " PM"
+    days = (due.date() - now.date()).days
+    if days == 1:
+        text += " tomorrow"
+    return text
+
+
+def _resolve_clock(match: re.Match, now: datetime) -> datetime | None:
+    """Turn a matched wall-clock phrase into the next matching local time."""
+    groups = match.groupdict()
+    day_only = groups.get("day_only")
+    if day_only:
+        day = now.date() + timedelta(days=1 if day_only.startswith("tomorrow") else 0)
+        due = datetime.combine(day, dt_time(_DAY_ONLY_HOURS[day_only]), now.tzinfo)
+        return due if due > now else None
+
+    day_word = groups.get("day_before") or groups.get("day_after")
+    day_part = groups.get("day_part")
+    if day_word == "tonight":
+        day_part = day_part or "night"
+    meridiem = (groups.get("meridiem") or "").replace(" ", "")
+    if not meridiem and day_part:
+        meridiem = "am" if day_part == "morning" else "pm"
+
+    named = groups.get("named")
+    if named:
+        hours, minute = ([0] if named == "midnight" else [12]), 0
+    else:
+        hour_value = _parse_spoken_number(groups["hour"])
+        minute_value = _parse_spoken_number(groups["minute"]) if groups.get("minute") else 0.0
+        if hour_value is None or minute_value is None:
+            return None
+        hour, minute = int(hour_value), int(minute_value)
+        if hour > 23 or minute > 59 or (meridiem and not 1 <= hour <= 12):
+            return None
+        if meridiem == "pm" and hour == 12 and day_part == "night":
+            hours = [0]  # "12 tonight" is midnight
+        elif meridiem:
+            hours = [hour % 12 + (12 if meridiem == "pm" else 0)]
+        elif hour == 0 or hour > 12:
+            hours = [hour]
+        else:
+            hours = sorted({hour % 12, hour % 12 + 12})
+
+    tomorrow = now.date() + timedelta(days=1)
+    if day_word == "tomorrow":
+        if len(hours) == 2:
+            # An unqualified "tomorrow at 9" is the morning; "tomorrow at 3"
+            # is the afternoon.
+            hours = [hours[0] if 7 <= hours[0] <= 11 else hours[1]]
+        return datetime.combine(tomorrow, dt_time(hours[0], minute), now.tzinfo)
+    candidates = [
+        datetime.combine(day, dt_time(hour, minute), now.tzinfo)
+        for day in (now.date(), tomorrow)
+        for hour in hours
+    ]
+    upcoming = [due for due in candidates if due > now]
+    return min(upcoming) if upcoming else None
+
+
+def _when(match: re.Match, now: datetime) -> tuple[float, str | None] | None:
+    duration = match.groupdict().get("duration")
+    if duration:
+        seconds = _parse_duration(duration)
+        return None if seconds is None else (seconds, None)
+    due = _resolve_clock(match, now)
+    if due is None:
+        return None
+    return due.timestamp() - now.timestamp(), _clock_text(due, now)
+
+
+def match_reminder_request(
+    text: str,
+    *,
+    now: datetime | None = None,
+    timezone_name: str | None = None,
+) -> ReminderRequest | None:
     """Parse the bounded spoken reminder grammar without consulting the LLM."""
     normalized = normalize_utterance(text)
-    match = _REMINDER_REQUEST.fullmatch(normalized)
-    kind = "reminder"
-    if match is None:
-        match = _TIMER_REQUEST.fullmatch(normalized)
-        kind = "timer"
+    if now is None:
+        now = _local_now(timezone_name)
+    for pattern in _REMINDER_PATTERNS:
+        match = pattern.fullmatch(normalized)
+        if match is None:
+            continue
+        when = _when(match, now)
+        if when is None:
+            continue
+        return ReminderRequest(
+            "reminder", when[0], match.group("message"), match.group("connector"), when[1]
+        )
+    match = _WAKE_UP_REQUEST.fullmatch(normalized)
+    if match is not None:
+        when = _when(match, now)
+        if when is not None:
+            return ReminderRequest("reminder", when[0], "wake up", "to", when[1])
+    for pattern in _TIMER_PATTERNS:
+        match = pattern.fullmatch(normalized)
+        if match is None:
+            continue
+        when = _when(match, now)
+        if when is not None:
+            return ReminderRequest("timer", when[0], None, "to", when[1])
+    return None
+
+
+def reminder_clarification(text: str) -> str | None:
+    """The question to ask back when a reminder or timer request has no time.
+
+    A pause after "remind me" often ends the turn early, so a half-finished
+    request is normal speech rather than an error.
+    """
+    if match_reminder_request(text) is not None:
+        return None
+    normalized = normalize_utterance(text)
+    if _TIMER_INTENT.fullmatch(normalized):
+        return "Sure. For how long?"
+    match = _REMINDER_INTENT.fullmatch(normalized)
     if match is None:
         return None
-    amount = _parse_spoken_number(match.group("amount"))
-    if amount is None:
-        return None
-    unit = match.group("unit")
-    multiplier = 1 if unit.startswith("second") else 60 if unit.startswith("minute") else 3600
-    message = match.groupdict().get("message")
-    return ReminderRequest(kind, amount * multiplier, message)
+    if match.group("message"):
+        return "Sure. When should I remind you?"
+    return "Sure. What should I remind you about, and when?"
+
+
+def is_reminder_request_without_time(text: str) -> bool:
+    """True for "remind me to call mom": clear intent, but no usable time."""
+    return reminder_clarification(text) is not None
 
 
 # Keep this deliberately explicit. Adding an alias here is what grants spoken
@@ -1511,8 +1789,10 @@ class VoiceRouter:
         reminder_executor: Callable[[ReminderRequest], tuple[bool, str]] | None = None,
         reminder_cancel_executor: Callable[[], tuple[bool, str]] | None = None,
         reminder_list_executor: Callable[[], tuple[bool, str]] | None = None,
+        reminder_timezone: str | None = None,
     ):
         self.llm = llm
+        self.reminder_timezone = reminder_timezone
         self.action_executor = action_executor
         self.stop_executor = stop_executor
         self.reminder_executor = reminder_executor
@@ -1554,6 +1834,28 @@ class VoiceRouter:
         if self.action_executor is None:
             return None, self._action_reply(action)
         return self.action_executor(action)
+
+    def route_follow_up(self, previous: str, utterance: str) -> RouteDecision:
+        """Route the answer to a clarifying question asked about ``previous``.
+
+        "Remind me to call mom" + "five minutes" is one request. Anything that
+        does not complete it is routed as a fresh utterance.
+        """
+        for joiner in (" ", " in ", " at ", " to "):
+            combined = f"{previous.strip(' .!?')}{joiner}{utterance}"
+            if (
+                match_reminder_request(combined, timezone_name=self.reminder_timezone)
+                is not None
+            ):
+                return self.route(combined)
+        combined = f"{previous.strip(' .!?')} {utterance}"
+        if reminder_clarification(combined) not in (
+            None,
+            reminder_clarification(previous),
+        ):
+            # "Remind me" + "to call mom": closer, but still missing the time.
+            return self.route(combined)
+        return self.route(utterance)
 
     def route(self, utterance: str) -> RouteDecision:
         utterance = utterance.strip()
@@ -1608,7 +1910,20 @@ class VoiceRouter:
                 action_started=listed,
             )
 
-        reminder = match_reminder_request(utterance)
+        reminder = match_reminder_request(
+            utterance, timezone_name=self.reminder_timezone
+        )
+        clarification = None if reminder is not None else reminder_clarification(utterance)
+        if clarification is not None:
+            # Asking the LLM would produce a promise nothing schedules.
+            return RouteDecision(
+                RouteKind.QUESTION,
+                utterance,
+                action="reminder",
+                reply=clarification,
+                action_started=False,
+                expects_reply=True,
+            )
         if reminder is not None:
             if self.reminder_executor is None:
                 started, status = False, "Reminders are unavailable right now."

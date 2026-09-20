@@ -20,7 +20,8 @@ Torque is never cut while an object is held.
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+import json
 import math
 import os
 import queue
@@ -152,6 +153,8 @@ LEAN_STEP_DEGREES = 2.0
 # Placing into a container: hold the object this far above its rim before
 # opening, so the jaws clear the walls and the drop is short.
 PLACE_CLEAR_RIM_METRES = 0.07    # the object's base passes this far above the rim
+PLACE_MIN_RIM_METRES = 0.03      # the least the object's base may clear the rim by
+PREGRASP_NEAR_BACKOFF_METRES = 0.05  # shorter hover for objects close to the body
 PLACE_SINK_METRES = 0.035        # fallback: let the carry sink this much (< the rim clearance)
 PLACE_INSIDE_WALL_METRES = 0.08  # release at least this far inside the walls
 SCAN_SPREAD_METRES = 0.05
@@ -170,6 +173,92 @@ shutdown_event = threading.Event()
 
 def log(stage, message):
     print(f"[pick][{stage}] {message}", flush=True)
+
+
+SOUNDS_DIR = Path(__file__).resolve().parent / "sounds"
+
+
+def speak(name):
+    """Say one pre-rendered line (sounds/NAME.wav) without holding up the arm.
+
+    Speech is a courtesy: a missing file, a busy speaker or any other trouble
+    is logged and ignored, and the pick carries on.
+    """
+
+    def play_mixed():
+        """PulseAudio mixes this in beside whatever else is talking.
+
+        The always-on voice assistant keeps the one ``speaker.audio`` writer,
+        so that channel is usually taken.
+        """
+        import shutil
+        import subprocess
+
+        if shutil.which("paplay") is None:
+            return False
+        env = dict(os.environ, XDG_RUNTIME_DIR=os.environ.get(
+            "XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+        try:
+            sinks = subprocess.run(["pactl", "list", "short", "sinks"], env=env, text=True,
+                                   capture_output=True, timeout=3).stdout.splitlines()
+            sink = next((line.split("\t")[1] for line in sinks
+                         if "speakerphone" in line.lower()), None)
+            command = ["paplay"] + ([f"--device={sink}"] if sink else [])
+            return subprocess.run(command + [str(SOUNDS_DIR / f"{name}.wav")], env=env,
+                                  capture_output=True, timeout=15).returncode == 0
+        except (OSError, subprocess.SubprocessError, IndexError):
+            return False
+
+    def play():
+        import wave
+
+        if play_mixed():
+            return
+        try:
+            _, Config, _, Type, Writer = tr._load_bbos()
+            cfg = Config("speaker")
+            with wave.open(str(SOUNDS_DIR / f"{name}.wav"), "rb") as source:
+                if source.getframerate() != cfg.sample_rate or source.getsampwidth() != 2:
+                    raise RuntimeError(f"{name}.wav is not 16-bit at {cfg.sample_rate} Hz")
+                channels = source.getnchannels()
+                # The schema's timing paces chunks to the speaker sample clock.
+                with Writer("speaker.audio", Type("speaker_audio")) as speaker:
+                    time.sleep(0.25)
+                    while True:
+                        raw = source.readframes(cfg.chunk_size)
+                        if not raw:
+                            break
+                        samples = np.frombuffer(raw, dtype="<i2").reshape(-1, channels)
+                        if channels == 1 and cfg.channels > 1:
+                            samples = np.repeat(samples, cfg.channels, axis=1)
+                        elif channels != cfg.channels:
+                            samples = samples.mean(axis=1).astype(np.int16)[:, None]
+                        if len(samples) < cfg.chunk_size:
+                            samples = np.concatenate((samples, np.zeros(
+                                (cfg.chunk_size - len(samples), cfg.channels), dtype=np.int16)))
+                        with speaker.buf() as frame:
+                            frame["audio"] = samples
+        except Exception as exc:  # noqa: BLE001 - never let speech break a pick
+            log("say", f"could not say '{name}': {exc}")
+
+    if not speak.enabled:
+        return
+    log("say", name)
+    with speak.lock:
+        previous = speak.thread
+
+        def after_previous():
+            if previous is not None:
+                previous.join()  # one line at a time: the speaker has one writer
+            play()
+
+        speak.thread = threading.Thread(target=after_previous, name="say", daemon=True)
+        speak.thread.start()
+
+
+speak.enabled = True
+speak.lock = threading.Lock()
+speak.thread = None
 
 
 class Deferred:
@@ -259,7 +348,7 @@ def grasp_orientation(pitch_degrees, yaw):
 
 
 def grasp_waypoints(item, side, pitch_degrees, table_height_at, yaw_fraction=1.0,
-                    lift_metres=None):
+                    lift_metres=None, backoff=None):
     """Pregrasp, grasp and lift positions plus the grasp quaternion.
 
     ``yaw_fraction`` scales the approach heading between straight ahead (0)
@@ -281,7 +370,8 @@ def grasp_waypoints(item, side, pitch_degrees, table_height_at, yaw_fraction=1.0
         max(MIN_GRASP_ABOVE_TABLE + tip_drop, item.top - GRASP_BELOW_TOP_METRES),
     ))
     grasp = np.array([cx, cy, table_z + grasp_height]) + GRASP_TIP_PAST_AXIS_METRES * approach
-    pregrasp = grasp - PREGRASP_BACKOFF_METRES * approach + np.array([0.0, 0.0, PREGRASP_RAISE_METRES])
+    backoff = PREGRASP_BACKOFF_METRES if backoff is None else backoff
+    pregrasp = grasp - backoff * approach + np.array([0.0, 0.0, PREGRASP_RAISE_METRES])
     lift = grasp + np.array([0.0, 0.0, LIFT_METRES if lift_metres is None else lift_metres])
     return pregrasp, grasp, lift, quaternion
 
@@ -569,7 +659,7 @@ def lift_for_box(box):
     return LIFT_METRES if box is None else max(LIFT_METRES, box.top + PLACE_CLEAR_RIM_METRES)
 
 
-def place_candidates(box, lift_point, pitch_degrees, yaw, already_placed=0):
+def place_candidates(box, lift_point, pitch_degrees, yaw, already_placed=0, allow_sink=True):
     """Release poses to try, best first: ``(position, quaternion, description)``.
 
     The object is carried level at the lift height (its base already clears
@@ -598,7 +688,7 @@ def place_candidates(box, lift_point, pitch_degrees, yaw, already_placed=0):
     # The lift height is near the top of the arm's travel, where few poses
     # solve; as a fallback the carry may sink a little on the way over. The
     # object's base still clears the rim (PLACE_CLEAR_RIM_METRES is larger).
-    for sink in (0.0, PLACE_SINK_METRES):
+    for sink in (0.0, PLACE_SINK_METRES) if allow_sink else (0.0,):
         for pitch in pitches:
             quaternion, _ = grasp_orientation(pitch, yaw)
             for spot in spots:
@@ -671,7 +761,8 @@ def ordered_options(pitches, remembered=None):
     return options
 
 
-def plan_pick(cfg, start, side, item, plane, pitch, yaw_fraction=1.0, lift_metres=None):
+def plan_pick(cfg, start, side, item, plane, pitch, yaw_fraction=1.0, lift_metres=None,
+              backoff=None):
     """Full validated motor path plus the indices where each phase ends."""
 
     lateral = SHOULDER_LATERAL_METRES if side == "left" else -SHOULDER_LATERAL_METRES
@@ -685,7 +776,7 @@ def plan_pick(cfg, start, side, item, plane, pitch, yaw_fraction=1.0, lift_metre
     # further from the robot than it does straight ahead.
     raise_observation = dict(observation, near_edge=plane.near_edge_at(lateral))
     pregrasp, grasp, lift, grasp_quaternion = grasp_waypoints(
-        item, side, pitch, plane.height_at, yaw_fraction, lift_metres)
+        item, side, pitch, plane.height_at, yaw_fraction, lift_metres, backoff)
     log(
         "plan",
         f"side={side} raise_edge={raise_observation['near_edge']:.3f} "
@@ -1037,6 +1128,9 @@ def scan(Reader, frames=5, timeout=12.0):
             if float(np.max(np.ptp(centres, axis=0))) <= SCAN_SPREAD_METRES:
                 plane, item = combine_picks(picks[-frames:])
                 scan.others = merge_candidates(sightings[-frames:], skip=item)
+                log("scan", f"{len(sightings[-1])} graspable in the last frame, "
+                            f"{len(scan.others)} steady besides the target: " + ", ".join(
+                                f"({o.center[0]:.2f}, {o.center[1]:.2f})" for o in scan.others))
                 return plane, item
             # The recent frames disagree (robot still settling, or the lock
             # landed on noise): slide the window and re-aim an automatic lock
@@ -1313,6 +1407,41 @@ def nearest_target_distance(Reader):
     return None
 
 
+TELEOP_RELAY = ("127.0.0.1", 8765)  # scripts/robot_teleop.py RELAY_PORT
+
+
+@contextmanager
+def drive_channel(Type, Writer):
+    """Yields ``twist(v)`` for straight base moves, however the base is owned.
+
+    bbos allows one ``drive.ctrl`` writer. When the WASD teleop runner already
+    holds it, the twist goes to that runner's robot-local relay instead, which
+    applies its own clamps and deadman and lets a held key override it.
+    """
+
+    try:
+        manager = tr.nonsuppressing(Writer("drive.ctrl", Type("drive_ctrl"), keeptime=False))
+        drive = manager.__enter__()
+    except Exception as exc:  # noqa: BLE001 - bbos raises a bare Exception for a taken topic
+        if "already exists" not in str(exc):
+            raise
+        import socket
+
+        log("space", f"drive.ctrl is held by the teleop runner; using its relay ({exc})")
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as relay:
+            yield lambda v: relay.sendto(
+                json.dumps({"v": float(v), "w": 0.0}).encode(), TELEOP_RELAY)
+        return
+    try:
+        def twist(v):
+            with drive.buf() as frame:
+                frame["twist"] = np.array([v, 0.0], dtype=np.float32)
+
+        yield twist
+    finally:
+        manager.__exit__(None, None, None)
+
+
 def auto_space(Reader, Type, Writer):
     """Back the base up until the target sits at a comfortable grasp distance.
 
@@ -1328,12 +1457,7 @@ def auto_space(Reader, Type, Writer):
     log("space", f"target is {distance:.3f} m ahead (want >= {SPACE_MIN_OBJECT_METRES:.2f})")
     if distance >= SPACE_MIN_OBJECT_METRES:
         return
-    with tr.nonsuppressing(Writer("drive.ctrl", Type("drive_ctrl"), keeptime=False)) as drive:
-
-        def twist(v):
-            with drive.buf() as frame:
-                frame["twist"] = np.array([v, 0.0], dtype=np.float32)
-
+    with drive_channel(Type, Writer) as twist:
         try:
             for pulse in range(1, SPACE_MAX_PULSES + 1):
                 if cancel_event.is_set() or distance >= SPACE_GOAL_OBJECT_METRES:
@@ -1475,22 +1599,35 @@ def execute(plan_only=True, pid_file=None, stop_at=None, adjust=False,
         """
         space_if_needed()
         kept_box, placed, failures = None, 0, 0
-        pick_with.placed = 0
+        pick_with.placed = pick_with.skipped = 0
         while not cancel_event.is_set():
             scan.filled_box = kept_box
             try:
                 plane, item = scan(Reader)
             except RuntimeError as exc:
                 if placed or failures:
+                    speak("out-of-reach" if pick_with.skipped else "done" if placed else "none")
                     log("complete", f"nothing more to pick ({exc}); delivered {placed}")
                     return "PLACED" if placed else None
+                speak("none")
                 raise
             box = kept_box or box_for(plane, item, place)
             others = [other for other in scan.others
                       if box is None or not inside_footprint(box, other.center[:2])]
-            result = pick_with(bbos, Config, Reader, Type, Writer, plane, item,
-                               plan_only, stop_at, adjust, grip_torque, box,
-                               others if everything and box is not None else ())
+            try:
+                result = pick_with(bbos, Config, Reader, Type, Writer, plane, item,
+                                   plan_only, stop_at, adjust, grip_torque, box,
+                                   others if everything and box is not None else ())
+            except RuntimeError as exc:
+                if not pick_with.placed:
+                    raise
+                # Something is left, but the arm cannot get to it: that ends a
+                # clearing run, it does not make the run a failure.
+                speak("out-of-reach")
+                log("complete", f"delivered {pick_with.placed}; the object left at "
+                                f"({item.center[0]:.2f}, {item.center[1]:.2f}) is out of reach "
+                                f"({object_reach(item):.2f} m): {str(exc)[:120]}")
+                return "PLACED"
             placed = pick_with.placed
             if plan_only or stop_at or cancel_event.is_set():
                 return result
@@ -1507,6 +1644,7 @@ def execute(plan_only=True, pid_file=None, stop_at=None, adjust=False,
                 log("complete", f"gave up after {failures} rounds on one object; "
                                 f"delivered {placed}")
                 return result
+            speak("retry")
             log("retry", f"round {failures} ended {result}; scanning again for the object")
         return None
 
@@ -1580,10 +1718,21 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
                    else GRASP_PITCHES_DEGREES)
         # The object rarely moves between tests, so the option that validated
         # last time is tried first instead of re-rejecting the ones before it.
-        for pitch, yaw_fraction in ordered_options(pitches, pick_with.accepted.get(side)):
+        # A can close to the body needs a steep wrist, which puts the hover
+        # point and the lift near the top of the arm's travel. Fall back to a
+        # shorter hover and then a lower lift (still above the rim) before
+        # giving up on it.
+        lifts = [lift_metres]
+        if place_box is not None and lift_metres > place_box.top + PLACE_MIN_RIM_METRES + 0.005:
+            lifts.append(place_box.top + PLACE_MIN_RIM_METRES)
+        shapes = [(lifts[0], PREGRASP_BACKOFF_METRES), (lifts[0], PREGRASP_NEAR_BACKOFF_METRES)]
+        shapes += [(lift, PREGRASP_NEAR_BACKOFF_METRES) for lift in lifts[1:]]
+        options = ordered_options(pitches, pick_with.accepted.get(side))
+        for lift_height, backoff, pitch, yaw_fraction in (
+                (lift, back, *option) for lift, back in shapes for option in options):
             try:
                 path, marks, observation = plan_pick(cfg, begin, side, target, plane, pitch,
-                                                     yaw_fraction, lift_metres)
+                                                     yaw_fraction, lift_height, backoff)
                 phases = split_dense(path, marks)
                 for name, phase in phases.items():
                     tr.validate_calibration(phase, low, high, f"{side}:{name}", logger=log)
@@ -1599,10 +1748,14 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
             phases["approach"] = np.vstack([raised, phases["approach"][1:]])
             pick_with.accepted[side] = (pitch, yaw_fraction)
             _, grasp, lift, quaternion = grasp_waypoints(
-                target, side, pitch, plane.height_at, yaw_fraction, lift_metres)
+                target, side, pitch, plane.height_at, yaw_fraction, lift_height, backoff)
+            if (lift_height, backoff) != shapes[0]:
+                log("plan", f"used a {backoff * 100:.0f} cm hover and a "
+                            f"{lift_height * 100:.0f} cm lift to reach this one")
             return {"item": target, "phases": phases, "ready_index": len(raised) - 1,
                     "observation": observation, "pitch": pitch, "yaw_fraction": yaw_fraction,
                     "grasp": grasp, "lift": lift, "quaternion": quaternion,
+                    "lift_height": lift_height,
                     "options_tried": len(failures) + 1}
         raise RuntimeError("no validated grasp: " + " | ".join(failures))
 
@@ -1612,8 +1765,10 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
         yaw = job["yaw_fraction"] * math.atan2(target_item.center[1] - shoulder_y,
                                                target_item.center[0])
         reasons = []
+        # Sinking on the way over is only safe from the full-height lift.
+        full_lift = job["lift_height"] >= lift_metres - 1e-6
         for target, quaternion, description in place_candidates(
-                place_box, job["lift"], job["pitch"], yaw, already_placed):
+                place_box, job["lift"], job["pitch"], yaw, already_placed, full_lift):
             try:
                 carry = plan_place(cfg, side, phases["lift"][-1], target, quaternion,
                                    job["observation"], low, high)
@@ -1678,6 +1833,9 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
         other for other in more_items
         if ("left" if other.center[1] >= 0.0 else "right") == side
         and math.hypot(other.center[0], other.center[1] - shoulder_y) <= HARD_REACH_METRES]
+    if more_items:
+        log("plan", f"{len(more_items)} other graspable object(s) seen; ready pose is "
+                    f"{'home' if at_home else 'NOT home, so no chaining'}")
     if chain:
         log("plan", f"{len(chain)} more object(s) queued for the {side} arm: "
                     + ", ".join(f"({c.center[0]:.2f}, {c.center[1]:.2f})" for c in chain))
@@ -1699,6 +1857,7 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
 
     jobs = queue.Queue()
     jobs.abandon = threading.Event()  # set by the motion loop when it stops early
+    jobs.skipped = 0                  # queued objects the arm could not plan a way to
 
     def plan_everything():
         jobs.put(plan_extras(first, pick_with.placed))
@@ -1708,18 +1867,24 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
             try:
                 jobs.put(plan_extras(plan_can(other, ready), pick_with.placed + number))
             except RuntimeError as exc:
-                log("plan", f"skipping ({other.center[0]:.2f}, {other.center[1]:.2f}): {exc}")
+                jobs.skipped += 1
+                log("plan", f"skipping ({other.center[0]:.2f}, {other.center[1]:.2f}): "
+                            f"{str(exc)[:160]}")
         jobs.put(None)
 
     TIMING.mark("motion starts")
+    if not pick_with.placed:
+        speak("starting")
     result, placed = run_motion(Config, Reader, Type, Writer, cfg, side, start, first, stop_at,
                                 grip_torque, jobs, Deferred(plan_everything))
     pick_with.placed += placed
+    pick_with.skipped += jobs.skipped
     return result
 
 
 pick_with.accepted = {}
 pick_with.placed = 0
+pick_with.skipped = 0
 
 
 def run_motion(*args, **kwargs):
@@ -1964,6 +2129,7 @@ def _run_motion(outcome, Config, Reader, Type, Writer, cfg, side, start, job, st
                     # Straight on to the next object: up to the ready pose and
                     # out again, without lowering the arm to rest in between.
                     target = job["item"].center
+                    speak("next")
                     log("retry", f"next object at ({target[0]:.2f}, {target[1]:.2f}); "
                                  "not returning to rest")
                     stage = "approach"
@@ -2084,6 +2250,7 @@ def build_parser():
     parser.add_argument("--record", type=Path, metavar="DIR",
                         help="save every scanned depth frame here for offline replay "
                              "with scripts/pick_replay.py")
+    parser.add_argument("--quiet", action="store_true", help="do not speak")
     parser.add_argument("--pid-file", type=Path)
     parser.add_argument("--serve", type=Path, metavar="DIR",
                         help="stay warm (bbos imported, IK initialised) and run the jobs "
@@ -2104,6 +2271,7 @@ def run_job(parser, args):
     scan.box_side = {"left": 1.0, "right": -1.0}.get(args.box_side)
     scan.virtual = tuple(args.virtual) if args.virtual else None
     scan.record_dir = args.record
+    speak.enabled = not args.quiet
     scan.recorded = 0
     scan.last_box = None
     scan.filled_box = None
@@ -2135,6 +2303,8 @@ def run_job(parser, args):
             log("trace", line)
         return 1
     finally:
+        if speak.thread is not None:
+            speak.thread.join(timeout=8.0)  # let the last line finish before the job ends
         if args.pid_file:
             try:
                 args.pid_file.unlink()

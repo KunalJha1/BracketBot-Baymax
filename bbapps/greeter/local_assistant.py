@@ -419,6 +419,9 @@ def run_voice(args, router, transcriber, synthesizer, action_controller) -> None
     )
     last_wake_active = False
     pending_wake = False
+    # The utterance a clarifying question was asked about, until answered.
+    follow_up = None
+    follow_up_due = False
     guess = None  # (loud chunk count, transcript future) for the current pause
     loud_chunks = 0
     endpoint_db = args.vad_threshold_db
@@ -486,21 +489,33 @@ def run_voice(args, router, transcriber, synthesizer, action_controller) -> None
                     triggered = active and not last_wake_active
                     last_wake_active = active
                     if triggered:
-                        # Reopen at the turn boundary. A long-lived reader can
-                        # remain mapped to a stale mic slot even while the mic
-                        # daemon and other readers are healthy. The user waits
-                        # for cyan before asking, so no query audio is lost.
-                        microphone.__exit__(None, None, None)
-                        microphone = Reader(
-                            "mic.audio", keeptime=False
-                        ).__enter__()
-                        mic_last_update = time.monotonic()
-                        segmenter.reset()
-                        guess = None
-                        pending_wake = True
-                        action_controller.listening.set()
-                        leds.set("listening")
+                        # A fresh wake phrase abandons any pending question.
+                        follow_up = None
                         print("[local-assistant] Wake phrase detected; recording...")
+                if follow_up_due and not triggered:
+                    # The robot just asked a question ("For how long?"); take
+                    # the answer without a second wake phrase.
+                    triggered = True
+                    # Let the speaker drain so the robot's own question is
+                    # not recorded as the start of the answer.
+                    time.sleep(0.3)
+                    print("[local-assistant] Listening for the answer...", flush=True)
+                follow_up_due = False
+                if triggered:
+                    # Reopen at the turn boundary. A long-lived reader can
+                    # remain mapped to a stale mic slot even while the mic
+                    # daemon and other readers are healthy. The user waits
+                    # for cyan before asking, so no query audio is lost.
+                    microphone.__exit__(None, None, None)
+                    microphone = Reader(
+                        "mic.audio", keeptime=False
+                    ).__enter__()
+                    mic_last_update = time.monotonic()
+                    segmenter.reset()
+                    guess = None
+                    pending_wake = True
+                    action_controller.listening.set()
+                    leds.set("listening")
 
                 if not microphone.ready():
                     if time.monotonic() - mic_last_update >= mic_reconnect_after_s:
@@ -562,6 +577,7 @@ def run_voice(args, router, transcriber, synthesizer, action_controller) -> None
                     # Nothing was said after the wake phrase; whisper would
                     # only invent a question from its prompt.
                     print("[local-assistant] No speech after the wake phrase", flush=True)
+                    follow_up = None
                     leds.set("idle")
                     continue
                 leds.set("processing")
@@ -588,7 +604,19 @@ def run_voice(args, router, transcriber, synthesizer, action_controller) -> None
                         print("[local-assistant] No speech recognized")
                         continue
                     print(f"[local-assistant] Heard: {transcript}")
-                    decision = router.route(transcript)
+                    if follow_up is not None:
+                        decision = router.route_follow_up(follow_up[0], transcript)
+                    else:
+                        decision = router.route(transcript)
+                    if decision.expects_reply and (follow_up is None or follow_up[1] > 0):
+                        # Ask at most twice, then fall back to the wake phrase.
+                        follow_up = (
+                            decision.utterance,
+                            1 if follow_up is None else follow_up[1] - 1,
+                        )
+                        follow_up_due = True
+                    else:
+                        follow_up = None
                     reply = decision.reply or "I did not understand that."
                     print(f"[local-assistant] Reply: {reply}")
                     print(
@@ -765,6 +793,7 @@ def main() -> None:
         reminder_executor=action_controller.schedule_reminder,
         reminder_cancel_executor=action_controller.cancel_reminders,
         reminder_list_executor=action_controller.list_reminders,
+        reminder_timezone=args.timezone or default_timezone_name(),
     )
     whisper_server = None
     if not args.whisper_server and not (args.text or args.preflight_gesture or args.speak_text):

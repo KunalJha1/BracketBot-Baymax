@@ -11,9 +11,16 @@ This app runs the complete vision-to-voice path on the robot:
 6. estimate its visible expression by averaging two EmotiEffLib ONNX models
    **through onnxruntime**; and
 7. after a sustained, confidently distressed-looking expression, open with one
-   of a handful of short lines ("Hey, you okay? What's going on?"), listen for
-   the answer (whisper.cpp), and reply with the OpenRouter LLM for up to three
-   turns (`check_in.py`).
+   of a handful of consent-based lines ("Want to talk, or would you rather have
+   some space?"), listen for the answer (whisper.cpp), and reply with the
+   OpenRouter LLM for up to two turns (`check_in.py`). Saying "not now," "I
+   don't want to talk," or another natural dismissal ends it immediately.
+
+After any check-in—including silence or a dismissal—automatic check-ins stay
+quiet for 30 minutes by default. The normal "Hey BracketBot" assistant remains
+available during that time. Change the pause with `--check-in-quiet-seconds`.
+With the two-turn default, the LLM can ask at most one follow-up, and it is
+instructed to do that only when the person clearly wants to keep talking.
 
 If whisper.cpp, espeak-ng, or the greeter voice modules are missing, the app
 falls back to playing `sad_prompt.wav`. If the LLM cannot be reached it gives

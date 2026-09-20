@@ -7,16 +7,19 @@ BBOS writers for sounds, lights, and routines.
 
 from __future__ import annotations
 
+from datetime import datetime
 import json
 import os
 from pathlib import Path
 import queue
+import re
 import shutil
 import signal
 import subprocess
 import threading
 import time
 import wave
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -124,6 +127,21 @@ FOLLOW_CHIRP_VOLUME = 0.5
 # scanned, and stays distinct from the assistant's blue thinking light.
 SCAN_LED = ((70, 220, 120), "pulse")
 CLEAR_FOREHEAD_MESSAGE = "Please move any hair off your forehead, then hold still."
+_FIRST_TO_SECOND_PERSON = {
+    "my": "your",
+    "mine": "yours",
+    "myself": "yourself",
+    "me": "you",
+    "i": "you",
+    "i'm": "you're",
+    "i've": "you've",
+    "i'll": "you'll",
+}
+_FIRST_PERSON = re.compile(r"\b(?:i'm|i've|i'll|myself|mine|my|me|i)\b(?!')")
+# Rising two-note ding played the moment a reminder or timer is stored, so the
+# person knows it took before the spoken confirmation starts.
+REMINDER_SET_CHIME = ((880.0, 0.11), (1318.5, 0.2))
+REMINDER_SET_LED = ((255, 185, 40), "blink", 1.2)
 REMINDER_LED = ((255, 185, 40), "blink", 8.0)
 # A reminder can land while the audience is watching the arms rather than
 # the lights. A short chime ahead of the spoken text makes the delivery
@@ -528,16 +546,41 @@ class VoiceActionController:
 
     @staticmethod
     def _duration_text(seconds: float) -> str:
+        if seconds < 60 or seconds != int(seconds):
+            return f"{seconds:g} {'second' if seconds == 1 else 'seconds'}"
+        remaining = int(seconds)
+        parts = []
         for unit_seconds, singular, plural in (
             (3600, "hour", "hours"),
             (60, "minute", "minutes"),
             (1, "second", "seconds"),
         ):
-            value = seconds / unit_seconds
-            if value >= 1 and abs(value - round(value)) < 1e-9:
-                count = int(round(value))
-                return f"{count} {singular if count == 1 else plural}"
-        return f"{seconds:g} seconds"
+            count, remaining = divmod(remaining, unit_seconds)
+            if count:
+                parts.append(f"{count} {singular if count == 1 else plural}")
+        return " ".join(parts)
+
+    @staticmethod
+    def _second_person(message: str) -> str:
+        """Say "take your meds" back to the person who said "take my meds"."""
+        return _FIRST_PERSON.sub(
+            lambda match: _FIRST_TO_SECOND_PERSON[match.group(0)], message
+        )
+
+    @staticmethod
+    def _due_text(reminder) -> str:
+        """A speakable local due time: "5:30 PM", "9 AM tomorrow"."""
+        due = datetime.fromtimestamp(reminder.due_at, ZoneInfo(reminder.timezone))
+        now = datetime.now(due.tzinfo)
+        hour = due.hour % 12 or 12
+        text = f"{hour}:{due.minute:02d}" if due.minute else f"{hour}"
+        text += " AM" if due.hour < 12 else " PM"
+        days = (due.date() - now.date()).days
+        if days == 1:
+            text += " tomorrow"
+        elif days != 0:
+            text += f" on {due.strftime('%A, %B')} {due.day}"
+        return text
 
     def _deliver_reminder(self, reminder) -> None:
         if self._shutdown.is_set():
@@ -557,7 +600,7 @@ class VoiceActionController:
             # and suppress the spoken text the reminder exists to give.
             pass
         message = (
-            f"Reminder: {reminder.message}."
+            f"Reminder: {self._second_person(reminder.message)}."
             if reminder.message
             else "Your timer is finished."
         )
@@ -587,11 +630,22 @@ class VoiceActionController:
             reminder.message,
             source="voice",
         )
+        print(
+            f"[voice-action] {reminder.kind if hasattr(reminder, 'kind') else 'reminder'} "
+            f"set: {delay:g}s, message={reminder.message!r}",
+            flush=True,
+        )
+        self._acknowledge_reminder_set()
 
-        duration = self._duration_text(delay)
+        due_text = getattr(reminder, "due_text", None)
+        when = f"at {due_text}" if due_text else f"in {self._duration_text(delay)}"
         if reminder.message:
-            return True, f"Okay. I'll remind you in {duration} to {reminder.message}."
-        return True, f"Okay. Your {duration} timer is set."
+            connector = getattr(reminder, "connector", "to")
+            message = self._second_person(reminder.message)
+            return True, f"Okay. I'll remind you {when} {connector} {message}."
+        if due_text:
+            return True, f"Okay. Your alarm is set for {due_text}."
+        return True, f"Okay. Your timer is set for {self._duration_text(delay)}."
 
     def set_reminder(self, due_at, message, *, timezone_name=None, source="internal"):
         """Typed internal ``set-reminder`` action for absolute timestamps."""
@@ -616,12 +670,20 @@ class VoiceActionController:
             return True, "You don't have any active reminders or timers."
         descriptions = []
         for reminder in reminders[:3]:
-            label = reminder.message or "timer"
-            due = reminder.public()["due_at_local"]
-            descriptions.append(f"number {reminder.id}, {label}, due {due}")
+            label = (
+                self._second_person(reminder.message) if reminder.message else "a timer"
+            )
+            remaining = reminder.due_at - time.time()
+            if 0 < remaining < 3600:
+                due = f"in {self._duration_text(max(1, round(remaining / 60)) * 60)}"
+                if remaining < 60:
+                    due = f"in {self._duration_text(round(remaining))}"
+            else:
+                due = f"at {self._due_text(reminder)}"
+            descriptions.append(f"{label}, {due}")
         extra = len(reminders) - len(descriptions)
         suffix = f", plus {extra} more" if extra else ""
-        return True, "Your active reminders are " + "; ".join(descriptions) + suffix + "."
+        return True, "You have " + "; ".join(descriptions) + suffix + "."
 
     def cancel_reminder(self, reminder_id: int):
         """Typed internal ``cancel-reminder`` action for one reminder."""
@@ -1076,6 +1138,37 @@ class VoiceActionController:
                         frame["audio"] = samples
                     due += period
                     self._cancel.wait(max(0.0, due - time.monotonic()))
+
+    def _play_chime(self, notes, volume: float = 0.5) -> None:
+        """Play short synthesized notes; needs no sound asset on the robot."""
+        cfg = self.speaker_cfg
+        if self.speaker is None or cfg is None:
+            return
+        tones = []
+        for frequency, seconds in notes:
+            t = np.arange(int(cfg.sample_rate * seconds)) / cfg.sample_rate
+            fade = np.minimum(1.0, np.minimum(t, seconds - t) / 0.012)
+            tones.append(np.sin(2 * np.pi * frequency * t) * np.exp(-t * 6.0) * fade)
+        signal_ = (np.concatenate(tones) * volume * 32767).astype(np.int16)
+        signal_ = np.pad(signal_, (0, -len(signal_) % cfg.chunk_size))
+        period = cfg.chunk_size / cfg.sample_rate
+        due = time.monotonic()
+        with self.speaker_lock:
+            for start in range(0, len(signal_), cfg.chunk_size):
+                chunk = signal_[start:start + cfg.chunk_size]
+                with self.speaker.buf() as frame:
+                    frame["audio"] = np.repeat(chunk[:, None], cfg.channels, axis=1)
+                due += period
+                time.sleep(max(0.0, due - time.monotonic()))
+
+    def _acknowledge_reminder_set(self) -> None:
+        try:
+            if self.leds is not None:
+                self.leds.start_effect(*REMINDER_SET_LED)
+            self._play_chime(REMINDER_SET_CHIME)
+        except Exception as exc:
+            # Feedback only: the reminder is already stored.
+            print(f"[voice-action] reminder chime skipped: {exc}", flush=True)
 
     def speak(self, speak, *args, **kwargs) -> None:
         with self.speaker_lock:

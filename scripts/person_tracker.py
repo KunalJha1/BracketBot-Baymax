@@ -39,6 +39,7 @@ import json
 import math
 from pathlib import Path
 import queue
+import socket
 import sys
 import threading
 import time
@@ -74,6 +75,10 @@ SETTLE_S = 0.6
 DRIVE_PERIOD_S = 0.02
 UPRIGHT_DEG = 25.0
 BALANCE_MODE = 0
+# The dashboard's teleop (scripts/robot_teleop.py) owns drive.ctrl while it is
+# open and takes small moves from other programs on this port instead. The
+# person at the keys still wins over anything sent here.
+TELEOP_RELAY = ("127.0.0.1", 8765)
 
 # Face distance the next action works best at, in metres.
 DISTANCE_BANDS = {"scan": (0.4, 1.2), "gesture": (0.45, 0.9)}
@@ -155,6 +160,30 @@ def slew(previous: float, target: float, dt: float, accel: float = TURN_ACCEL) -
 # ---------------------------------------------------------------------------
 # Robot side
 # ---------------------------------------------------------------------------
+
+class TeleopRelayDrive:
+    """Stands in for the drive.ctrl writer while teleop owns the base."""
+
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def __setitem__(self, key, twist):
+        message = {"v": float(twist[0]), "w": float(twist[1])}
+        self.socket.sendto(json.dumps(message).encode(), TELEOP_RELAY)
+
+    def __exit__(self, *exc):
+        self.socket.close()
+
+
+def teleop_relay_listening() -> bool:
+    """Whether teleop's relay port is taken, which only teleop does."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        try:
+            probe.bind(TELEOP_RELAY)
+        except OSError:
+            return True
+    return False
+
 
 def _log(message):
     print(f"[person-tracker] {message}", file=sys.stderr, flush=True)
@@ -258,7 +287,23 @@ class Robot:
 
     # -- motion -------------------------------------------------------------
 
-    def preflight(self):
+    def open_drive(self):
+        """Something to write twists to: the base itself, or teleop's relay. Refuses otherwise."""
+        via_teleop = teleop_relay_listening()
+        self.preflight(base_may_be_driven=via_teleop)
+        if via_teleop:
+            _log("teleop owns the base; turning through its relay")
+            return TeleopRelayDrive()
+        try:
+            return self.bbos.Writer(
+                "drive.ctrl", self.bbos.Type("drive_ctrl"), keeptime=False
+            ).__enter__()
+        except RuntimeError as exc:
+            # An idle nav process holds the writer without publishing, so
+            # preflight cannot see it. Same answer.
+            raise Refused("another app is already driving the base") from exc
+
+    def preflight(self, base_may_be_driven=False):
         roll, pitch = self.rpy()[:2]
         if abs(roll) >= UPRIGHT_DEG or abs(pitch) >= UPRIGHT_DEG:
             raise Refused("the robot is not upright")
@@ -270,6 +315,8 @@ class Robot:
                         raise Refused("the base is in lean or twist mode")
                     break
                 time.sleep(0.01)
+        if base_may_be_driven:
+            return
         with self.bbos.Reader("drive.ctrl", keeptime=False) as drive:
             deadline = time.monotonic() + 0.3
             while time.monotonic() < deadline:
@@ -349,15 +396,7 @@ class Tracker:
         try:
             if face is None or abs(face["bearing_deg"]) > CENTER_TOLERANCE_DEG:
                 try:
-                    self.robot.preflight()
-                    try:
-                        writer = self.robot.bbos.Writer(
-                            "drive.ctrl", self.robot.bbos.Type("drive_ctrl"), keeptime=False
-                        ).__enter__()
-                    except RuntimeError as exc:
-                        # An idle teleop or nav process holds the writer without
-                        # publishing, so preflight cannot see it. Same answer.
-                        raise Refused("another app is already driving the base") from exc
+                    writer = self.robot.open_drive()
                 except Refused as exc:
                     if face is None:
                         raise
@@ -403,13 +442,7 @@ class Tracker:
         delta = float(delta_deg)
         if not math.isfinite(delta) or abs(delta) > MAX_REQUESTED_TURN_DEG:
             raise Refused(f"a {delta:.0f} degree turn is more than a gesture may ask for")
-        self.robot.preflight()
-        try:
-            writer = self.robot.bbos.Writer(
-                "drive.ctrl", self.robot.bbos.Type("drive_ctrl"), keeptime=False
-            ).__enter__()
-        except RuntimeError as exc:
-            raise Refused("another app is already driving the base") from exc
+        writer = self.robot.open_drive()
         try:
             self.robot.turn_by(writer, delta, cancel)
         finally:

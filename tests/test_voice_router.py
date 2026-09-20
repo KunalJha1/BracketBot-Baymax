@@ -1,7 +1,9 @@
+from datetime import datetime
 import json
 import sqlite3
 from http.client import RemoteDisconnected
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -19,7 +21,9 @@ from bbapps.greeter.voice_router import (
     default_seed_pairs,
     default_seed_path,
     is_cacheable_question,
+    ModelResponse,
     is_question,
+    is_reminder_request_without_time,
     load_seed_pairs,
     match_action,
     match_explicit_gesture_request,
@@ -1344,3 +1348,141 @@ def test_a_whole_sentence_command_survives_stray_transcribed_words():
     assert match_explicit_gesture_request("Don't. Fist bump.") is None
     assert match_explicit_gesture_request("I saw a fist bump yesterday") is None
     assert match_explicit_gesture_request("Fist bump. Wave.") is None
+
+
+_REMINDER_NOW = datetime(2026, 9, 20, 14, 10, tzinfo=ZoneInfo("America/Toronto"))
+
+
+@pytest.mark.parametrize(
+    ("utterance", "kind", "delay", "connector", "message", "due_text"),
+    [
+        ("Remind me to call mom in 5 minutes", "reminder", 300, "to", "call mom", None),
+        ("Remind me in 5 mins to call mom.", "reminder", 300, "to", "call mom", None),
+        ("Remind me to check in in 5 minutes", "reminder", 300, "to", "check in", None),
+        ("In ten minutes, remind me to check in", "reminder", 600, "to", "check in", None),
+        (
+            "Can you remind me to check the oven in an hour and a half?",
+            "reminder", 5400, "to", "check the oven", None,
+        ),
+        (
+            "Remind me in two and a half hours that the laundry is done",
+            "reminder", 9000, "that", "the laundry is done", None,
+        ),
+        ("remind me in 1 hour 30 minutes to stretch", "reminder", 5400, "to", "stretch", None),
+        ("Remind me in half an hour to drink water", "reminder", 1800, "to", "drink water", None),
+        ("remind me in a couple of minutes to stand up", "reminder", 120, "to", "stand up", None),
+        ("Remind me at 5 pm to call mom", "reminder", 10200, "to", "call mom", "5 PM"),
+        ("Remind me to call mom at 5:30 p.m.", "reminder", 12000, "to", "call mom", "5:30 PM"),
+        # A bare hour means its next occurrence: 9 at 2:10 PM is 9 PM.
+        ("Remind me at 9 to take my pills", "reminder", 24600, "to", "take my pills", "9 PM"),
+        (
+            "Remind me tomorrow at 9 to take my pills",
+            "reminder", 67800, "to", "take my pills", "9 AM tomorrow",
+        ),
+        (
+            "Remind me at seven thirty tomorrow morning to go running",
+            "reminder", 62400, "to", "go running", "7:30 AM tomorrow",
+        ),
+        (
+            "Remind me about the meeting at noon",
+            "reminder", 78600, "about", "the meeting", "12 PM tomorrow",
+        ),
+        ("Remind me tonight to lock the door", "reminder", 21000, "to", "lock the door", "8 PM"),
+        ("Set a reminder for 6 pm to eat dinner", "reminder", 13800, "to", "eat dinner", "6 PM"),
+        ("Wake me up at 7 am", "reminder", 60600, "to", "wake up", "7 AM tomorrow"),
+        ("set a 5 minute timer", "timer", 300, "to", None, None),
+        ("Start a ninety second countdown", "timer", 90, "to", None, None),
+        ("timer for 45 seconds", "timer", 45, "to", None, None),
+        ("Set a timer for an hour and fifteen minutes", "timer", 4500, "to", None, None),
+        ("Set an alarm for 7:15 am", "timer", 61500, "to", None, "7:15 AM tomorrow"),
+    ],
+)
+def test_reminder_grammar_accepts_natural_phrasings(
+    utterance, kind, delay, connector, message, due_text
+):
+    request = match_reminder_request(utterance, now=_REMINDER_NOW)
+
+    assert request is not None
+    assert (request.kind, request.delay_seconds, request.connector) == (kind, delay, connector)
+    assert request.message == message
+    assert request.due_text == due_text
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        # "for 5" and "at 3 houses" belong to the message, not the schedule.
+        "Remind me to buy gifts for 5",
+        "Remind me to look at 3 houses",
+        "Remind me to call mom",
+    ],
+)
+def test_reminder_without_a_time_asks_instead_of_reaching_the_llm(utterance):
+    class FailingLLM:
+        def complete(self, _utterance):
+            raise AssertionError("an unscheduled reminder must not reach the LLM")
+
+    assert match_reminder_request(utterance, now=_REMINDER_NOW) is None
+    assert is_reminder_request_without_time(utterance) is True
+    decision = VoiceRouter(FailingLLM()).route(utterance)
+    assert decision.kind == RouteKind.QUESTION
+    assert decision.action_started is False
+    assert decision.expects_reply is True
+    assert decision.reply == "Sure. When should I remind you?"
+
+
+@pytest.mark.parametrize(
+    ("turns", "delay", "message"),
+    [
+        # The turn often closes on the pause after "remind me".
+        (["Remind me...", "in five minutes to call mom"], 300, "call mom"),
+        (["Remind me to call mom", "five minutes"], 300, "call mom"),
+        (["Remind me to call mom.", "In 10 minutes."], 600, "call mom"),
+        (["Remind me", "to call mom", "in two minutes"], 120, "call mom"),
+        (["Set a timer.", "Five minutes."], 300, None),
+        (["Set a timer", "for ninety seconds"], 90, None),
+    ],
+)
+def test_half_finished_reminder_is_completed_by_the_follow_up_answer(turns, delay, message):
+    class FailingLLM:
+        def complete(self, _utterance):
+            raise AssertionError("a reminder follow-up must not reach the LLM")
+
+    scheduled = []
+    router = VoiceRouter(
+        FailingLLM(),
+        reminder_executor=lambda reminder: (scheduled.append(reminder) is None, "Okay."),
+    )
+    decision = router.route(turns[0])
+    for answer in turns[1:]:
+        assert decision.expects_reply is True
+        assert scheduled == []
+        decision = router.route_follow_up(decision.utterance, answer)
+
+    assert decision.expects_reply is False
+    assert decision.action_started is True
+    assert [(item.delay_seconds, item.message) for item in scheduled] == [(delay, message)]
+
+
+def test_unrelated_follow_up_answer_is_routed_on_its_own():
+    class RecordingLLM:
+        def __init__(self):
+            self.heard = []
+
+        def complete(self, utterance, *_args, **_kwargs):
+            self.heard.append(utterance)
+            return ModelResponse("It is sunny.")
+
+    llm = RecordingLLM()
+    router = VoiceRouter(llm)
+    decision = router.route("Set a timer")
+    assert decision.reply == "Sure. For how long?"
+    decision = router.route_follow_up(decision.utterance, "What's the weather like?")
+    assert llm.heard == ["What's the weather like?"]
+    assert decision.expects_reply is False
+
+
+def test_non_reminder_speech_is_not_mistaken_for_a_reminder():
+    for utterance in ("What time is it", "Set a time", "How do reminders work?"):
+        assert match_reminder_request(utterance, now=_REMINDER_NOW) is None
+        assert is_reminder_request_without_time(utterance) is False

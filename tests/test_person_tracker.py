@@ -77,9 +77,10 @@ class FakeRobot:
     def yaw(self):
         return self.heading
 
-    def preflight(self):
+    def open_drive(self):
         if self.refuse:
             raise pt.Refused(self.refuse)
+        return self.Writer()
 
     def look(self, frames=2):
         if self.person_yaw is None:
@@ -195,3 +196,21 @@ def test_a_base_held_by_an_idle_driver_is_a_refusal_not_a_crash():
 
     result = pt.Tracker(HeldRobot(person_yaw=30.0)).acquire("gesture", None, threading.Event())
     assert result["found"] and not result["centered"]
+
+
+def test_relay_drive_sends_teleop_the_twist_as_json(monkeypatch):
+    import json
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.settimeout(1.0)
+        monkeypatch.setattr(pt, "TELEOP_RELAY", listener.getsockname())
+        assert pt.teleop_relay_listening() is True
+
+        drive = pt.TeleopRelayDrive()
+        drive["twist"] = [0.0, 0.25]
+        drive.__exit__(None, None, None)
+
+        assert json.loads(listener.recv(256)) == {"v": 0.0, "w": 0.25}
+    assert pt.teleop_relay_listening() is False

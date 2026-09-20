@@ -293,7 +293,10 @@ def ground_perception(data, t, wall_now, calibration):
     local = without_self(base_to_local(cloud(data), calibration.left_sign), calibration.self_mask)
     if len(local) < 100:
         return None
-    return Perception(t - age, (), local)
+    # The cloud's floor is a ramp (~0.10 m per metre on this robot). Unlevelled it
+    # put ~11,000 "obstacle" points in the corridor and held every ground approach
+    # BLOCKED. With too little floor to fit, the cloud stays as it is: still blocked.
+    return Perception(t - age, (), level_floor(local, floor_line(local)))
 
 
 def state_vector(data, field, size, topic):

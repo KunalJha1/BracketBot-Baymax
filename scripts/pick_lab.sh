@@ -33,7 +33,7 @@ SSH_OPTS=(-o ControlMaster=auto -o ControlPath=/tmp/pick-lab-%C -o ControlPersis
           -o ServerAliveInterval=5 -o ServerAliveCountMax=2)
 HOST_CACHE=/tmp/pick-lab-host
 SSH() { ssh "${SSH_OPTS[@]}" "$@"; }
-FILTER='timing\]|complete\]|median|lean\]|reach\]|state\] side|startup|accepted pitch|retry\]|place\]|space\]|grip\]|evidence|torque\]|cleanup|fatal|staged|rest\]|gripper\]|motion\] stage|complete\]'
+FILTER='say\]|timing\]|complete\]|median|lean\]|reach\]|state\] side|startup|accepted pitch|retry\]|place\]|space\]|grip\]|evidence|torque\]|cleanup|fatal|staged|rest\]|gripper\]|motion\] stage|complete\]'
 
 host() {
   if [ -s "$HOST_CACHE" ]; then
@@ -103,6 +103,19 @@ run_detached() {
       sleep 0.15; kill \$TAIL 2>/dev/null" | grep --line-buffered -E "$FILTER" | cut -c1-170
 }
 
+# The robot's spoken pick lines (scripts/generate_pick_lines.py renders them).
+sync_sounds() {
+  local stamp=/tmp/pick-lab-sounds newest
+  newest=$(ls -t "$ROOT"/assets/pick/*.wav 2>/dev/null | head -1)
+  [ -n "$newest" ] || return 0
+  if ssh "${SSH_OPTS[@]}" -O check "$1" 2>/dev/null && [ -f "$stamp" ] \
+      && [ "$(cat "$stamp")" = "$1" ] && [ ! "$newest" -nt "$stamp" ]; then
+    return 0
+  fi
+  SSH "$1" "mkdir -p $REMOTE/sounds" && \
+    scp -q "${SSH_OPTS[@]}" "$ROOT"/assets/pick/*.wav "$1:$REMOTE/sounds/" && echo "$1" > "$stamp"
+}
+
 CMD=${1:-status}; shift || true
 FRAMES="$ROOT/artifacts/pick/latest"
 if [ "$CMD" = replay ]; then
@@ -115,6 +128,7 @@ if [ "$CMD" = replay ]; then
 fi
 H=$(host) || exit 1
 sync_files "$H" || exit 1
+sync_sounds "$H" || echo "could not copy the voice lines; the pick will run silently" >&2
 
 case "$CMD" in
   status)

@@ -297,3 +297,30 @@ def test_all_mode_rescans_after_a_drop_and_stops_when_the_table_is_clear(monkeyp
     # -> scan 4 sees nothing left. The box is remembered once something is inside it.
     assert scans == [None, None, box, box]
     assert po.pick_with.placed == 2
+
+
+def test_backup_goes_through_the_teleop_relay_when_the_drive_writer_is_taken():
+    import json
+    import socket
+    import scripts.pick_object as po
+
+    def taken(*_args, **_kwargs):
+        raise Exception("Writer for drive.ctrl already exists (pid=48843)")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as teleop:
+        teleop.bind(("127.0.0.1", 0))
+        teleop.settimeout(2.0)
+        original, po.TELEOP_RELAY = po.TELEOP_RELAY, teleop.getsockname()
+        try:
+            with po.drive_channel(lambda name: name, taken) as twist:
+                twist(-0.10)
+                assert json.loads(teleop.recv(256)) == {"v": -0.10, "w": 0.0}
+        finally:
+            po.TELEOP_RELAY = original
+
+    def broken(*_args, **_kwargs):
+        raise Exception("shared memory is gone")
+
+    with pytest.raises(Exception, match="shared memory"):
+        with po.drive_channel(lambda name: name, broken):
+            pass

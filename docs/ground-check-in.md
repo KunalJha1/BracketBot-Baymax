@@ -112,7 +112,7 @@ require physical evaluation.
 
 Only one alert with a current matching pose is eligible. A latched alert with
 unknown/missing depth, stale/future camera time, malformed data, or multiple
-alerts commands zero. Vision older than 1.0 s or depth older than 0.30 s also
+alerts commands zero. Vision older than 1.0 s or depth older than 0.5 s also
 commands zero, including rotation. A changed vision session/track ID or a
 position jump over 0.4 m terminates the attempt. Total duration is bounded to
 120 seconds. Safety stops bypass acceleration smoothing.
@@ -147,3 +147,42 @@ tests. Complete the positive lying-pose and stop-path trials in
 [ground safety](slam-ground-safety.md), then tune and test in a clear area with
 an operator at the physical stop. Neither detection nor this question infers
 that a person fell or needs medical treatment.
+
+## Seeing a body on the floor at range
+
+`camera.rect` is 512x384 and the pose model runs at 320 px, so a body lying a few
+metres out is a handful of pixels and was not detected at all (`people=0`) while
+the same model on the raw 1280x960 eye found it. The CPU is saturated (a 640 px
+pass costs ~0.5 s), so `bbapps/emotion_greeter/floor_roi.py` instead crops the raw
+eye to the floor 1.6-6 m ahead and runs the same 320 px model on that: raw-frame
+pixel density at the small model's cost. There is one pose pass per frame. Every
+third frame is the floor crop; once somebody is `checking` or `alert`, every
+frame goes to whichever view sees them (`next_view_focus`), and the other view's
+people are carried forward for up to 1 s. Crop detections are mapped into
+`camera.rect` pixels (`RAW_TO_RECT`, fitted from 3.6k SIFT matches, 0.56 px), so
+tracking, depth lookup and the floor-plane test are unchanged.
+
+Iterate offline, not on the robot: record with `scripts/ground_record.py`
+(read-only), then run `scripts/ground_replay.py RECORDING --sheet out.jpg`,
+which pushes every frame through the same detection, merge, tracking, floor
+test and alert hold as the robot.
+
+## Why the approach used to stay still
+
+Two things held it at zero even with a valid alert, both found with
+`robot_follow.py --ground-approach --dry-run --no-heartbeat` against a synthetic
+alert file:
+
+- The depth cloud's floor is a ramp (~0.10 m per metre). Ground mode did not
+  level it, so ~11,000 floor points filled the obstacle corridor and the state
+  was permanently `BLOCKED`. `ground_perception` now levels the floor like normal
+  follow, and the obstacle cut is 6 cm (levelled floor noise stops at 5 cm).
+- Vision frames are 0.3-1.5 s old and drop out now and then, and each expiry
+  reset the acceleration ramp. The loop now pins the person in the odometry
+  frame and dead-reckons from wheel feedback between frames; a missing
+  observation is bridged for 1 s, frames up to 2 s old are accepted, and a
+  pinned target that moves more than 0.4 m aborts with `target-jumped`.
+
+The robot still needs about a metre of genuinely clear floor ahead: a table or
+chair within 0.85 m is a real `BLOCKED`.
+
