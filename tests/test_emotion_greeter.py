@@ -54,6 +54,7 @@ from check_in import (  # noqa: E402
     NO_ANSWER_REPLY,
     OPENING_LINE,
     OPENING_LINES,
+    LocalVoiceError,
     SadCheckIn,
     speech_segments,
 )
@@ -358,7 +359,9 @@ def test_expression_analyzer_averages_model_ensemble():
     result = analyzer.analyze(frame)
 
     assert result.label == "sadness"
-    assert result.distress == pytest.approx(result.confidence)
+    # distress sums sadness with anger, disgust and fear, so it carries the
+    # softmax tail the sadness class alone leaves behind.
+    assert result.confidence <= result.distress <= 1.0
     assert (result.x2 - result.x1) == (result.y2 - result.y1) == 100
 
 
@@ -435,6 +438,13 @@ class FakeSpeakerWriter:
                 writer.frames.append(self["audio"])
 
         return Buffer()
+
+
+class BusySpeakerWriter:
+    """speaker.audio already has a writer process, as when the voice app runs."""
+
+    def __init__(self):
+        raise RuntimeError("Writer for speaker.audio already exists (pid=4242)")
 
 
 class FakeMic:
@@ -646,3 +656,35 @@ def test_prewarm_survives_a_synthesizer_that_is_not_ready():
     check_in.synthesizer = BrokenSynthesizer()
 
     assert check_in.prewarm() == 0
+
+
+def test_check_in_relays_speech_when_another_process_owns_the_speaker(monkeypatch):
+    """The always-on assistant holds the single speaker.audio writer, so the
+    check-in must hand its line over rather than fail the conversation."""
+
+    import speech_relay
+
+    relayed = []
+    monkeypatch.setattr(
+        speech_relay, "request", lambda **kwargs: relayed.append(kwargs) or True
+    )
+
+    check_in, synthesizer, _spoken = check_in_for([], [], FakeLlm([]))
+    check_in.open_speaker = BusySpeakerWriter
+    check_in.speak("Hey, why are you sad?")
+
+    assert relayed == [{"text": "Hey, why are you sad?"}]
+    # Nothing was synthesized locally: the owner renders the audio itself.
+    assert synthesizer.spoken == []
+
+
+def test_check_in_reports_when_nobody_can_play_the_relayed_line(monkeypatch):
+    import speech_relay
+
+    monkeypatch.setattr(speech_relay, "request", lambda **_kwargs: False)
+
+    check_in, _synthesizer, _spoken = check_in_for([], [], FakeLlm([]))
+    check_in.open_speaker = BusySpeakerWriter
+
+    with pytest.raises(LocalVoiceError):
+        check_in.speak("Hey, why are you sad?")

@@ -2,7 +2,7 @@
 
 This app reads the left eye from ``camera.head.rgb``, runs the repository's
 YOLO11 pose model as a person detector, classifies the largest visible face,
-and after a sustained sadness cue starts a short spoken check-in (see
+and after a sustained distress cue starts a short spoken check-in (see
 ``check_in.py``). Vision stays local; only the check-in reply uses the
 OpenRouter LLM, and the recorded ``sad_prompt.wav`` is used when speech or
 the network is unavailable.
@@ -43,6 +43,12 @@ from ground_safety import (
 SCRIPT_DIR = Path(__file__).resolve().parent
 VISION_SESSION_ID = uuid.uuid4().hex
 PROJECT_ROOT = SCRIPT_DIR.parents[1]
+# The speech helpers live in bbapps/greeter and are imported rather than
+# duplicated, the same way check_in.py reaches them.
+_GREETER_DIR = SCRIPT_DIR.parent / "greeter"
+if str(_GREETER_DIR) not in sys.path:
+    sys.path.append(str(_GREETER_DIR))
+import speech_relay  # noqa: E402
 EMOTION_LABELS = (
     "anger",
     "contempt",
@@ -1165,7 +1171,23 @@ class RobotSpeaker:
                         f"the robot speaker ({config.sample_rate} Hz, "
                         f"{config.channels} channel(s))"
                     )
-                with Writer("speaker.audio", Type("speaker_audio")) as speaker:
+                try:
+                    speaker_writer = Writer("speaker.audio", Type("speaker_audio"))
+                except RuntimeError as error:
+                    # The always-on voice assistant owns the single
+                    # speaker.audio writer; ask it to play this instead.
+                    print(
+                        f"[speaker] Speaker owned elsewhere ({error}); relaying",
+                        flush=True,
+                    )
+                    if not speech_relay.request(wav=self.wav_path):
+                        print(
+                            "[speaker] Nothing served the speech relay; the "
+                            "sadness prompt was not played",
+                            flush=True,
+                        )
+                    return
+                with speaker_writer as speaker:
                     time.sleep(0.25)
                     while raw := source.readframes(config.chunk_size):
                         samples = np.frombuffer(raw, dtype="<i2")

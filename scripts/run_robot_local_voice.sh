@@ -82,6 +82,7 @@ scp -q \
   bbapps/greeter/person_finder.py \
   bbapps/greeter/gesture_safety.py \
   bbapps/greeter/gesture_runtime.py \
+  bbapps/greeter/speech_relay.py \
   "$robot_host:/home/bracketbot/bbapps/greeter/"
 # The prepared answers must land beside the greeter modules: the robot has no
 # repository around them, so this is where the router looks for the seed.

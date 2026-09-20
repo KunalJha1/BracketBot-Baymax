@@ -8,27 +8,34 @@ This app runs the complete vision-to-voice path on the robot:
 4. flag a sustained **possible person on ground** observation and locate it in
    the `slam.pose` map;
 5. locate the primary face with YuNet;
-6. estimate its visible expression by averaging two EmotiEffLib ONNX models;
-   and
-7. after a confidently sad-looking expression, open with one of a handful of
-   short lines ("Hey, you okay? What's going on?"), listen for the answer
-   (whisper.cpp), and reply with the OpenRouter LLM for up to three turns
-   (`check_in.py`).
+6. estimate its visible expression by averaging two EmotiEffLib ONNX models
+   **through onnxruntime**; and
+7. after a sustained, confidently distressed-looking expression, open with one
+   of a handful of short lines ("Hey, you okay? What's going on?"), listen for
+   the answer (whisper.cpp), and reply with the OpenRouter LLM for up to three
+   turns (`check_in.py`).
 
 If whisper.cpp, espeak-ng, or the greeter voice modules are missing, the app
 falls back to playing `sad_prompt.wav`. If the LLM cannot be reached it gives
 a short fixed, supportive reply. Use `--no-check-in` to keep the recorded
 prompt only.
 
-The default trigger requires 60% smoothed confidence for 0.6 seconds, clears
-for 1.5 seconds before re-arming, and has a 30-second cooldown. A reading at
+The default trigger requires a **60% smoothed distress score** -- the summed
+sadness, anger, disgust and fear probabilities -- for 0.6 seconds, clears for
+1.5 seconds before re-arming, and has a 30-second cooldown. A distress score at
 or above `--sad-instant-confidence` (85%) skips the hold and speaks on the
 first frame, because waiting out a hold on a face the models are already sure
-about is what made the robot feel slow. A face must be inside a YOLO person
-box. Face detection runs only inside the primary person box, and expression
-classification runs every third scan until a reading leans sad, after which
-every scan is classified so the evidence builds at the full four-per-second
-rate. These estimates are fallible conversation cues, not claims about a
+about is what made the robot feel slow. The single `sadness`
+class cannot be used for this: AffectNet scores a plain frown as disgust 60% /
+sadness 20%, so a sadness-only gate never fires on the cue people actually
+give the robot. Measured on captured robot frames, the summed score separates
+cleanly: 87-100% on a held frown against 19-50% on neutral and surprised
+frames. The `[vision]` log line prints `distress=NN%`; watch that, not the
+class label, when tuning `--sad-confidence`. A face must be
+inside a YOLO person box. Face detection runs only inside the primary person
+box, and expression classification runs every third scan until a reading leans
+sad or distressed, after which every scan is classified so the evidence builds
+at the full four-per-second rate. These estimates are fallible conversation cues, not claims about a
 person's internal emotional state.
 
 ## Response latency
@@ -93,8 +100,23 @@ on), cropped with YuNet the same way the robot does:
 
 Contempt is removed before the argmax. Faces smaller than `--min-face-size`
 (32 px) are skipped, because accuracy falls from 57% at 64 px to 51% at 32 px
-and 44% at 24 px. The robot's 512x384 `camera.rect` shows faces at roughly
-30-45 px from a couple of metres, so stand close for reliable cues.
+and 44% at 24 px. The robot's 512x384 `camera.rect` is a 111-degree rectified
+view with `fy = 132 px`, so a face spans only about `132 * 0.22 / distance`
+pixels: ~58 px at 0.5 m, ~29 px at 1 m and ~15 px at 2 m. Only inside roughly
+0.75 m does a face clear both the 32 px floor and YuNet's 0.75 confidence, so
+stand close -- a couple of metres is far too far.
+
+**These models must run under onnxruntime.** OpenCV 4.8's `cv2.dnn`, which the
+robot ships, silently miscomputes these EfficientNet-B0 graphs: every input,
+including a photo of the floor and uniform noise, returns the same
+near-uniform distribution whose peak never exceeds ~25%. No error is raised,
+the trigger threshold simply becomes unreachable and the greeter never speaks.
+onnxruntime runs the byte-identical file correctly (a frowning reference face
+goes from "surprise 22%" to "disgust 53%") at ~103 ms per model on the Jetson.
+Install it with `python3 -m pip install --user onnxruntime`, then
+`python3 -m pip uninstall -y numpy`, because onnxruntime pulls numpy 2.x into
+the user site where it shadows the system numpy 1.21.5 that `cv2` needs. The
+app logs which backend it chose at startup and warns loudly on the fallback.
 
 ## Prepare the models
 
@@ -111,6 +133,19 @@ Place these files in `models/` on the robot:
 - `face_detection_yunet_2026may.onnx`
 - `enet_b0_8_best_afew.onnx`
 - `enet_b0_8_va_mtl.onnx` (optional; without it only one model runs)
+
+## The speaker is exclusive
+
+`speaker.audio` accepts one writer process at a time, and the always-on voice
+assistant (`bbapps/voice`, which execs `greeter/local_assistant.py`) holds that
+writer open for its entire lifetime. While it runs, both the spoken check-in
+and the `sad_prompt.wav` fallback fail with `RuntimeError: Writer for
+speaker.audio already exists`, so the greeter detects the expression, composes
+its line, and is silent. Stopping the voice app -- remove
+`/dev/shm/app-voice_lock` after `sudo systemctl stop voice-watchdog`, which
+otherwise recreates it within two seconds -- frees the speaker and the whole
+vision-to-voice path runs. Routing both apps through a single speaker owner is
+still open.
 
 The check-in imports `local_voice.py` and `voice_router.py` from
 `~/bbapps/greeter`, and reads `OPENROUTER_API_KEY` from `~/bbapps/.env`.

@@ -23,9 +23,12 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 
 import numpy as np
 from bbos import Config, Reader, Type, Writer
+
+import speech_relay
 
 try:
     from .gesture_runtime import RecordedGestureController
@@ -96,6 +99,34 @@ def load_env(path: Path) -> None:
         value = value.strip().strip("'\"")
         if key:
             os.environ.setdefault(key, value)
+
+
+def play_wav_file(writer, path: Path, speaker_cfg) -> None:
+    """Push a 16-bit PCM wav to the speaker this process owns."""
+
+    with wave.open(str(path), "rb") as source:
+        if (
+            source.getsampwidth() != 2
+            or source.getnchannels() != speaker_cfg.channels
+            or source.getframerate() != speaker_cfg.sample_rate
+        ):
+            raise ValueError(
+                f"{path} must be 16-bit PCM at {speaker_cfg.sample_rate} Hz, "
+                f"{speaker_cfg.channels} channel(s)"
+            )
+        period = speaker_cfg.chunk_size / speaker_cfg.sample_rate
+        due = time.monotonic()
+        while raw := source.readframes(speaker_cfg.chunk_size):
+            samples = np.frombuffer(raw, dtype="<i2")
+            if len(samples) < speaker_cfg.chunk_size * speaker_cfg.channels:
+                samples = np.pad(
+                    samples,
+                    (0, speaker_cfg.chunk_size * speaker_cfg.channels - len(samples)),
+                )
+            with writer.buf() as frame:
+                frame["audio"] = samples.reshape(-1, speaker_cfg.channels)
+            due += period
+            time.sleep(max(0.0, due - time.monotonic()))
 
 
 def play_speech(
@@ -328,6 +359,21 @@ def run_voice(args, router, transcriber, synthesizer, action_controller) -> None
         try:
             print("[local-assistant] Ready. Say: Hey BracketBot, then your question.")
             while True:
+                # This process owns the one speaker.audio writer, so apps that
+                # cannot open it (the emotion greeter's check-in and its wav
+                # prompt) post their line to the relay and this plays it.
+                # Served only between turns, so a relayed line never cuts into
+                # somebody's answer.
+                if not segmenter.recording and not pending_wake:
+                    speech_relay.serve_pending(
+                        lambda line: play_speech(
+                            speaker, synthesizer, line, speaker_cfg, args.volume
+                        ),
+                        play_wav=lambda path: play_wav_file(
+                            speaker, path, speaker_cfg
+                        ),
+                        log=lambda line: print(line, flush=True),
+                    )
                 triggered = False
                 if wakeword.ready():
                     active = bool(wakeword.data["active"])

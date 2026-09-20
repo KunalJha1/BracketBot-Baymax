@@ -10,6 +10,7 @@ so the conversation logic stays testable off the robot.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 import os
 from pathlib import Path
 import random
@@ -35,6 +36,7 @@ from local_voice import (  # noqa: E402
     speaker_chunks,
 )
 from voice_router import BrowserbaseSearchClient, OpenRouterClient  # noqa: E402
+import speech_relay  # noqa: E402
 
 
 # Short openers keep the first spoken moment quick and stop the robot from
@@ -214,10 +216,26 @@ class SadCheckIn:
     def speak(self, text: str) -> None:
         self.status = "speaking"
         self.log(f"[check-in] Baymax: {text}")
-        config = self.speaker_config
-        segments = speech_segments(text)
-        period = config.chunk_size / config.sample_rate
-        with self.open_speaker() as speaker:
+        stack = ExitStack()
+        try:
+            speaker = stack.enter_context(self.open_speaker())
+        except RuntimeError as error:
+            # speaker.audio takes one writer process, and the always-on voice
+            # assistant holds it for its whole lifetime. Ask whoever owns it to
+            # say this instead of failing the conversation. Delegating before
+            # synthesising also saves a TTS call we could not have played.
+            stack.close()
+            self.log(f"[check-in] Speaker owned elsewhere ({error}); relaying")
+            if not speech_relay.request(text=text):
+                raise LocalVoiceError(
+                    "speaker.audio is owned by another process and nothing is "
+                    "serving the speech relay"
+                ) from error
+            return
+        with stack:
+            config = self.speaker_config
+            segments = speech_segments(text)
+            period = config.chunk_size / config.sample_rate
             due = time.monotonic()
             # Only the first sentence needs the jitter-buffer lead; padding the
             # later ones would open a silent gap mid-reply.
