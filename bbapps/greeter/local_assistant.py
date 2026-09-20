@@ -141,6 +141,7 @@ def play_speech(
     volume: float,
     *,
     stream: bool = True,
+    cancelled=None,
 ) -> None:
     """Speak ``text``, synthesizing the next sentence while the current plays.
 
@@ -152,6 +153,8 @@ def play_speech(
     sentences = split_sentences(text) if stream else [text.strip()]
     sentences = [sentence for sentence in sentences if sentence]
     if not sentences:
+        return
+    if cancelled is not None and cancelled():
         return
 
     def render(sentence: str) -> np.ndarray:
@@ -182,6 +185,8 @@ def play_speech(
             if due is None:
                 due = time.monotonic()
             for chunk in chunks:
+                if cancelled is not None and cancelled():
+                    return
                 with writer.buf() as data:
                     data["audio"] = chunk.reshape(-1, speaker_cfg.channels)
                 due += period
@@ -475,11 +480,15 @@ def run_voice(args, router, transcriber, synthesizer, action_controller) -> None
                 # somebody's answer.
                 if not segmenter.recording and not pending_wake:
                     speech_relay.serve_pending(
-                        lambda line: play_speech(
-                            speaker, synthesizer, line, speaker_cfg, args.volume
+                        lambda line: action_controller.speak(
+                            play_speech, speaker, synthesizer, line, speaker_cfg, args.volume
                         ),
-                        play_wav=lambda path: play_wav_file(
-                            speaker, path, speaker_cfg
+                        play_wav=lambda path: action_controller.speak(
+                            play_wav_file, speaker, path, speaker_cfg
+                        ),
+                        speak_cancellable=lambda line, cancelled: action_controller.speak(
+                            play_speech, speaker, synthesizer, line, speaker_cfg, args.volume,
+                            cancelled=cancelled,
                         ),
                         log=lambda line: print(line, flush=True),
                     )

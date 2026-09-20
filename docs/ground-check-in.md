@@ -51,10 +51,10 @@ forever.
 
 ## Setup
 
-1. Deploy both updated vision files to the existing robot app directory:
+1. Deploy the updated vision files to the existing robot app directory:
 
    ```sh
-   scripts/bot push bbapps/emotion_greeter/main.py bbapps/emotion_greeter/ground_safety.py --to '~/bbapps/emotion_greeter/'
+   scripts/bot push bbapps/emotion_greeter/main.py bbapps/emotion_greeter/ground_safety.py bbapps/emotion_greeter/floor_roi.py --to '~/bbapps/emotion_greeter/'
    ```
 
    Restart the vision service using the robot's normal service workflow while
@@ -74,7 +74,23 @@ forever.
 3. Ensure `espeak-ng` is installed on the robot. Speech uses existing local
    synthesis and BBOS speaker helpers, with no LLM or network dependency. The
    line is rendered before opening the drive writer, so a missing speech
-   dependency refuses the start.
+   dependency refuses the start. An available speaker writer is reserved until
+   the approach ends. If the voice assistant owns it, the runner checks its
+   speech relay before moving and requests the line on arrival. A successful
+   playback receipt is required before reporting completion.
+
+   When using the voice assistant, deploy these updates too, then restart that
+   service while idle (the dashboard does not restart persistent services):
+
+   ```sh
+   scripts/bot push bbapps/greeter/local_assistant.py bbapps/greeter/speech_relay.py --to '~/bbapps/greeter/'
+   ```
+
+   An older, busy, or unavailable relay refuses the start with a visible error.
+   Stop cancels a queued request or stops streaming its remaining audio chunks;
+   audio already buffered by the speaker may still drain. Occupied LEDs are
+   left with their owner. An idle person tracker is allowed to stay running;
+   BBOS still refuses a second `drive.ctrl` writer if it is actively turning.
 
 4. Run `python3 scripts/robot_dashboard.py` and open
    <http://127.0.0.1:8020/>. **Check on person** owns the same exclusive base
@@ -110,15 +126,16 @@ wheel speed below 0.015 m/s and yaw speed below 0.04 rad/s for 0.6 seconds.
 This margin is based on visible joints; occluded limbs and depth errors still
 require physical evaluation.
 
-Only one alert with a current matching pose is eligible. A latched alert with
-unknown/missing depth, stale/future camera time, malformed data, or multiple
-alerts commands zero. Vision older than 1.0 s or depth older than 0.5 s also
-commands zero, including rotation. A changed vision session/track ID or a
+Only one alert with a current matching pose can establish a target. The latest
+controller can bridge an unavailable observation for at most 1.0 s using wheel
+odometry, while the camera capture must remain at most 2.0 s old. New observations
+require a file published within 1.0 s. Once those limits expire, or depth is older
+than 0.5 s, it commands zero, including rotation. A changed vision session/track ID or a
 position jump over 0.4 m terminates the attempt. Total duration is bounded to
 120 seconds. Safety stops bypass acceleration smoothing.
 
 The local obstacle corridor extends 0.85 m forward, covers robot width plus
-0.20 m on each side, and includes points from 0.03 to 1.70 m above the floor.
+0.20 m on each side, and includes points from 0.06 to 1.70 m above the fitted floor.
 Ten points block motion immediately; the person's points are never removed
 from obstacle checking. Sparse clouds cannot establish clearance. This is a
 local approach controller, not a route planner; it waits at obstructions.
@@ -130,14 +147,23 @@ PID limits, heading direction, obstacle braking, identity changes, standoff,
 wheel settling, one-shot speech, cancellation, and dashboard mutual exclusion.
 `--simulate` exercises the dashboard flow without connecting to hardware.
 
+`tests/test_ground_check_integration.py` runs the real ground assessment,
+confirmation timer, atomic file publisher, depth processing, control runner,
+PID and speech handoff against synthetic joints, a ramped floor and simulated
+wheel feedback. It checks standalone and shared-speaker completion plus obstacle,
+depth loss, vision loss, heartbeat loss and cancellation. Separate tests check
+speaker receipts/cancellation, busy motor ownership, the dashboard launch command,
+and imports from freshly copied deployment bundles. These do not validate camera
+inference, wheel calibration, physical clearance, or audible output on the robot.
+
 After dashboard connection has copied the runner bundle, a read-only robot
 diagnostic is:
 
 ```sh
-~/bbos/.venv/bin/python /tmp/robot_follow.py --ground-approach --dry-run --no-heartbeat
+scripts/bot py /tmp/robot_follow.py --ground-approach --dry-run --no-heartbeat --no-led
 ```
 
-This does not open `drive.ctrl` or play speech (it does display status LEDs).
+This does not open motor, LED, or speaker writers.
 Keep the robot stationary for this diagnostic because no motion compensates
 the target range. Existing `--preflight` and `--rotate-only` options also work
 with `--ground-approach`; live motion still requires dashboard heartbeats.

@@ -186,8 +186,17 @@ def test_reads_the_raw_head_topic_the_camera_daemon_publishes():
     assert pt.CAMERA_TOPIC == "camera.head.rgb"
 
 
-def test_a_base_held_by_an_idle_driver_is_a_refusal_not_a_crash():
+def test_a_base_held_by_an_idle_driver_is_a_refusal_not_a_crash(monkeypatch):
+    monkeypatch.setattr(pt, "teleop_relay_listening", lambda: False)
+
     class HeldRobot(FakeRobot):
+        # Exercise the production ownership boundary, not FakeRobot.open_drive,
+        # which deliberately has no BBOS error handling.
+        open_drive = pt.Robot.open_drive
+
+        def preflight(self, **_):
+            pass
+
         def Writer(self, *args, **kwargs):  # noqa: N802
             raise RuntimeError("Writer for drive.ctrl already exists (pid=1)")
 

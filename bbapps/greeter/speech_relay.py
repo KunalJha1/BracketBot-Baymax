@@ -21,6 +21,7 @@ not depend on the assistant running at all.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -70,18 +71,27 @@ def request(
     timeout: float = DEFAULT_TIMEOUT_S,
     spool: Path = SPOOL_DIR,
     poll_s: float = 0.05,
+    *,
+    cancel=None,
+    require_success: bool = False,
+    probe: bool = False,
 ) -> bool:
     """Ask the speaker's owner to say ``text`` (or play ``wav``).
 
-    Returns True once the owner reports it finished, False on timeout -- which
-    means nothing is serving the spool, so the caller should not assume the
-    person heard anything.
+    A strict caller requires an explicit successful playback receipt. A probe
+    verifies the owner's cancellation/receipt support without making a sound.
+    Cancellation removes the request; an updated owner checks it between chunks.
     """
 
-    if not text and wav is None:
+    if not text and wav is None and not probe:
         raise ValueError("speech relay needs text or a wav path")
+    if cancel is not None and cancel.is_set():
+        return False
     request_id = uuid.uuid4().hex
-    payload: dict[str, Any] = {"id": request_id, "created": time.time()}
+    payload: dict[str, Any] = {
+        "id": request_id, "created": time.time(), "expires": time.time() + timeout,
+        "cancellable": cancel is not None, "probe": probe,
+    }
     if text:
         payload["text"] = text
     if wav is not None:
@@ -94,9 +104,20 @@ def request(
     deadline = time.monotonic() + timeout
     try:
         while time.monotonic() < deadline:
+            if cancel is not None and cancel.is_set():
+                return False
             if done.exists():
-                return True
-            time.sleep(poll_s)
+                receipt = done.read_text()
+                if not receipt.strip():
+                    return not require_success  # Legacy owners only touched .done.
+                try:
+                    return json.loads(receipt).get("ok") is True
+                except (ValueError, AttributeError):
+                    return False
+            if cancel is None:
+                time.sleep(poll_s)
+            else:
+                cancel.wait(poll_s)
         return False
     finally:
         pending.unlink(missing_ok=True)
@@ -175,6 +196,7 @@ def serve_pending(
     spool: Path = SPOOL_DIR,
     log: Callable[[str], None] = lambda _message: None,
     now: Callable[[], float] = time.time,
+    speak_cancellable: Callable[[str, Callable[[], bool]], None] | None = None,
 ) -> int:
     """Play every queued request. Call this from the speaker owner's loop.
 
@@ -188,36 +210,57 @@ def serve_pending(
     for path in _pending_requests(spool):
         try:
             payload = json.loads(path.read_text())
-        except (OSError, ValueError):
+            created = float(payload.get("created") or 0.0)
+            expires = float(payload.get("expires", created + REQUEST_TTL_S if created else now() + REQUEST_TTL_S))
+            if not math.isfinite(created) or not math.isfinite(expires):
+                raise ValueError("invalid request time")
+        except (OSError, ValueError, TypeError, AttributeError):
             path.unlink(missing_ok=True)
             continue
 
-        request_id = str(payload.get("id") or path.stem)
-        created = float(payload.get("created") or 0.0)
-        if created and now() - created > REQUEST_TTL_S:
+        request_id = path.stem
+        if now() >= expires or (created and now() - created > REQUEST_TTL_S):
             log(f"[speech-relay] dropped stale request {request_id}")
             path.unlink(missing_ok=True)
             continue
 
+        def cancelled():
+            return not path.exists() or now() >= expires
+
+        ok, error = False, None
         try:
-            if payload.get("text"):
+            if payload.get("cancellable") and speak_cancellable is None:
+                raise RuntimeError("owner does not support cancellable playback")
+            if payload.get("probe"):
+                ok = True
+            elif payload.get("text"):
                 log(f"[speech-relay] speaking for another app: {payload['text']}")
-                speak_text(str(payload["text"]))
+                if payload.get("cancellable"):
+                    speak_cancellable(str(payload["text"]), cancelled)
+                else:
+                    speak_text(str(payload["text"]))
+                if cancelled():
+                    raise RuntimeError("playback cancelled or expired")
+                ok = True
                 spoken += 1
             elif payload.get("wav") and play_wav is not None:
+                if payload.get("cancellable"):
+                    raise RuntimeError("cancellable wav playback is unavailable")
                 log(f"[speech-relay] playing {payload['wav']}")
                 play_wav(Path(str(payload["wav"])))
+                ok = True
                 spoken += 1
-        except Exception as error:  # noqa: BLE001 - never kill the owner's loop
-            log(f"[speech-relay] request {request_id} failed: {error!r}")
+        except Exception as exc:  # noqa: BLE001 - never kill the owner's loop
+            error = str(exc)
+            log(f"[speech-relay] request {request_id} failed: {exc!r}")
         finally:
-            path.unlink(missing_ok=True)
-            # The marker is what unblocks the requester, so write it even when
-            # playback failed: it waited for an answer, not for success.
             try:
-                (path.parent / f"{request_id}.done").touch()
+                # Do not leave a receipt after the requester cancelled/timed out.
+                if path.exists():
+                    _write_atomic(path.with_suffix(".done"), {"ok": ok, "error": error})
             except OSError:
                 pass
+            path.unlink(missing_ok=True)
     return spoken
 
 

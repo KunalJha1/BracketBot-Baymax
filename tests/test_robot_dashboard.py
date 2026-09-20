@@ -894,7 +894,8 @@ def test_ground_check_in_simulates_a_single_spoken_line():
     assert state["error"] is None
 
 
-def test_ground_completion_is_not_reported_as_a_crash_after_cleanup(monkeypatch):
+@pytest.mark.parametrize("host", ["bot", "bracketbot@bracketbot-184.local"])
+def test_ground_completion_is_not_reported_as_a_crash_after_cleanup(monkeypatch, host):
     class CompletedProcess:
         stdin = None
         stdout = iter(["[follow] follow active (ground approach)\n",
@@ -914,12 +915,13 @@ def test_ground_completion_is_not_reported_as_a_crash_after_cleanup(monkeypatch)
         return CompletedProcess()
 
     controller = RobotController(("bot",), follow_args=("--v-max", "0.3"))
-    controller.state.host = "bot"
+    controller.state.host = host
     monkeypatch.setattr(controller, "_deploy", lambda *_args: None)
     monkeypatch.setattr("scripts.robot_dashboard.subprocess.Popen", popen)
     controller.set_follow(True, mode="ground")
     wait_for(lambda: follow_off(controller))
     assert "--ground-approach" in calls[0][-1]
+    assert calls[0][1:-2] == list(ssh_options_for_host(host))
     assert controller.state.snapshot()["follow_phase"] == "Check-in complete"
     assert controller.state.snapshot()["error"] is None
 

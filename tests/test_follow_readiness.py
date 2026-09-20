@@ -181,6 +181,31 @@ def test_preflight_opens_no_writers(robot, capsys):
     assert "PREFLIGHT OK" in capsys.readouterr().out
 
 
+def test_busy_led_does_not_prevent_follow_and_drive_is_still_zeroed(robot, monkeypatch, capsys):
+    bbos = sys.modules["bbos"]
+    writer = bbos.Writer
+
+    def open_writer(topic, *args, **kwargs):
+        if topic == "led.ctrl":
+            raise RuntimeError("Writer for led.ctrl already exists")
+        return writer(topic, *args, **kwargs)
+
+    monkeypatch.setattr(bbos, "Writer", open_writer)
+    robot.run()
+    assert_stopped(robot)
+    assert "LEDs already owned" in capsys.readouterr().out
+
+
+def test_busy_drive_never_sends_commands(robot, monkeypatch):
+    def open_writer(topic, *args, **kwargs):
+        raise RuntimeError(f"Writer for {topic} already exists")
+
+    monkeypatch.setattr(sys.modules["bbos"], "Writer", open_writer)
+    with pytest.raises(RuntimeError, match="drive.ctrl already exists"):
+        robot.run()
+    assert robot.writes == []
+
+
 def test_missing_live_input_never_opens_writers(robot):
     robot.missing = "camera.points"
     with pytest.raises(RuntimeError, match="refusing to start"):

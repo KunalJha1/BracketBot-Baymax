@@ -82,6 +82,7 @@ scp -q \
   bbapps/greeter/person_finder.py \
   bbapps/greeter/gesture_safety.py \
   bbapps/greeter/gesture_runtime.py \
+  bbapps/greeter/fist_target.py \
   bbapps/greeter/speech_relay.py \
   "$robot_host:/home/bracketbot/bbapps/greeter/"
 # The prepared answers must land beside the greeter modules: the robot has no
@@ -131,6 +132,10 @@ scp -q \
   scripts/follow_core.py \
   scripts/follow_perception.py \
   scripts/follow_calibration.py \
+  scripts/ground_approach.py \
+  scripts/ground_speech.py \
+  bbapps/greeter/local_voice.py \
+  bbapps/greeter/speech_relay.py \
   "$robot_host:/home/bracketbot/bbapps/follow/"
 # Keep the Whisper model resident. The CLI reloads it from disk on every
 # spoken turn, which is fixed latency in front of every single answer. If the

@@ -1,5 +1,9 @@
 import math
 import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -57,6 +61,26 @@ def test_runner_imports_without_bbos():
     assert "bbos" not in sys.modules
 
 
+@pytest.mark.parametrize("bundle", ["dashboard", "voice-launcher"])
+def test_fresh_deployment_bundle_imports_without_the_checkout(tmp_path, bundle):
+    from scripts.robot_dashboard import FOLLOW_MODULES, FOLLOW_RUNNER
+
+    root = Path(__file__).parents[1]
+    files = [FOLLOW_RUNNER, *FOLLOW_MODULES]
+    if bundle == "voice-launcher":
+        script = (root / "scripts/run_robot_local_voice.sh").read_text()
+        block = script.split('echo "Syncing the person follower', 1)[1].split('scp -q', 1)[1]
+        block = block.split('"$robot_host:', 1)[0].replace("\\\n", " ")
+        files = [root / name for name in shlex.split(block)]
+    for path in files:
+        shutil.copy2(path, tmp_path / path.name)
+    result = subprocess.run([sys.executable, "robot_follow.py", "--help"], cwd=tmp_path,
+                            env={k: v for k, v in os.environ.items() if k != "PYTHONPATH"},
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert "--ground-approach" in result.stdout
+
+
 def test_clamped_twist_reclamps_out_of_range_loop_output():
     cfg = robot_follow.FollowConfig(v_max=0.15, omega_max=0.8)
     stub_out = SimpleNamespace(v=-0.5, omega=5.0)
@@ -88,6 +112,16 @@ def test_other_drive_writers_ignores_self_and_parent_pids(monkeypatch):
 
     assert len(found) == 1
     assert str(other_pid) in found[0]
+
+
+def test_idle_person_tracker_does_not_block_start_but_teleop_does(monkeypatch):
+    def processes(command, **_):
+        pattern = command[-1]
+        output = f"999999 python {pattern}\n" if pattern in ("person_tracker.py", "robot_teleop.py") else ""
+        return SimpleNamespace(stdout=output, returncode=0)
+
+    monkeypatch.setattr(robot_follow.subprocess, "run", processes)
+    assert robot_follow.other_drive_writers() == ["999999 python robot_teleop.py"]
 
 
 def test_ground_mode_is_capped_independently_of_follow_speed():

@@ -60,7 +60,7 @@ FOLLOW_RUNNER = ROOT / "scripts" / "robot_follow.py"
 FOLLOW_MODULES = tuple(ROOT / "scripts" / name for name in (
     "follow_core.py", "follow_perception.py", "follow_calibration.py",
     "ground_approach.py", "ground_speech.py",
-)) + (ROOT / "bbapps" / "greeter" / "local_voice.py",)
+)) + tuple(ROOT / "bbapps" / "greeter" / name for name in ("local_voice.py", "speech_relay.py"))
 REMOTE_FOLLOW_RUNNER = "/tmp/robot_follow.py"
 # Must match follow_core (FollowConfig gap bounds and STATUS_PREFIX); a test checks this.
 FOLLOW_GAP_MIN = 0.6
@@ -1696,7 +1696,7 @@ class RobotController:
                 REMOTE_FOLLOW_RUNNER, "--gap", f"{gap:.2f}", "--pid-file", pid_file, *self.follow_args, *extra_args
             )
             process = subprocess.Popen(
-                ["ssh", *SSH_OPTIONS, host, remote_command],
+                ["ssh", *ssh_options_for_host(host), host, remote_command],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -2103,7 +2103,7 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:560px; overflow:a
   <div class="controls">
     <button id="reconnect" class="secondary">Reconnect</button>
     <button id="follow" class="secondary" aria-pressed="false"><span class="key">F</span>Follow me</button>
-    <button id="ground-check-in" class="secondary" aria-pressed="false" title="Approach slowly, stop 1 m outside the body, and ask if they need help">Check on person</button>
+    <button id="ground-check-in" class="secondary" aria-pressed="false" title="Approach slowly, stop outside the body, and ask if they need help">Check on person</button>
     <button id="stop" class="stop" disabled><span class="key">Esc</span>Stop action</button>
   </div>
   <div class="follow-gap">
@@ -2129,7 +2129,14 @@ function followText(c) {
     if(!c.follow_enabled&&!c.follow_transition) return `Check-in: ${c.follow_phase==='Check-in complete'?'complete':'off'}`;
     const s=c.follow_status;
     if(!s) return `Check-in: ${c.follow_phase}`;
-    if(s.state==='WAITING') return 'Check-in: waiting for one clearly visible person on the ground';
+    const reasons={
+      'target-unavailable':'waiting for one fresh, confirmed person on the ground',
+      'points-stale':'paused: waiting for fresh depth data',
+      'blocked':'paused: obstacle ahead',
+      'settling':'stopping: waiting for the wheels to settle'
+    };
+    if(reasons[s.rule]) return `Check-in: ${reasons[s.rule]}`;
+    if(s.state==='WAITING') return `Check-in: paused (${s.rule||'waiting for data'})`;
     if(s.state==='ARRIVED') return 'Check-in: stopped beside the person';
     return `Check-in: ${s.state.toLowerCase()} · ${s.range==null?'—':s.range.toFixed(2)+' m from body'} · max 5 cm/s`;
   }

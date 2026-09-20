@@ -3,8 +3,54 @@ from types import SimpleNamespace
 import threading
 
 import numpy as np
+import pytest
 
 from ground_speech import GroundSpeech
+
+
+def test_busy_speaker_uses_relay_and_requires_success_before_completing():
+    calls = []
+
+    def open_writer():
+        raise RuntimeError("Writer for speaker.audio already exists")
+
+    def request(**kwargs):
+        calls.append(kwargs)
+        return kwargs.get("probe", False)  # Available, but actual playback fails.
+
+    speech = GroundSpeech(None, open_writer, [], relay_request=request)
+    speech.reserve()
+    assert len(calls) == 1 and calls[0]["probe"] is True
+    speech.start()
+    assert speech.done.wait(2)
+    speech.close()
+    assert len(calls) == 2 and calls[1]["text"] == "hello specimen, are you in trouble"
+    assert calls[1]["require_success"] is True
+    assert "not confirmed" in speech.error
+
+
+def test_unavailable_relay_is_refused_before_driving():
+    def open_writer():
+        raise RuntimeError("Writer for speaker.audio already exists")
+
+    speech = GroundSpeech(None, open_writer, [], relay_request=lambda **_: False)
+    with pytest.raises(RuntimeError, match="speech relay"):
+        speech.reserve()
+    speech.close()
+
+
+def test_unrelated_speaker_errors_are_not_hidden_by_relay():
+    def open_writer():
+        raise RuntimeError("speaker daemon broken")
+
+    def unexpected(**_):
+        pytest.fail("unrelated writer errors must not use relay")
+
+    speech = GroundSpeech(None, open_writer, [], relay_request=unexpected)
+    speech.start()
+    assert speech.done.wait(2)
+    speech.close()
+    assert speech.error == "speaker daemon broken"
 
 
 def test_speech_plays_once_and_releases_writer():

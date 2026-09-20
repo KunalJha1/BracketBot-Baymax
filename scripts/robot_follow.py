@@ -48,8 +48,10 @@ STATE_TIMEOUT = 0.3
 DRIVE_WRITER_PATTERNS = (
     "bbapps/greeter/main.py", "nav/main.py", "bbapps/teleop.py", "quest_teleop/main.py",
     "leader_follower_teleop.py", "live_inference.py", "robot_follow.py", "robot_base_mode.py",
-    "person_tracker.py",
+    "robot_teleop.py",
 )
+# person_tracker opens drive.ctrl only during a turn. Its idle process is not
+# ownership evidence; BBOS's exclusive Writer arbitrates both sides of a race.
 CSV_FIELDS = (
     "t", "state", "rule", "gap", "range", "bearing", "error", "v_cmd", "omega_cmd", "v", "omega",
     "measured_v", "measured_omega", "blocked", "corridor_points", "track_age", "people",
@@ -621,7 +623,14 @@ def run(args):
             check_ground_service(args.ground_alert_file)
         if not args.dry_run:
             drive = stack.enter_context(Writer("drive.ctrl", Type("drive_ctrl"), keeptime=False))
-        led = None if args.no_led else stack.enter_context(Writer("led.ctrl", Type("led_ctrl"), keeptime=False))
+        led = None
+        if not args.no_led:
+            try:
+                led = stack.enter_context(Writer("led.ctrl", Type("led_ctrl"), keeptime=False))
+            except RuntimeError as exc:
+                if "Writer for led.ctrl already exists" not in str(exc):
+                    raise
+                print("[follow] LEDs already owned; leaving them with the current owner", flush=True)
         mode = "dry run" if args.dry_run else "rotate only" if args.rotate_only else f"v_max {cfg.v_max:.2f} m/s"
         if args.ground_approach:
             print(f"[follow] follow active (ground approach, {mode}, {STANDOFF:.1f} m body standoff)", flush=True)

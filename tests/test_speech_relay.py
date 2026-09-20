@@ -139,6 +139,73 @@ def test_request_requires_something_to_say(tmp_path):
         speech_relay.request(spool=tmp_path)
 
 
+@pytest.mark.parametrize("outcome", ["success", "failed", "cancelled"])
+def test_strict_cancellable_request_reports_actual_playback(tmp_path, outcome):
+    cancel, playing = threading.Event(), threading.Event()
+    results = []
+
+    def speak(text, cancelled):
+        assert text == "hello specimen, are you in trouble"
+        playing.set()
+        if outcome == "failed":
+            raise RuntimeError("speaker stopped")
+        if outcome == "cancelled":
+            cancel.set()
+            deadline = time.monotonic() + 2
+            while not cancelled() and time.monotonic() < deadline:
+                time.sleep(.005)
+            assert cancelled()
+
+    caller = threading.Thread(target=lambda: results.append(speech_relay.request(
+        text="hello specimen, are you in trouble", spool=tmp_path,
+        cancel=cancel, require_success=True, timeout=3)))
+    caller.start()
+    deadline = time.monotonic() + 2
+    while not list(tmp_path.glob("*.json")) and time.monotonic() < deadline:
+        time.sleep(.005)
+    speech_relay.serve_pending(lambda _: pytest.fail("must use cancellation callback"),
+                               spool=tmp_path, speak_cancellable=speak)
+    caller.join(2)
+    assert not caller.is_alive() and playing.is_set()
+    assert results == [outcome == "success"]
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("updated_owner", [True, False])
+def test_probe_checks_cancellation_support_without_speaking(tmp_path, updated_owner):
+    results = []
+
+    def unexpected(*_):
+        pytest.fail("probe must never speak")
+
+    caller = threading.Thread(target=lambda: results.append(speech_relay.request(
+        probe=True, spool=tmp_path, cancel=threading.Event(), require_success=True, timeout=3)))
+    caller.start()
+    deadline = time.monotonic() + 2
+    while not list(tmp_path.glob("*.json")) and time.monotonic() < deadline:
+        time.sleep(.005)
+    assert speech_relay.serve_pending(unexpected, spool=tmp_path,
+        speak_cancellable=unexpected if updated_owner else None) == 0
+    caller.join(2)
+    assert results == [updated_owner]
+
+
+def test_strict_request_does_not_accept_an_old_empty_receipt(tmp_path):
+    results = []
+    caller = threading.Thread(target=lambda: results.append(speech_relay.request(
+        probe=True, spool=tmp_path, require_success=True, timeout=2)))
+    caller.start()
+    deadline = time.monotonic() + 1
+    paths = []
+    while not paths and time.monotonic() < deadline:
+        paths = list(tmp_path.glob("*.json"))
+        time.sleep(.005)
+    assert paths
+    paths[0].with_suffix(".done").touch()
+    caller.join(2)
+    assert results == [False]
+
+
 def test_led_status_round_trips_and_expires(tmp_path):
     speech_relay.post_led_status("listening", ttl=10.0, spool=tmp_path)
     assert speech_relay.read_led_status(spool=tmp_path) == "listening"
