@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from scripts.camera_point_motion import (
+    aim_error_degrees,
     motor_command_path,
     pointing_goal,
     quaternion_from_z,
@@ -9,31 +10,33 @@ from scripts.camera_point_motion import (
 )
 
 
-def test_point_goal_raises_high_camera_target_into_pointing_band():
-    side, position, _ = pointing_goal(
-        x_offset=0.7,
-        y_offset=-0.4,
+def test_point_goal_raises_high_target_into_pointing_band_and_preserves_aim():
+    target = np.array([2.0, -0.7, 1.6])
+    side, position, direction, quaternion = pointing_goal(
+        target=target,
         current_hand_height=0.43,
         shoulder_height=1.265,
     )
 
     assert side == "right"
     assert position[1] < 0
-    assert position[2] == pytest.approx(0.995)
-    assert np.linalg.norm(position[:2]) == pytest.approx(0.30)
+    assert 1.265 - 0.60 <= position[2] <= 1.265 - 0.20
+    expected = target - position
+    np.testing.assert_allclose(direction, expected / np.linalg.norm(expected))
+    assert aim_error_degrees(quaternion, direction) < 1e-5
 
 
-def test_point_goal_uses_left_arm_for_image_left():
-    side, position, _ = pointing_goal(-0.7, 0.5, 0.40, 1.265)
+def test_point_goal_uses_left_arm_for_target_on_robot_left():
+    side, position, _, _ = pointing_goal([2.0, 0.7, 1.0], 0.40, 1.265)
 
     assert side == "left"
     assert position[1] > 0
 
 
 def test_point_goal_tracks_camera_height_and_caps_total_lift():
-    _, high, _ = pointing_goal(0.2, -1.0, 0.43, 1.265)
-    _, low, _ = pointing_goal(0.2, 1.0, 0.43, 1.265)
-    _, capped, _ = pointing_goal(0.2, -1.0, 0.20, 1.265)
+    _, high, _, _ = pointing_goal([2.0, -0.2, 1.8], 0.43, 1.265)
+    _, low, _, _ = pointing_goal([2.0, -0.2, -5.0], 0.43, 1.265)
+    _, capped, _, _ = pointing_goal([2.0, -0.2, 1.8], 0.20, 1.265)
 
     assert high[2] > low[2]
     assert high[2] <= 1.265 - 0.20

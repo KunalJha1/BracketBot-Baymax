@@ -330,12 +330,13 @@ def test_status_has_per_process_identity_for_browser_hot_reload():
     assert "window.location.reload()" in PAGE
 
 
-def test_source_reloader_waits_for_safe_balance_state(tmp_path):
+@pytest.mark.parametrize("busy_field", ["lean_enabled", "follow_enabled", "follow_transition"])
+def test_source_reloader_waits_for_safe_balance_state(tmp_path, busy_field):
     source = tmp_path / "dashboard.py"
     source.write_text("first")
     assert file_signature(source) is not None
     controller = RobotController(("not-used",), simulate=True)
-    assert controller.set_lean(True)[0]
+    setattr(controller.state, busy_field, True)
     stopped = threading.Event()
     reload_requested = threading.Event()
     watcher_stop = threading.Event()
@@ -350,7 +351,7 @@ def test_source_reloader_waits_for_safe_balance_state(tmp_path):
     try:
         source.write_text("second version")
         assert not stopped.wait(0.9)
-        assert controller.set_lean(False)[0]
+        setattr(controller.state, busy_field, False)
         assert stopped.wait(1.2)
         assert reload_requested.is_set()
     finally:

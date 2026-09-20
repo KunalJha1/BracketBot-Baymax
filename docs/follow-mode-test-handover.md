@@ -1,5 +1,11 @@
 # Follow mode — handover for robot testing
 
+**Current setup instructions:** [Follow readiness](follow-readiness.md). Use the
+per-robot JSON calibration and `--preflight` workflow there before these physical
+gates. It supersedes the old instructions to edit source constants or turn an
+entire nearby cloud into a self mask. The historical laptop test count below
+is not the current suite count.
+
 Everything in this branch has been tested on a laptop only: 118 automated tests
 pass, including a closed-loop simulation. **Nothing has run on the robot.** This
 page is what you need to change that. Design:

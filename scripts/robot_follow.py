@@ -34,17 +34,17 @@ from follow_core import (
     FollowConfig, FollowLoop, Perception, PersonObservation, TickInputs, clamp, led_color,
     parse_command, start_refusal, status_line, wheel_twist,
 )
-from follow_perception import ClusterConfig, base_to_local, find_people
+from follow_calibration import Calibration, DEFAULT_PATH, load_calibration
+from follow_perception import ClusterConfig, base_to_local, find_people, without_self
 
 PERIOD = 0.02  # 50 Hz control loop; drive.ctrl times out after 0.1 s
 STATUS_PERIOD = 0.2
 CSV_PERIOD = 0.05
-# drive.state.vel -> (left, right) turns/s, forward-positive. Verified at gates G3/G4a.
-WHEEL_ORDER = (0, 1)
-WHEEL_SIGNS = (1.0, 1.0)
+STATE_TIMEOUT = 0.3
 DRIVE_WRITER_PATTERNS = (
     "greeter/main.py", "nav/main.py", "bbapps/teleop.py", "quest_teleop/main.py",
     "leader_follower_teleop.py", "live_inference.py", "robot_follow.py", "robot_base_mode.py",
+    "person_tracker.py",
 )
 CSV_FIELDS = (
     "t", "state", "rule", "gap", "range", "bearing", "error", "v_cmd", "omega_cmd", "v", "omega",
@@ -66,10 +66,14 @@ def build_parser():
     parser.add_argument("--v-max", type=float, default=cfg.v_max)
     parser.add_argument("--pid-file", type=Path)
     parser.add_argument("--log-dir", type=Path, default=Path("/tmp"))
-    parser.add_argument("--dry-run", action="store_true", help="compute and log; never open drive.ctrl")
-    parser.add_argument("--rotate-only", action="store_true", help="forward speed held at 0 (gate G3)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="compute and log; never open drive.ctrl")
+    mode.add_argument("--rotate-only", action="store_true", help="forward speed held at 0 (gate G3)")
     parser.add_argument("--no-heartbeat", action="store_true", help="only with --dry-run: no dashboard needed")
-    parser.add_argument("--check", action="store_true", help="gate G0: print the clusters seen for 3 s, then exit")
+    mode.add_argument("--check", action="store_true", help="gate G0: print the clusters seen for 3 s, then exit")
+    mode.add_argument("--preflight", action="store_true", help="validate calibration and live inputs; opens no writers")
+    parser.add_argument("--calibration", type=Path, default=DEFAULT_PATH,
+                        help="robot-specific JSON calibration (default: ~/.config/baymax/follow.json)")
     return parser
 
 
@@ -113,16 +117,30 @@ def other_drive_writers():
     return found
 
 
-def perceive(points_base, t, cluster_cfg=ClusterConfig()):
+def perceive(points_base, t, cluster_cfg=ClusterConfig(), calibration=None):
     """One camera.points frame -> Perception with every person-sized cluster."""
-    local = base_to_local(points_base)
+    calibration = calibration or Calibration()
+    local = without_self(base_to_local(points_base, calibration.left_sign), calibration.self_mask)
     people = tuple(PersonObservation(c.forward, c.left) for c in find_people(local, cluster_cfg))
     return Perception(t, people, local)
 
 
 def cloud(data):
     n = int(data["num_points"])
-    return np.asarray(data["points"][:n])
+    points = np.asarray(data["points"])
+    if points.ndim != 2 or points.shape[1] != 3 or not 0 <= n <= len(points):
+        raise RuntimeError("invalid camera.points count or shape; expected num_points and Nx3 points")
+    points = points[:n].copy()
+    if not np.isfinite(points).all():
+        raise RuntimeError("non-finite camera.points; check the depth daemon")
+    return points
+
+
+def state_vector(data, field, size, topic):
+    value = np.asarray(data[field], dtype=float).copy()
+    if value.shape != (size,) or not np.isfinite(value).all():
+        raise RuntimeError(f"invalid {topic}.{field}; expected {size} finite values")
+    return value
 
 
 def start_command_reader(commands):
@@ -152,14 +170,15 @@ def write_led(writer, rgb):
         frame["period_ms"] = np.uint16(0)
 
 
-def run_check(reader_cls, seconds=3.0):
+def run_check(reader_cls, seconds=3.0, calibration=None):
     """Read-only: print the person-sized clusters in each camera.points frame."""
     with reader_cls("camera.points", keeptime=False) as points:
         wait_fresh(points, 3.0, "camera.points")
         end = time.monotonic() + seconds
         while time.monotonic() < end:
             if points.ready():
-                people = find_people(base_to_local(cloud(points.data)))
+                cal = calibration or Calibration()
+                people = find_people(without_self(base_to_local(cloud(points.data), cal.left_sign), cal.self_mask))
                 print(json.dumps({"clusters": [
                     {"forward": round(c.forward, 2), "left": round(c.left, 2), "points": c.points,
                      "top": round(c.top, 2), "depth": round(c.depth, 2), "width": round(c.width, 2)}
@@ -168,8 +187,9 @@ def run_check(reader_cls, seconds=3.0):
             time.sleep(0.05)
 
 
-def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width):
+def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width, calibration=None):
     points, imu, drive_state = readers
+    calibration = calibration or Calibration()
     loop = FollowLoop(cfg, args.gap)
     commands = queue.Queue()
     if not args.no_heartbeat:
@@ -177,9 +197,12 @@ def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width):
     now = time.monotonic()
     last_heartbeat = now
     command_stop = False
-    rpy = np.zeros(3)
-    measured = (0.0, 0.0)
+    last_imu = last_drive = now
+    rpy = state_vector(imu.data, "rpy", 3, "imu.orientation")
+    vel = state_vector(drive_state.data, "vel", 2, "drive.state")
+    measured = wheel_twist(vel[list(calibration.wheel_order)], wheel_diam, robot_width, calibration.wheel_signs)
     last_status = last_csv = 0.0
+    last_flush = now
     state, state_since = None, now
     log_path = args.log_dir / f"baymax_follow_{time.strftime('%Y%m%d_%H%M%S')}.csv"
     with log_path.open("w", newline="") as log_file:
@@ -187,7 +210,7 @@ def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width):
         log.writeheader()
         print(f"[follow] logging to {log_path}", flush=True)
         while True:
-            t = time.monotonic()
+            tick_started = t = time.monotonic()
             while not commands.empty():
                 line = commands.get()
                 if line is None:
@@ -206,15 +229,24 @@ def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width):
                 last_heartbeat = t
 
             if imu.ready():
-                rpy = np.asarray(imu.data["rpy"], dtype=float)
+                rpy = state_vector(imu.data, "rpy", 3, "imu.orientation")
+                last_imu = t
             if drive_state.ready():
-                vel = np.asarray(drive_state.data["vel"], dtype=float)
-                measured = wheel_twist(vel[list(WHEEL_ORDER)], wheel_diam, robot_width, WHEEL_SIGNS)
+                vel = state_vector(drive_state.data, "vel", 2, "drive.state")
+                measured = wheel_twist(vel[list(calibration.wheel_order)], wheel_diam, robot_width, calibration.wheel_signs)
+                last_drive = t
+            if t - last_imu > STATE_TIMEOUT or t - last_drive > STATE_TIMEOUT:
+                raise RuntimeError("stale imu.orientation or drive.state; stopping follow")
             perception = perception_ms = None
             if points.ready():
                 perception_started = time.monotonic()
-                perception = perceive(cloud(points.data), t)
+                perception = perceive(cloud(points.data), t, calibration=calibration)
                 perception_ms = (time.monotonic() - perception_started) * 1000.0
+
+            # Include perception work in freshness and heartbeat checks.
+            t = time.monotonic()
+            if t - last_imu > STATE_TIMEOUT or t - last_drive > STATE_TIMEOUT:
+                raise RuntimeError("stale imu.orientation or drive.state; stopping follow")
 
             out = loop.tick(TickInputs(
                 t=t, heartbeat_age=t - last_heartbeat,
@@ -239,26 +271,39 @@ def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width):
                     "measured_v": measured[0], "measured_omega": measured[1], "blocked": out.blocked,
                     "corridor_points": out.corridor_points, "track_age": out.track_age,
                     "people": "" if perception is None else len(perception.people),
-                    "tick_ms": round((time.monotonic() - t) * 1000, 3),
+                    "tick_ms": round((time.monotonic() - tick_started) * 1000, 3),
                     "perception_ms": "" if perception_ms is None else round(perception_ms, 3),
                 })
                 last_csv = t
+            if t - last_flush >= 1.0:
+                log_file.flush()
+                last_flush = t
             if out.exit:
                 print(f"[follow] exit: {out.rule}", flush=True)
                 return
-            time.sleep(max(0.0, PERIOD - (time.monotonic() - t)))
+            time.sleep(max(0.0, PERIOD - (time.monotonic() - tick_started)))
 
 
 def run(args):
+    calibration = load_calibration(args.calibration, required=args.preflight or not (args.check or args.dry_run))
+    if calibration is None:
+        print("[follow] UNCALIBRATED diagnostic: assumed left sign, no self mask; not motion-ready", flush=True)
+    elif args.v_max > calibration.motion_speed_limit:
+        raise RuntimeError(f"requested speed exceeds calibrated limit {calibration.motion_speed_limit:.2f} m/s")
+
     from bbos import Config, Reader, Type, Writer
 
     if args.check:
-        run_check(Reader)
+        run_check(Reader, calibration=calibration)
         return
     cfg = loop_config(args)
+    if calibration is not None:
+        cfg = replace(cfg, self_mask=calibration.self_mask)
     drive_cfg = Config("drive")
     wheel_diam = float(drive_cfg.wheel_diam)
     robot_width = float(getattr(drive_cfg, "robot_width", cfg.robot_width))
+    if not np.isfinite([wheel_diam, robot_width]).all() or min(wheel_diam, robot_width) <= 0:
+        raise RuntimeError("invalid drive wheel diameter or robot width")
     low_battery_v = getattr(Config("base"), "low_battery_v", None)
     with ExitStack() as stack:
         points = stack.enter_context(Reader("camera.points", keeptime=False))
@@ -266,18 +311,21 @@ def run(args):
         drive_state = stack.enter_context(Reader("drive.state", keeptime=False))
         drive_status = stack.enter_context(Reader("drive.status", keeptime=False))
 
-        rpy = np.asarray(wait_fresh(imu, 2.0, "imu.orientation")["rpy"], dtype=float)
+        rpy = state_vector(wait_fresh(imu, 2.0, "imu.orientation"), "rpy", 3, "imu.orientation")
+        state_vector(wait_fresh(drive_state, 2.0, "drive.state"), "vel", 2, "drive.state")
         try:
-            wait_fresh(points, 2.0, "camera.points")
+            cloud(wait_fresh(points, 2.0, "camera.points"))
             points_fresh = True
         except RuntimeError:
             points_fresh = False
         try:
-            voltage = float(wait_fresh(drive_status, 2.0, "drive.status")["voltage"])
+            voltage = float(wait_fresh(drive_status, 5.0, "drive.status")["voltage"])
         except RuntimeError:
             voltage = None
-        if low_battery_v is None:
-            print("[follow] warning: base.low_battery_v unknown; battery not checked", flush=True)
+        if low_battery_v is None or not np.isfinite(float(low_battery_v)):
+            raise RuntimeError("base.low_battery_v unavailable; cannot check battery")
+        if voltage is None or not np.isfinite(voltage):
+            raise RuntimeError("drive.status.voltage unavailable; cannot check battery")
         refusal = start_refusal(
             cfg, roll_deg=float(rpy[0]), pitch_deg=float(rpy[1]), voltage=voltage,
             low_battery_v=None if low_battery_v is None else float(low_battery_v),
@@ -286,6 +334,17 @@ def run(args):
         if refusal:
             raise RuntimeError(f"refusing to start: {refusal}")
 
+        # The slow battery topic may have taken several seconds. Refresh fast
+        # inputs immediately before allowing writers, including the upright test.
+        rpy = state_vector(wait_fresh(imu, 2.0, "imu.orientation"), "rpy", 3, "imu.orientation")
+        state_vector(wait_fresh(drive_state, 2.0, "drive.state"), "vel", 2, "drive.state")
+        cloud(wait_fresh(points, 2.0, "camera.points"))
+        if max(abs(rpy[0]), abs(rpy[1])) > cfg.upright_deg:
+            raise RuntimeError("refusing to start: robot is not upright")
+        if args.preflight:
+            print("[follow] PREFLIGHT OK: calibration and live inputs checked; no writers opened. Physical gates still required.", flush=True)
+            return
+
         drive = None
         if not args.dry_run:
             drive = stack.enter_context(Writer("drive.ctrl", Type("drive_ctrl"), keeptime=False))
@@ -293,7 +352,7 @@ def run(args):
         mode = "dry run" if args.dry_run else "rotate only" if args.rotate_only else f"v_max {cfg.v_max:.2f} m/s"
         print(f"[follow] follow active ({mode}, gap {args.gap:.2f} m) - stand in front of the robot", flush=True)
         try:
-            control_loop(args, cfg, (points, imu, drive_state), drive, led, wheel_diam, robot_width)
+            control_loop(args, cfg, (points, imu, drive_state), drive, led, wheel_diam, robot_width, calibration)
         finally:
             if drive is not None:
                 for _ in range(6):
