@@ -76,6 +76,10 @@ NOT_FOUND_MESSAGE = (
 )
 SCAN_LED = ((72, 205, 220), "pulse")
 REMINDER_LED = ((255, 185, 40), "blink", 8.0)
+# A reminder can land while the audience is watching the arms rather than
+# the lights. A short chime ahead of the spoken text makes the delivery
+# legible across a noisy room without owning the speaker for long.
+REMINDER_SOUND = "sound-processing"
 MAX_REMINDER_SECONDS = 365 * 24 * 60 * 60
 
 
@@ -249,6 +253,13 @@ class VoiceActionController:
             raise RuntimeError("assistant audio is not ready")
         if self.leds is not None:
             self.leds.start_effect(*REMINDER_LED)
+        try:
+            self._play_sound(self.assets_dir / SOUND_FILES[REMINDER_SOUND])
+        except Exception:
+            # The chime is an attention aid. A missing or unplayable asset must
+            # not fail delivery, because that would retry the whole reminder
+            # and suppress the spoken text the reminder exists to give.
+            pass
         message = (
             f"Reminder: {reminder.message}."
             if reminder.message

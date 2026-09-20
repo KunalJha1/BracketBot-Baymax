@@ -22,6 +22,7 @@ from main import (  # noqa: E402
     SadVoiceTrigger,
     expression_probabilities,
     face_belongs_to_person,
+    leans_sad,
     square_face_box,
     yolo_detections,
 )
@@ -29,7 +30,9 @@ from check_in import (  # noqa: E402
     FALLBACK_REPLY,
     NO_ANSWER_REPLY,
     OPENING_LINE,
+    OPENING_LINES,
     SadCheckIn,
+    speech_segments,
 )
 
 
@@ -44,18 +47,71 @@ def test_face_must_be_inside_a_yolo_person_box():
     assert not face_belongs_to_person(Expression(200, 20, 240, 60, "sadness", 0.9), people)
 
 
+def borderline():
+    """A cue above the trigger threshold but below the instant one."""
+    return expression(confidence=0.7)
+
+
 def test_robot_sadness_cue_is_debounced():
     trigger = SadVoiceTrigger(
         hold_seconds=1.5,
         cooldown_seconds=30,
         reset_seconds=2,
         confidence=0.6,
+        instant_confidence=0.85,
     )
 
-    assert not trigger.update(expression(), True, 0)
-    assert not trigger.update(expression(), True, 1.49)
-    assert trigger.update(expression(), True, 1.5)
-    assert not trigger.update(expression(), True, 60)
+    assert not trigger.update(borderline(), True, 0)
+    assert not trigger.update(borderline(), True, 1.49)
+    assert trigger.update(borderline(), True, 1.5)
+    assert not trigger.update(borderline(), True, 60)
+
+
+def test_unmistakable_sadness_cue_skips_the_hold():
+    trigger = SadVoiceTrigger(
+        hold_seconds=1.5,
+        cooldown_seconds=30,
+        reset_seconds=2,
+        confidence=0.6,
+        instant_confidence=0.85,
+    )
+
+    assert trigger.update(expression(confidence=0.9), True, 0)
+
+
+def test_instant_cue_still_respects_the_cooldown():
+    trigger = SadVoiceTrigger(
+        hold_seconds=1.5,
+        cooldown_seconds=30,
+        reset_seconds=2,
+        confidence=0.6,
+        instant_confidence=0.85,
+    )
+    assert trigger.update(expression(confidence=0.9), True, 0)
+
+    # Stay clear long enough to re-arm, then frown again inside the cooldown.
+    assert not trigger.update(None, False, 3)
+    assert not trigger.update(None, False, 5.1)
+    assert trigger.armed
+    assert not trigger.update(expression(confidence=0.9), True, 6)
+    assert trigger.update(expression(confidence=0.9), True, 31)
+
+
+def test_sad_leaning_readings_are_recognised_at_any_confidence():
+    assert leans_sad(expression("sadness", 0.2))
+    assert leans_sad(expression("sad", 0.99))
+    assert not leans_sad(expression("neutral", 0.99))
+    assert not leans_sad(None)
+
+
+def test_trigger_reports_when_sad_evidence_is_building():
+    trigger = SadVoiceTrigger(hold_seconds=1.5, confidence=0.6, instant_confidence=0.85)
+
+    assert not trigger.warming
+    trigger.update(borderline(), True, 0)
+    assert trigger.warming
+    trigger.update(None, False, 1)
+    assert not trigger.warming
 
 
 def test_yolo_pose_output_decodes_person_box():
@@ -222,15 +278,29 @@ class FakeFaceDetector:
         return 1, np.asarray([self.face], dtype=np.float32)
 
 
-def fake_analyzer(face, nets, min_face_size=40):
+def fake_analyzer(face, nets, min_face_size=40, smoothing=1.0, attack=None):
     analyzer = ExpressionAnalyzer.__new__(ExpressionAnalyzer)
     analyzer.face_detector = FakeFaceDetector(face)
     analyzer.expression_nets = nets
-    analyzer.smoothing = 1.0
+    analyzer.smoothing = smoothing
+    analyzer.attack = smoothing if attack is None else attack
     analyzer.min_face_size = min_face_size
     analyzer.scores = None
     analyzer.missing_frames = 0
     return analyzer
+
+
+class SwitchableNet:
+    """One fake model whose predicted expression can change between frames."""
+
+    def __init__(self, label):
+        self.label = label
+
+    def setInput(self, _blob):
+        pass
+
+    def forward(self):
+        return np.asarray(one_hot(self.label), dtype=np.float32)[None, :]
 
 
 def one_hot(label, size=8):
@@ -249,6 +319,50 @@ def test_expression_analyzer_averages_model_ensemble():
 
     assert result.label == "sadness"
     assert (result.x2 - result.x1) == (result.y2 - result.y1) == 100
+
+
+def sadness_after_frames(frames, **smoothing):
+    """Read the smoothed sadness score after a run of predicted labels."""
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    net = SwitchableNet(frames[0])
+    analyzer = fake_analyzer([50, 50, 80, 100], [net], **smoothing)
+    for label in frames:
+        net.label = label
+        analyzer.analyze(frame)
+    return analyzer.scores[EMOTION_LABELS.index("sadness")]
+
+
+def test_rising_sadness_is_followed_faster_than_a_symmetric_filter():
+    frames = ["neutral", "sadness", "sadness"]
+
+    fast = sadness_after_frames(frames, smoothing=0.25, attack=0.55)
+    symmetric = sadness_after_frames(frames, smoothing=0.25)
+
+    assert fast > symmetric
+    assert fast >= 0.6  # crosses --sad-confidence two readings sooner
+
+
+def test_one_contrary_reading_does_not_wipe_sad_evidence():
+    sustained = sadness_after_frames(
+        ["neutral", "sadness", "sadness"], smoothing=0.25, attack=0.55
+    )
+    interrupted = sadness_after_frames(
+        ["neutral", "sadness", "sadness", "neutral"], smoothing=0.25, attack=0.55
+    )
+
+    assert interrupted > sustained * 0.5
+
+
+def test_smoothed_expression_scores_stay_a_probability_distribution():
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    net = SwitchableNet("neutral")
+    analyzer = fake_analyzer([50, 50, 80, 100], [net], smoothing=0.25, attack=0.55)
+    analyzer.analyze(frame)
+    net.label = "sadness"
+    analyzer.analyze(frame)
+
+    assert analyzer.scores.sum() == pytest.approx(1.0)
+    assert 0.0 <= analyzer.analyze(frame).confidence <= 1.0
 
 
 def test_expression_analyzer_skips_faces_too_small_to_read():
@@ -329,7 +443,7 @@ class FakeLlm:
         return type("Reply", (), {"text": f"reply to {utterance}"})()
 
 
-def check_in_for(mic_sessions, answers, llm, **kwargs):
+def check_in_for(mic_sessions, answers, llm, openings=(OPENING_LINE,), **kwargs):
     config = type("Config", (), {"sample_rate": 1000, "chunk_size": 100, "channels": 1})()
     synthesizer = RecordingSynthesizer()
     sessions = iter(mic_sessions)
@@ -342,10 +456,21 @@ def check_in_for(mic_sessions, answers, llm, **kwargs):
         open_speaker=FakeSpeakerWriter,
         open_mic=lambda: FakeMic(next(sessions)),
         trailing_silence=0.2,
+        openings=openings,
         log=lambda _line: None,
         **kwargs,
     )
-    return check_in, synthesizer
+    # Replies are synthesized sentence by sentence, so record whole utterances
+    # separately from the individual synthesizer calls.
+    spoken = []
+    say = check_in.speak
+
+    def record(text):
+        spoken.append(text)
+        say(text)
+
+    check_in.speak = record
+    return check_in, synthesizer, spoken
 
 
 def spoken_answer():
@@ -357,7 +482,7 @@ def spoken_answer():
 def test_check_in_asks_listens_and_replies_with_llm(monkeypatch):
     monkeypatch.setattr("check_in.time.sleep", lambda _s: None)
     llm = FakeLlm()
-    check_in, synthesizer = check_in_for(
+    check_in, _synthesizer, spoken = check_in_for(
         [spoken_answer(), []],
         ["my exam went badly"],
         llm,
@@ -366,24 +491,98 @@ def test_check_in_asks_listens_and_replies_with_llm(monkeypatch):
     )
     check_in.converse()
 
-    assert synthesizer.spoken == [OPENING_LINE, "reply to my exam went badly"]
+    assert spoken == [OPENING_LINE, "reply to my exam went badly"]
     assert llm.heard == ["my exam went badly"]
     assert check_in.status == "idle"
 
 
 def test_check_in_is_gentle_when_nobody_answers(monkeypatch):
     monkeypatch.setattr("check_in.time.sleep", lambda _s: None)
-    check_in, synthesizer = check_in_for([[]], [], FakeLlm(), answer_timeout=0.01)
+    check_in, _synthesizer, spoken = check_in_for([[]], [], FakeLlm(), answer_timeout=0.01)
     check_in.converse()
 
-    assert synthesizer.spoken == [OPENING_LINE, NO_ANSWER_REPLY]
+    assert spoken == [OPENING_LINE, NO_ANSWER_REPLY]
 
 
 def test_check_in_falls_back_when_llm_is_offline(monkeypatch):
     monkeypatch.setattr("check_in.time.sleep", lambda _s: None)
-    check_in, synthesizer = check_in_for(
+    check_in, _synthesizer, spoken = check_in_for(
         [spoken_answer()], ["not great"], FakeLlm(fail=True), answer_timeout=0.05
     )
     check_in.converse()
 
-    assert synthesizer.spoken == [OPENING_LINE, FALLBACK_REPLY]
+    assert spoken == [OPENING_LINE, FALLBACK_REPLY]
+
+
+def test_speech_segments_split_sentences_and_merge_short_fragments():
+    assert speech_segments("Oh no. That sounds really hard, I'm sorry.") == [
+        "Oh no. That sounds really hard, I'm sorry."
+    ]
+    assert speech_segments(
+        "That sounds really hard to sit with. Do you want to tell me more?"
+    ) == [
+        "That sounds really hard to sit with.",
+        "Do you want to tell me more?",
+    ]
+    assert speech_segments("   ") == [""]
+
+
+def test_reply_is_synthesized_sentence_by_sentence(monkeypatch):
+    """The first sentence can start playing before the rest is rendered."""
+    monkeypatch.setattr("check_in.time.sleep", lambda _s: None)
+    llm = FakeLlm()
+    llm.complete = lambda _u: type(
+        "Reply",
+        (),
+        {"text": "That sounds really hard to sit with. Do you want to tell me more?"},
+    )()
+    check_in, synthesizer, _spoken = check_in_for(
+        [spoken_answer(), []], ["work was rough"], llm, max_turns=1, answer_timeout=0.05
+    )
+    check_in.converse()
+
+    assert synthesizer.spoken == [
+        OPENING_LINE,
+        "That sounds really hard to sit with.",
+        "Do you want to tell me more?",
+    ]
+
+
+def test_openers_are_rendered_once_and_reused(monkeypatch):
+    monkeypatch.setattr("check_in.time.sleep", lambda _s: None)
+    check_in, synthesizer, _spoken = check_in_for(
+        [[], []], [], FakeLlm(), answer_timeout=0.01
+    )
+
+    assert check_in.prewarm() == 1
+    check_in.converse()
+    check_in.converse()
+
+    # One pre-render, then the cached PCM for both conversations; only the
+    # no-answer reply is synthesized on demand.
+    assert synthesizer.spoken == [OPENING_LINE, NO_ANSWER_REPLY, NO_ANSWER_REPLY]
+
+
+def test_openers_rotate_so_the_robot_does_not_repeat_itself():
+    check_in, _synthesizer, _spoken = check_in_for(
+        [[]], [], FakeLlm(), openings=OPENING_LINES
+    )
+
+    openings = [check_in.next_opening() for _ in range(6)]
+
+    assert set(openings) <= set(OPENING_LINES)
+    assert all(first != second for first, second in zip(openings, openings[1:]))
+    assert len(set(openings)) > 1
+
+
+def test_prewarm_survives_a_synthesizer_that_is_not_ready():
+    class BrokenSynthesizer:
+        def synthesize(self, _text, _rate):
+            raise RuntimeError("voice service down")
+
+    check_in, _synthesizer, _spoken = check_in_for(
+        [[]], [], FakeLlm(), openings=OPENING_LINES
+    )
+    check_in.synthesizer = BrokenSynthesizer()
+
+    assert check_in.prewarm() == 0

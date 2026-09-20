@@ -9,12 +9,15 @@ so the conversation logic stays testable off the robot.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
+import random
+import re
 import sys
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterator, Sequence
 
 import numpy as np
 
@@ -31,24 +34,53 @@ from local_voice import (  # noqa: E402
     WhisperCppTranscriber,
     speaker_chunks,
 )
-from voice_router import OpenRouterClient  # noqa: E402
+from voice_router import BrowserbaseSearchClient, OpenRouterClient  # noqa: E402
 
 
-OPENING_LINE = "Hey, why are you sad? What's up?"
+# Short openers keep the first spoken moment quick and stop the robot from
+# saying the exact same sentence every time it reads a frown. The first line
+# matches the recorded ``sad_prompt.wav`` fallback.
+OPENING_LINES = (
+    "Hey, why are you sad? What's up?",
+    "Hey, you okay? What's going on?",
+    "You look a little down. What happened?",
+    "Hey. Rough moment? I'm listening.",
+    "That looked like a heavy sigh. What's up?",
+)
+OPENING_LINE = OPENING_LINES[0]
 FALLBACK_REPLY = "I'm sorry you're feeling down. I'm right here if you want to talk."
 NO_ANSWER_REPLY = "That's okay. I'm here whenever you want to talk."
 CHECK_IN_SYSTEM_PROMPT = (
     "You are Baymax, a gentle, caring home robot. Your camera noticed that "
-    "the person in front of you looked sad, so you asked them: "
-    f"\"{OPENING_LINE}\" Reply to what they say in one or two short, warm, "
-    "natural sentences, because your words are spoken aloud. Listen and "
-    "validate their feelings, and when it fits ask one gentle follow-up "
-    "question. Do not diagnose, lecture, or claim to know how they feel; the "
-    "camera cue can be wrong, so if they say they are fine, accept it kindly. "
-    "If they mention wanting to hurt themselves or being in danger, tell them "
-    "you care and encourage them to contact someone they trust right now or "
-    "call or text 988 (the Suicide and Crisis Lifeline in the US and Canada)."
+    "the person in front of you looked sad, so you opened with a short "
+    f"question like \"{OPENING_LINE}\" Reply to what they say in one or two "
+    "short, warm, natural sentences, because your words are spoken aloud and "
+    "a long answer feels slow. Lead with the reply itself: no preamble, no "
+    "restating what they told you, no stage directions. Listen and validate "
+    "their feelings, and when it fits ask one gentle follow-up question. Do "
+    "not diagnose, lecture, or claim to know how they feel; the camera cue "
+    "can be wrong, so if they say they are fine, accept it kindly. If they "
+    "mention wanting to hurt themselves or being in danger, tell them you "
+    "care and encourage them to contact someone they trust right now or call "
+    "or text 988 (the Suicide and Crisis Lifeline in the US and Canada)."
 )
+# Splitting a reply on sentence ends lets the first sentence start playing
+# while the rest is still being synthesized.
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+
+def speech_segments(text: str, min_chars: int = 24) -> list[str]:
+    """Split spoken text into sentences, merging fragments too short to stream."""
+    segments: list[str] = []
+    for part in _SENTENCE_END.split(text.strip()):
+        part = part.strip()
+        if not part:
+            continue
+        if segments and len(segments[-1]) < min_chars:
+            segments[-1] = f"{segments[-1]} {part}"
+        else:
+            segments.append(part)
+    return segments or [text.strip()]
 
 
 def load_env(path: Path) -> None:
@@ -82,8 +114,10 @@ class SadCheckIn:
         mic_gain: float = 3.0,
         volume: float = 1.0,
         vad_threshold_db: float = -38.0,
-        trailing_silence: float = 1.2,
+        trailing_silence: float = 0.7,
         max_utterance: float = 12.0,
+        speaker_drain: float = 0.4,
+        openings: Sequence[str] = OPENING_LINES,
         log: Callable[[str], None] = lambda line: print(line, flush=True),
     ) -> None:
         self.synthesizer = synthesizer
@@ -100,31 +134,114 @@ class SadCheckIn:
         self.vad_threshold_db = vad_threshold_db
         self.trailing_silence = trailing_silence
         self.max_utterance = max_utterance
+        self.speaker_drain = speaker_drain
+        self.openings = tuple(openings) or (OPENING_LINE,)
         self.log = log
         self.lock = threading.Lock()
         self.status = "idle"
+        # Pre-rendered openers so a frown is answered without waiting on TTS.
+        self._voice_cache: dict[str, np.ndarray] = {}
+        self._cache_lock = threading.Lock()
+        self._last_opening: str | None = None
+        self._synth_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="check-in-tts"
+        )
 
     @property
     def busy(self) -> bool:
         return self.lock.locked()
 
+    def next_opening(self) -> str:
+        """Pick an opener, avoiding the line used for the previous check-in."""
+        choices = [line for line in self.openings if line != self._last_opening]
+        opening = random.choice(choices or list(self.openings))
+        self._last_opening = opening
+        return opening
+
+    def prewarm(self) -> int:
+        """Synthesize every opener up front; returns how many are cached.
+
+        Rendering the openers at startup is what makes the trigger feel
+        instant: at cue time the robot only has to push PCM at the speaker.
+        """
+        started = time.monotonic()
+        for line in self.openings:
+            try:
+                self._pcm_for(line)
+            except Exception as exc:
+                self.log(
+                    f"[check-in] Could not pre-render an opener "
+                    f"({type(exc).__name__}: {exc})"
+                )
+                break
+        cached = len(self._voice_cache)
+        if cached:
+            self.log(
+                f"[check-in] Pre-rendered {cached} opener(s) in "
+                f"{(time.monotonic() - started) * 1000:.0f} ms"
+            )
+        return cached
+
+    def prewarm_async(self) -> None:
+        threading.Thread(
+            target=self.prewarm, name="check-in-prewarm", daemon=True
+        ).start()
+
+    def _pcm_for(self, text: str) -> np.ndarray:
+        """Synthesize ``text``, reusing a cached opener when there is one."""
+        with self._cache_lock:
+            cached = self._voice_cache.get(text)
+        if cached is not None:
+            return cached
+        pcm = self.synthesizer.synthesize(text, self.speaker_config.sample_rate)
+        if text in self.openings:
+            with self._cache_lock:
+                self._voice_cache[text] = pcm
+        return pcm
+
+    def _pcm_stream(self, segments: Sequence[str]) -> Iterator[np.ndarray]:
+        """Yield each sentence's PCM while the next one is already rendering."""
+        ahead = None
+        for index, segment in enumerate(segments):
+            pcm = ahead.result() if ahead is not None else self._pcm_for(segment)
+            ahead = (
+                self._synth_pool.submit(self._pcm_for, segments[index + 1])
+                if index + 1 < len(segments)
+                else None
+            )
+            yield pcm
+
     def speak(self, text: str) -> None:
         self.status = "speaking"
         self.log(f"[check-in] Baymax: {text}")
         config = self.speaker_config
-        pcm = self.synthesizer.synthesize(text, config.sample_rate)
-        pcm = (pcm.astype(np.float32) * self.volume).clip(-32768, 32767)
-        chunks = speaker_chunks(pcm.astype(np.int16), config.chunk_size, config.channels)
+        segments = speech_segments(text)
         period = config.chunk_size / config.sample_rate
         with self.open_speaker() as speaker:
             due = time.monotonic()
-            for chunk in chunks:
-                with speaker.buf() as frame:
-                    frame["audio"] = chunk.reshape(-1, config.channels)
-                due += period
-                time.sleep(max(0.0, due - time.monotonic()))
+            # Only the first sentence needs the jitter-buffer lead; padding the
+            # later ones would open a silent gap mid-reply.
+            lead_chunks = 4
+            for pcm in self._pcm_stream(segments):
+                pcm = (pcm.astype(np.float32) * self.volume).clip(-32768, 32767)
+                chunks = speaker_chunks(
+                    pcm.astype(np.int16),
+                    config.chunk_size,
+                    config.channels,
+                    lead_chunks=lead_chunks,
+                )
+                lead_chunks = 0
+                # Never burst after a slow synthesis: resume pacing from now.
+                due = max(due, time.monotonic())
+                for chunk in chunks:
+                    with speaker.buf() as frame:
+                        frame["audio"] = chunk.reshape(-1, config.channels)
+                    due += period
+                    time.sleep(max(0.0, due - time.monotonic()))
             # Let the speaker buffer drain so the mic does not hear Baymax.
-            time.sleep(0.4)
+            # This one stays generous on purpose: shaving it would risk the
+            # robot transcribing its own voice, which costs a whole turn.
+            time.sleep(self.speaker_drain)
 
     def listen(self) -> str:
         """Record one answer; return "" if the person stays quiet."""
@@ -163,7 +280,9 @@ class SadCheckIn:
             return
         try:
             llm = self.llm_factory()
-            self.speak(OPENING_LINE)
+            # The opener is already rendered, so nothing but the speaker sits
+            # between the sadness cue and Baymax's voice.
+            self.speak(self.next_opening())
             for turn in range(self.max_turns):
                 answer = self.listen()
                 if not answer:
@@ -210,8 +329,16 @@ def build_check_in(args, Config, Reader, Type, Writer) -> SadCheckIn:
         synthesizer=synthesizer,
         transcriber=transcriber,
         # A fresh client per conversation keeps one person's history out of
-        # the next check-in. Tools stay off: this is a listening conversation.
-        llm_factory=lambda: OpenRouterClient(system_prompt=CHECK_IN_SYSTEM_PROMPT),
+        # the next check-in. Tools stay off with an unconfigured search client:
+        # this is a listening conversation, and a tool round would add a whole
+        # extra round trip before Baymax can answer. The short token budget
+        # keeps replies to the couple of sentences the prompt asks for, which
+        # is both faster to generate and faster to speak.
+        llm_factory=lambda: OpenRouterClient(
+            system_prompt=CHECK_IN_SYSTEM_PROMPT,
+            web_search=BrowserbaseSearchClient(api_key=""),
+            max_tokens=110,
+        ),
         speaker_config=Config("speaker"),
         mic_config=Config("mic"),
         open_speaker=lambda: Writer(
@@ -221,6 +348,7 @@ def build_check_in(args, Config, Reader, Type, Writer) -> SadCheckIn:
         max_turns=args.check_in_turns,
         answer_timeout=args.check_in_answer_timeout,
         mic_gain=args.mic_gain,
+        trailing_silence=args.check_in_trailing_silence,
     )
 
 
@@ -228,6 +356,8 @@ __all__ = [
     "CHECK_IN_SYSTEM_PROMPT",
     "LocalVoiceError",
     "OPENING_LINE",
+    "OPENING_LINES",
     "SadCheckIn",
     "build_check_in",
+    "speech_segments",
 ]

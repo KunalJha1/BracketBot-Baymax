@@ -252,7 +252,7 @@ def test_demo_status_exposes_timed_first_minute_presenter_cues(monkeypatch):
     assert ready["elapsed_seconds"] == 0
     assert ready["cues"] == list(DEMO_CUES)
     assert ready["cues"][0]["script"] == (
-        "BracketBot, remind me in 4 minutes to take my medication."
+        "BracketBot, remind me in 3 minutes to take my medication."
     )
     assert "at-home care assistant" in ready["cues"][1]["script"]
 

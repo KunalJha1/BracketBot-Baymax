@@ -97,8 +97,8 @@ DEMO_CUES = (
         "at_seconds": 0,
         "timecode": "0:00",
         "speaker": "You → BracketBot",
-        "label": "Set the four-minute reminder",
-        "script": "BracketBot, remind me in 4 minutes to take my medication.",
+        "label": "Set the three-minute reminder",
+        "script": "BracketBot, remind me in 3 minutes to take my medication.",
         "note": "Pause and let BracketBot's spoken confirmation finish.",
     },
     {

@@ -9,6 +9,7 @@ We watched *Big Hero 6* and thought Baymax was pretty tuff. We wanted to recreat
 Baymax Bot turns BracketBot into an interactive companion that can:
 
 - Respond to voice commands and hold conversations
+- Keep persistent spoken reminders and timers that survive a restart and land even while the robot is busy with something else
 - Perform gestures such as waving, handshakes, fist bumps, hugs, and dancing
 - Run multi-step routines like a welcome sequence, calm moment, and dance party
 - Express itself using lights, sound effects, and original music
@@ -17,6 +18,8 @@ Baymax Bot turns BracketBot into an interactive companion that can:
 - Stop actions immediately through a global emergency stop control
 
 Every physical action passes through a fixed allowlist and deterministic safety checks. The language model can suggest an action, but it never directly controls the robot's motors.
+
+Our demo opens by asking Baymax for a three-minute reminder and then ignores it. Three minutes later, mid-task, Baymax interrupts itself with a chime, an amber blink, and the spoken reminder — a background care task outliving a foreground robot task, which is the whole point of a home assistant.
 
 ## How we built it
 
