@@ -1,3 +1,5 @@
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -84,6 +86,21 @@ def test_yunet_face_roi_loads_real_shipped_model():
     frame = np.zeros((240, 320, 3), np.uint8)
 
     assert roi(frame, 0) is None
+
+
+def test_robot_cli_self_test_loads_model_without_camera():
+    script = Path(__file__).resolve().parents[1] / "scripts" / "robot_rppg.py"
+    completed = subprocess.run(
+        [sys.executable, str(script), "--self-test"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    report = json.loads(completed.stdout)
+
+    assert report["ok"] is True
+    assert report["model"] == rppg.DEFAULT_MODEL.name
+    assert report["model_bytes"] == rppg.DEFAULT_MODEL.stat().st_size
 
 
 class FakeReader:

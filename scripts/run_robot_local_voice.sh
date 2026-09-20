@@ -109,7 +109,7 @@ scp -q \
 # Install the scan's OpenCV/SciPy environment now, through the
 # proxy, so the first "what's my heart rate" does not wait on downloads.
 if ! ssh -o BatchMode=yes "$robot_host" \
-  "cd /home/bracketbot/bbapps/rppg && env HTTPS_PROXY='$proxy_url' https_proxy='$proxy_url' /home/bracketbot/.local/bin/uv run --quiet robot_rppg.py --help >/dev/null"; then
+  "cd /home/bracketbot/bbapps/rppg && env HTTPS_PROXY='$proxy_url' https_proxy='$proxy_url' /home/bracketbot/.local/bin/uv run --quiet robot_rppg.py --self-test"; then
   echo "Heart-rate scan environment did not install; heart-rate requests will fail until it does." >&2
 fi
 echo "Syncing the person tracker (turns in place to face you)..."

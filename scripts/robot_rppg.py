@@ -116,6 +116,10 @@ def check(cam, model, seconds):
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--check", action="store_true", help="grab frames and report camera/face health; no scan")
+    p.add_argument(
+        "--self-test", action="store_true",
+        help="load OpenCV and the face model without opening the robot camera",
+    )
     p.add_argument("--jpeg", action="store_true", help=f"read {JPEG_TOPIC} instead of raw {RAW_TOPIC} (lossier)")
     p.add_argument("--duration", type=float, default=15.0, help="scan length in seconds")
     p.add_argument("--window", type=float, default=10.0, help="analysis window in seconds")
@@ -137,6 +141,15 @@ def main():
             "YuNet face model not found: copy assets/models/"
             "face_detection_yunet_2026may.onnx next to this script"
         )
+    if a.self_test:
+        FaceROI(model)  # Constructor parses the ONNX graph; failure must stop deployment.
+        print(json.dumps({
+            "ok": True,
+            "opencv": cv2.__version__,
+            "model": model.name,
+            "model_bytes": model.stat().st_size,
+        }))
+        return
 
     with HeadCamera(a.jpeg) as cam:
         t0 = time.monotonic()
