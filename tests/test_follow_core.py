@@ -25,6 +25,7 @@ from follow_core import (
     Tracker,
     corridor_count,
     follow_command,
+    FollowController,
     hist_distance,
     led_color,
     parse_command,
@@ -200,13 +201,45 @@ def test_inside_deadband_the_robot_holds_still():
 
 def test_range_error_drives_forward_proportionally():
     v, omega = follow_command(track(1.25), 1.0, FAST)
-    assert v == pytest.approx(0.8 * 0.20)
+    assert v == pytest.approx(FAST.v_kp * 0.20)
     assert omega == 0.0
 
 
-def test_person_speed_is_fed_forward():
-    v, _ = follow_command(track(1.0, v_radial=0.12), 1.0, FAST)
-    assert v == pytest.approx(0.12)
+def test_integral_removes_the_lag_behind_a_steady_walker():
+    controller = FollowController(FAST)
+    first, _ = controller.command(track(1.2), 1.0, 0.02)
+    for _ in range(100):
+        v, _ = controller.command(track(1.2), 1.0, 0.02)
+    assert v > first + 0.03
+    assert controller.range_pid.integral <= FAST.v_i_max
+
+
+def test_integral_does_not_wind_up_while_saturated_or_far_away():
+    controller = FollowController(CFG)
+    for _ in range(500):
+        v, _ = controller.command(track(3.0), 1.0, 0.02)
+    assert v == CFG.v_max
+    assert controller.range_pid.integral == 0.0
+
+
+def test_derivative_brakes_a_closing_gap():
+    def final_speed(cfg):
+        controller = FollowController(cfg)
+        for i in range(26):  # the gap closes at 0.2 m/s
+            v, _ = controller.command(track(1.30 - 0.004 * i), 1.0, 0.02)
+        return v
+
+    assert final_speed(FAST) < final_speed(dataclasses.replace(FAST, v_kd=0.0)) - 0.01
+
+
+def test_hold_and_lost_track_clear_the_integrals():
+    loop = FollowLoop(CFG)
+    loop.controller.range_pid.integral = 0.1
+    loop.controller.bearing_pid.integral = 0.1
+    loop.tick(TickInputs(t=0.0, heartbeat_age=0.0, stop_requested=False, roll_deg=0.0,
+                         pitch_deg=0.0, measured_v=0.0, measured_omega=0.0))
+    assert loop.controller.range_pid.integral == 0.0
+    assert loop.controller.bearing_pid.integral == 0.0
 
 
 def test_never_reverses_when_the_person_comes_closer():
@@ -230,9 +263,9 @@ def test_speeds_are_clamped():
 
 def test_rate_limiter_uses_separate_accel_brake_and_turn_limits():
     limiter = RateLimiter(CFG)
-    assert limiter.step(0.3, 1.0, 0.02) == pytest.approx((0.008, 0.03))
+    assert limiter.step(0.3, 1.0, 0.02) == pytest.approx((CFG.accel_up * 0.02, CFG.alpha_max * 0.02))
     limiter.v = 0.3
-    assert limiter.step(0.0, 0.03, 0.02)[0] == pytest.approx(0.3 - 0.016)
+    assert limiter.step(0.0, 0.03, 0.02)[0] == pytest.approx(0.3 - CFG.accel_down * 0.02)
 
 
 # --- obstacle corridor ----------------------------------------------------
@@ -286,7 +319,7 @@ def test_exit_rule_priority():
 @pytest.mark.parametrize("override, rule, omega", [
     ({"tracking": False, "track_age": None, "range_m": None}, "no-track", 0.0),
     ({"points_age": 0.5}, "points-stale", 0.1),
-    ({"track_age": 0.4}, "track-stale", 0.0),
+    ({"track_age": 0.6}, "track-stale", 0.0),
     ({"blocked": True}, "blocked", 0.1),
     ({"range_m": 0.4}, "min-range", 0.1),
 ])

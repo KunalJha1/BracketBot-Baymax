@@ -152,7 +152,7 @@ def robot(tmp_path, monkeypatch):
         Config=configs.__getitem__, Reader=Reader, Writer=Writer, Type=lambda name: name))
     monkeypatch.setattr(robot_follow, "time", SimpleNamespace(
         monotonic=lambda: state.t, sleep=sleep, strftime=lambda _: "test"))
-    monkeypatch.setattr(robot_follow, "other_drive_writers", lambda: [])
+    monkeypatch.setattr(robot_follow, "other_drive_writers", lambda ignore=(): [])
     monkeypatch.setattr(robot_follow, "start_command_reader", lambda _: None)
     monkeypatch.setattr(robot_follow, "STOP_REQUESTED", False)
 

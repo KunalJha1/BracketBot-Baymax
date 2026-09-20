@@ -11,6 +11,7 @@ from bbapps.greeter.local_voice import (
     FallbackSynthesizer,
     FallbackTranscriber,
     HttpTtsSynthesizer,
+    clarify_speech,
     LocalVoiceError,
     SpeechSegmenter,
     WhisperCppTranscriber,
@@ -350,3 +351,38 @@ def test_whisper_server_is_used_when_available_and_falls_back_when_not():
         WhisperCppTranscriber("/bin/sh", __file__, runner=runner),
     )
     assert fallback.transcribe(np.zeros(320, dtype=np.int16), 16000) == "From the CLI."
+
+
+def test_clarify_speech_lifts_consonant_band_and_controls_peak():
+    rate = 16000
+    t = np.arange(rate) / rate
+    body = 8000 * np.sin(2 * np.pi * 250 * t)
+    consonants = 800 * np.sin(2 * np.pi * 3200 * t)
+    rumble = 4000 * np.sin(2 * np.pi * 50 * t)
+    pcm = (body + consonants + rumble).astype(np.int16)
+
+    out = clarify_speech(pcm, rate)
+
+    def band(signal, freq):
+        return np.abs(np.fft.rfft(signal.astype(np.float64)))[freq]
+
+    assert out.dtype == np.int16
+    assert len(out) == len(pcm)
+    assert np.max(np.abs(out)) <= int(0.9 * 32768)
+    before = band(pcm, 3200) / band(pcm, 250)
+    after = band(out, 3200) / band(out, 250)
+    assert after > 2.0 * before
+    assert band(out, 50) / band(out, 250) < 0.2 * band(pcm, 50) / band(pcm, 250)
+
+
+def test_clarify_speech_passes_silence_through():
+    silence = np.zeros(1600, dtype=np.int16)
+    assert np.array_equal(clarify_speech(silence, 16000), silence)
+
+
+def test_whisper_audio_context_tracks_utterance_length():
+    from bbapps.greeter.local_voice import whisper_audio_context
+
+    assert whisper_audio_context(16_000 * 2, 16_000) == 384
+    assert whisper_audio_context(16_000 * 8, 16_000) == 576
+    assert whisper_audio_context(16_000 * 40, 16_000) == 1500

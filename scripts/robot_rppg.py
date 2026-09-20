@@ -5,14 +5,13 @@
 #   "numpy",
 #   "scipy",
 #   "opencv-python",
-#   "mediapipe",
 # ]
 # [tool.uv.sources]
 # bbos = { path = "/home/bracketbot/bbos", editable = true }
 # ///
 """Contactless heart-rate scan from the BracketBot head camera. Runs ON THE ROBOT, read-only.
 
-    scp scripts/robot_rppg.py rppg.py assets/models/face_landmarker.task bot:/tmp/
+    scp scripts/robot_rppg.py rppg.py assets/models/face_detection_yunet_2026may.onnx bot:/tmp/
     ssh bot 'cd /tmp && ~/.local/bin/uv run robot_rppg.py --check'   # camera + face gate, no scan
     ssh bot 'cd /tmp && ~/.local/bin/uv run robot_rppg.py'           # 15 s scan, JSON on stdout
 
@@ -121,15 +120,23 @@ def main():
     p.add_argument("--duration", type=float, default=15.0, help="scan length in seconds")
     p.add_argument("--window", type=float, default=10.0, help="analysis window in seconds")
     p.add_argument("--fs", type=float, default=30.0, help="resample rate in Hz")
-    p.add_argument("--model", type=Path, help="face_landmarker.task (default: next to this script)")
+    p.add_argument(
+        "--model", type=Path,
+        help="YuNet face-detection ONNX model (default: next to this script)",
+    )
     p.add_argument("--progress-json", action="store_true",
                    help="stream one compact JSON object per line on stdout (per-second estimates "
                         "tagged \"progress\", then the final \"result\" line) instead of a human report")
     a = p.parse_args()
 
-    model = a.model or next((m for m in (HERE / "face_landmarker.task", DEFAULT_MODEL) if m.exists()), None)
+    model = a.model or next(
+        (m for m in (HERE / "face_detection_yunet_2026may.onnx", DEFAULT_MODEL) if m.exists()), None
+    )
     if model is None or not model.exists():
-        sys.exit("face_landmarker.task not found: copy assets/models/face_landmarker.task next to this script")
+        sys.exit(
+            "YuNet face model not found: copy assets/models/"
+            "face_detection_yunet_2026may.onnx next to this script"
+        )
 
     with HeadCamera(a.jpeg) as cam:
         t0 = time.monotonic()

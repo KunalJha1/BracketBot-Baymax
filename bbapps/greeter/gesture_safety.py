@@ -26,6 +26,21 @@ HAND_PATH_CLEARANCE_METRES = 0.06
 # never profile-dependent: it is geometry, not caution.
 HARD_COLLISION_RADIUS_METRES = 0.035
 MIN_HARD_COLLISION_POINTS = 8
+# Recordings are slowed for playback. Gestures that invite a person into reach
+# keep the original slow pace; the dance keeps it because it is already the
+# fastest recording. Everything else is a free-space motion.
+DEFAULT_PLAYBACK_SPEED = 0.6
+PLAYBACK_SPEEDS = {"wave": 0.75, "goodbye": 0.75, "salute": 0.75, "namaste": 0.75}
+# Ease moves scale with distance so a 0.05 turn entry no longer takes as long
+# as a 0.5 turn one. Smoothstep peaks at 1.5x the mean speed, so this bounds
+# the peak at EASE_PEAK_TURNS_PER_SECOND; the longest allowed entry still takes
+# about as long as it always did.
+EASE_PEAK_TURNS_PER_SECOND = 0.30
+MIN_EASE_SECONDS = 0.5
+MAX_EASE_SECONDS = 3.0
+IDLE_TURNS = 0.01
+IDLE_MARGIN_SECONDS = 0.15
+RETURNED_TURNS = 0.08
 
 
 @dataclass(frozen=True)
@@ -141,6 +156,46 @@ def trajectory_arrays(frames: object) -> tuple[np.ndarray, dict[str, np.ndarray]
     return times - times[0], poses
 
 
+def playback_speed(name: str) -> float:
+    return PLAYBACK_SPEEDS.get(name, DEFAULT_PLAYBACK_SPEED)
+
+
+def ease_seconds(from_poses: Mapping[str, object], to_poses: Mapping[str, object]) -> float:
+    """Shortest ease that keeps the fastest joint under the ease speed limit."""
+    distance = max(
+        float(np.max(np.abs(np.asarray(to_poses[side]) - np.asarray(from_poses[side]))))
+        for side in to_poses
+    )
+    seconds = 1.5 * distance / EASE_PEAK_TURNS_PER_SECOND
+    return float(np.clip(seconds, MIN_EASE_SECONDS, MAX_EASE_SECONDS))
+
+
+def trim_idle(
+    times: np.ndarray, poses: Mapping[str, np.ndarray]
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Drop the motionless lead-in and lead-out of a recording.
+
+    Only stillness is removed: a hold in the middle, or a final hold away from
+    the first pose (namaste), is part of the gesture and stays.
+    """
+    joints = np.concatenate([poses[side][:, 1:7] for side in SIDES], axis=1)
+    moved = np.flatnonzero(np.abs(joints - joints[0]).max(axis=1) > IDLE_TURNS)
+    if not len(moved):
+        return times, dict(poses)
+    first = int(np.searchsorted(times, times[moved[0]] - IDLE_MARGIN_SECONDS))
+    last = len(times) - 1
+    if np.abs(joints[-1] - joints[0]).max() <= RETURNED_TURNS:
+        settling = np.flatnonzero(
+            np.abs(joints - joints[-1]).max(axis=1) > IDLE_TURNS
+        )
+        stop = times[settling[-1]] + IDLE_MARGIN_SECONDS
+        last = min(last, int(np.searchsorted(times, stop)))
+    if last - first < 1:
+        return times, dict(poses)
+    keep = slice(first, last + 1)
+    return times[keep] - times[first], {side: poses[side][keep] for side in SIDES}
+
+
 def active_sides(poses: Mapping[str, np.ndarray]) -> tuple[str, ...]:
     """Ignore arms containing only lift-position or recording noise."""
     return tuple(
@@ -248,6 +303,7 @@ def plan_recorded_gesture(
     sides = active_sides(poses)
     if not sides:
         raise RuntimeError("gesture recording has no intentional arm movement")
+    times, poses = trim_idle(times, poses)
 
     rpy = np.asarray(rpy_degrees, dtype=np.float64).reshape(-1)
     if len(rpy) < 2 or not np.isfinite(rpy[:2]).all():

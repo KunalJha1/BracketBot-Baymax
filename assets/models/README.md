@@ -7,12 +7,14 @@
   SHA-256: `869e83fcdffdc7371fa4e34cd8e51c838cc729571d1635e5141e3075e9319dc0`
 
 - `face_detection_yunet_2026may.onnx` is OpenCV Zoo's YuNet face detector,
-  distributed under the MIT License. Source:
+  used by both the person tracker and rPPG skin-ROI extraction and distributed
+  under the MIT License. Source:
   <https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet>
   SHA-256: `ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0`
-- `face_landmarker.task` is the MediaPipe FaceLandmarker (478-landmark) bundle
-  used to place the forehead and cheek ROI for rPPG, distributed by Google
-  under Apache-2.0. Source:
+- `face_landmarker.task` is a retained MediaPipe FaceLandmarker reference asset;
+  rPPG no longer depends on it because the stable MediaPipe 0.10 releases have
+  no Linux ARM64 wheel for the robot. It is distributed by Google under
+  Apache-2.0. Source:
   <https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task>
   SHA-256: `64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff`
 

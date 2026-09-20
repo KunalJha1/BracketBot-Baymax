@@ -539,7 +539,7 @@ medication schedule.
 
 Remote photoplethysmography (rPPG) reads a pulse from the sub-percent colour
 changes skin shows as blood volume changes. `rppg.py` holds the signal chain:
-MediaPipe forehead and cheek ROI, POS projection, bandpass, FFT peak with an
+OpenCV YuNet forehead and cheek ROI, POS projection, bandpass, FFT peak with an
 SNR gate.
 
 **This is not a medical device.** It produces a demo-grade estimate from a
@@ -564,7 +564,7 @@ Press `m` to switch POS to plain green and watch it fail under changing light,
 On the robot, check the camera before attempting any measurement:
 
 ```sh
-scp scripts/robot_rppg.py rppg.py assets/models/face_landmarker.task bot:/tmp/
+scp scripts/robot_rppg.py rppg.py assets/models/face_detection_yunet_2026may.onnx bot:/tmp/
 ssh bot 'cd /tmp && ~/.local/bin/uv run robot_rppg.py --check'
 ```
 

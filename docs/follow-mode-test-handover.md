@@ -19,6 +19,21 @@ robot then holds the slider's distance (0.6–1.5 m, default 1.0 m) to within
 ±20 cm while you stand, turn, or walk slowly. It finds you from the depth
 camera's 3D points alone — no neural network and no camera image.
 
+## Voice: "follow me"
+
+Say **"follow me"** (also "come with me", "walk with me"). The assistant turns to
+face you, then starts `~/bbapps/follow/robot_follow.py` with
+`--no-led --ignore-writer person_tracker.py` and feeds it heartbeats; say **"stop"**
+or **"stop following me"** to end it. If the assistant dies the runner stops within 1 s.
+Deploy the runner with `scripts/bot push scripts/robot_follow.py scripts/follow_*.py --to /home/bracketbot/bbapps/follow`
+(`run_robot_local_voice.sh` does it too).
+
+Speed comes from two PIDs in `follow_core.FollowController`: range error -> v
+(`v_kp/v_ki/v_kd`) and bearing -> omega (`w_kp/w_ki/w_kd`), then the rate limiter.
+Defaults are deliberately gentle: 0.15 m/s, 0.5 rad/s, 0.25 m/s^2. Jerky -> lower
+`accel_up`/`alpha_max` or `*_kp`; trails a steady walker -> raise `v_ki`; overshoots
+the gap -> raise `v_kd`. Check a change with `pytest tests/test_follow_sim.py` first.
+
 ## Expected behaviour that is not a bug
 
 - **A pillar, coat rack, or tall plant is person-sized.** Start in open space.

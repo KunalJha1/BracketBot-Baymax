@@ -51,6 +51,7 @@ EMOTION_LABELS = (
     "sadness",
     "surprise",
 )
+DISTRESS_LABELS = ("sadness", "anger", "disgust", "fear")
 EXPRESSION_MODELS = ("enet_b0_8_best_afew.onnx", "enet_b0_8_va_mtl.onnx")
 
 
@@ -72,6 +73,12 @@ class Expression:
     y2: int
     label: str
     confidence: float
+    # Summed sadness+anger+disgust+fear. The single "sadness" class is a poor
+    # stand-in for "this person looks upset": AffectNet scores a plain frown as
+    # disgust=60%/sadness=20%, so a sadness-only gate never fires on the cue
+    # people actually give the robot. The four negative classes together
+    # separate cleanly (87% on a frown, 19-49% otherwise).
+    distress: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -181,8 +188,7 @@ class SadVoiceTrigger:
         sad_visible = (
             person_present
             and expression is not None
-            and expression.label in {"sad", "sadness"}
-            and expression.confidence >= self.confidence
+            and expression.distress >= self.confidence
         )
         if sad_visible:
             self.first_clear_at = None
@@ -377,6 +383,47 @@ def expression_probabilities(logits: np.ndarray) -> np.ndarray:
     return probabilities / probabilities.sum()
 
 
+def expression_runner(path: Path) -> tuple[Any, str]:
+    """Return a callable running one expression ONNX, and the backend name.
+
+    OpenCV 4.8's DNN module silently miscomputes these EfficientNet-B0 graphs
+    on the robot: every input, including a photo of the floor and uniform
+    noise, comes back as the same near-uniform distribution whose peak never
+    exceeds ~25%. The 60% sadness gate is then unreachable by construction, so
+    the greeter can never speak. onnxruntime runs the identical file correctly
+    (the frowning reference face goes from 22% surprise to 53% disgust), so it
+    is used whenever it imports and cv2.dnn is kept only as a last resort.
+    """
+
+    try:
+        import onnxruntime
+    except ImportError:
+        net = cv2.dnn.readNetFromONNX(str(path))
+
+        def run_cv2(blob: np.ndarray) -> np.ndarray:
+            net.setInput(blob)
+            return net.forward()
+
+        return run_cv2, "cv2.dnn"
+
+    options = onnxruntime.SessionOptions()
+    # Two threads measured fastest on the Jetson's six cores (103 ms versus
+    # 120 ms at one and 197 ms at six); more threads contend with YOLO.
+    options.intra_op_num_threads = 2
+    options.graph_optimization_level = (
+        onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+    )
+    session = onnxruntime.InferenceSession(
+        str(path), sess_options=options, providers=["CPUExecutionProvider"]
+    )
+    input_name = session.get_inputs()[0].name
+
+    def run_ort(blob: np.ndarray) -> np.ndarray:
+        return session.run(None, {input_name: blob})[0]
+
+    return run_ort, "onnxruntime"
+
+
 class ExpressionAnalyzer:
     def __init__(
         self,
@@ -394,12 +441,20 @@ class ExpressionAnalyzer:
         self.face_detector = cv2.FaceDetectorYN.create(
             str(face_model), "", (320, 320), face_confidence, 0.3, 50
         )
-        # Averaging two EfficientNet-B0 heads costs one extra ~10 ms pass per
+        # Averaging two EfficientNet-B0 heads costs one extra ~100 ms pass per
         # classified face and lifts RAF-DB balanced accuracy from 53% to 59%
         # while keeping the sadness precision of the original model.
-        self.expression_nets = [
-            cv2.dnn.readNetFromONNX(str(path)) for path in expression_models
-        ]
+        runners = [expression_runner(path) for path in expression_models]
+        self.expression_nets = [runner for runner, _ in runners]
+        self.backends = sorted({backend for _, backend in runners})
+        if "cv2.dnn" in self.backends:
+            print(
+                "[expression] WARNING: onnxruntime is missing, so expression "
+                "cues fall back to cv2.dnn. On OpenCV 4.8 that returns the "
+                "same near-uniform scores for every input and the greeter will "
+                "never reach its sadness threshold. Install onnxruntime.",
+                flush=True,
+            )
         self.smoothing = smoothing
         self.min_face_size = min_face_size
         self.scores: np.ndarray | None = None
@@ -410,11 +465,12 @@ class ExpressionAnalyzer:
         resized = cv2.resize(face_rgb, (224, 224)).astype(np.float32) / 255.0
         resized -= np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
         resized /= np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
-        blob = resized.transpose(2, 0, 1)[None, ...]
-        probabilities = []
-        for net in self.expression_nets:
-            net.setInput(blob)
-            probabilities.append(expression_probabilities(net.forward()))
+        blob = np.ascontiguousarray(
+            resized.transpose(2, 0, 1)[None, ...], dtype=np.float32
+        )
+        probabilities = [
+            expression_probabilities(run(blob)) for run in self.expression_nets
+        ]
         return np.mean(probabilities, axis=0)
 
     def missing(self) -> None:
@@ -458,6 +514,9 @@ class ExpressionAnalyzer:
             )
 
         best_index = int(np.argmax(self.scores))
+        distress = float(
+            sum(self.scores[EMOTION_LABELS.index(name)] for name in DISTRESS_LABELS)
+        )
         return Expression(
             x1 + offset_x,
             y1 + offset_y,
@@ -465,6 +524,7 @@ class ExpressionAnalyzer:
             y2 + offset_y,
             EMOTION_LABELS[best_index],
             float(self.scores[best_index]),
+            distress,
         )
 
 
@@ -1133,6 +1193,11 @@ def run(args: argparse.Namespace) -> int:
         face_confidence=args.face_confidence,
         min_face_size=args.min_face_size,
     )
+    print(
+        f"[expression] {len(expression_models)} model(s) on "
+        f"{', '.join(analyzer.backends)}",
+        flush=True,
+    )
     speaker = RobotSpeaker(args.voice_prompt)
     check_in = start_check_in(args)
     trigger = SadVoiceTrigger(
@@ -1395,6 +1460,7 @@ def run(args: argparse.Namespace) -> int:
                     "expression_confidence": (
                         0.0 if expression is None else expression.confidence
                     ),
+                    "distress": 0.0 if expression is None else expression.distress,
                     "pipeline_ms": elapsed * 1000,
                     "yolo_ms": (yolo_finished - started) * 1000,
                     "expression_ms": (expression_finished - yolo_finished) * 1000,
@@ -1406,7 +1472,8 @@ def run(args: argparse.Namespace) -> int:
                 label = (
                     "none"
                     if expression is None
-                    else f"{expression.label} {expression.confidence:.0%}"
+                    else f"{expression.label} {expression.confidence:.0%} "
+                    f"distress={expression.distress:.0%}"
                 )
                 now = time.monotonic()
                 if args.max_frames or now - last_log_at >= args.log_interval:
@@ -1493,7 +1560,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("/tmp/bracketbot_ground_alert.json"),
         help="atomic safety observation consumed by the navigation app",
     )
-    parser.add_argument("--sad-confidence", type=float, default=0.6)
+    parser.add_argument(
+        "--sad-confidence",
+        type=float,
+        default=0.6,
+        help="summed sadness+anger+disgust+fear needed to start a check-in",
+    )
     parser.add_argument("--sad-hold-seconds", type=float, default=1.5)
     parser.add_argument("--sad-cooldown", type=float, default=30.0)
     parser.add_argument("--sad-reset-seconds", type=float, default=2.0)

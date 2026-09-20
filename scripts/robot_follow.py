@@ -42,7 +42,7 @@ STATUS_PERIOD = 0.2
 CSV_PERIOD = 0.05
 STATE_TIMEOUT = 0.3
 DRIVE_WRITER_PATTERNS = (
-    "greeter/main.py", "nav/main.py", "bbapps/teleop.py", "quest_teleop/main.py",
+    "bbapps/greeter/main.py", "nav/main.py", "bbapps/teleop.py", "quest_teleop/main.py",
     "leader_follower_teleop.py", "live_inference.py", "robot_follow.py", "robot_base_mode.py",
     "person_tracker.py",
 )
@@ -72,6 +72,11 @@ def build_parser():
     parser.add_argument("--no-heartbeat", action="store_true", help="only with --dry-run: no dashboard needed")
     mode.add_argument("--check", action="store_true", help="gate G0: print the clusters seen for 3 s, then exit")
     mode.add_argument("--preflight", action="store_true", help="validate calibration and live inputs; opens no writers")
+    parser.add_argument("--no-led", action="store_true",
+                        help="leave led.ctrl alone: BBOS allows one writer and the voice assistant holds it")
+    parser.add_argument("--ignore-writer", action="append", default=[], metavar="PATTERN",
+                        help="a DRIVE_WRITER_PATTERNS entry the caller guarantees is idle (the voice "
+                             "assistant passes person_tracker.py, which it keeps from turning meanwhile)")
     parser.add_argument("--calibration", type=Path, default=DEFAULT_PATH,
                         help="robot-specific JSON calibration (default: ~/.config/baymax/follow.json)")
     return parser
@@ -103,12 +108,14 @@ def wait_fresh(reader, timeout, topic):
     return reader.data
 
 
-def other_drive_writers():
+def other_drive_writers(ignore=()):
     # robot_follow.py and robot_base_mode.py match our own pattern, and the
     # `uv run ... python /tmp/robot_follow.py` parent also matches: ignore both.
     mine = {os.getpid(), os.getppid()}
     found = []
     for pattern in DRIVE_WRITER_PATTERNS:
+        if pattern in ignore:
+            continue
         result = subprocess.run(["pgrep", "-af", pattern], capture_output=True, text=True)
         found.extend(
             line.strip() for line in result.stdout.splitlines()
@@ -259,7 +266,8 @@ def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width, calibr
             if out.state != state:
                 print(f"[follow] state {out.state}", flush=True)
                 state, state_since = out.state, t
-            write_led(led, led_color(out.state, t - state_since))
+            if led is not None:
+                write_led(led, led_color(out.state, t - state_since))
             if t - last_status >= STATUS_PERIOD:
                 print(status_line(out), flush=True)
                 last_status = t
@@ -329,7 +337,7 @@ def run(args):
         refusal = start_refusal(
             cfg, roll_deg=float(rpy[0]), pitch_deg=float(rpy[1]), voltage=voltage,
             low_battery_v=None if low_battery_v is None else float(low_battery_v),
-            drive_writers=other_drive_writers(), points_fresh=points_fresh,
+            drive_writers=other_drive_writers(args.ignore_writer), points_fresh=points_fresh,
         )
         if refusal:
             raise RuntimeError(f"refusing to start: {refusal}")
@@ -348,7 +356,7 @@ def run(args):
         drive = None
         if not args.dry_run:
             drive = stack.enter_context(Writer("drive.ctrl", Type("drive_ctrl"), keeptime=False))
-        led = stack.enter_context(Writer("led.ctrl", Type("led_ctrl"), keeptime=False))
+        led = None if args.no_led else stack.enter_context(Writer("led.ctrl", Type("led_ctrl"), keeptime=False))
         mode = "dry run" if args.dry_run else "rotate only" if args.rotate_only else f"v_max {cfg.v_max:.2f} m/s"
         print(f"[follow] follow active ({mode}, gap {args.gap:.2f} m) - stand in front of the robot", flush=True)
         try:
@@ -358,7 +366,8 @@ def run(args):
                 for _ in range(6):
                     write_twist(drive, 0.0, 0.0)
                     time.sleep(PERIOD)
-            write_led(led, (0, 0, 0))
+            if led is not None:
+                write_led(led, (0, 0, 0))
             if drive is not None:
                 print("[follow] stopped; zero twist sent", flush=True)
 

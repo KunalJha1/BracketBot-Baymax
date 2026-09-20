@@ -21,7 +21,14 @@ import numpy as np
 from bbos import Reader, Type, Writer
 
 TICK = 0.015
-EASE_S = 3.0
+# Ease time scales with distance (smoothstep peaks at 1.5x the mean speed), so
+# a short entry is quick and the longest allowed entry is as slow as before.
+EASE_PEAK_TURNS_PER_S = 0.30
+MIN_EASE_S = 0.5
+MAX_EASE_S = 3.0
+IDLE_TURNS = 0.01
+IDLE_MARGIN_S = 0.15
+RETURNED_TURNS = 0.08
 UPRIGHT_DEG = 25.0
 DOF = 8
 ACTIVE_SPAN_TURNS = 0.04
@@ -87,6 +94,31 @@ def load_trajectory(path):
     return times - times[0], poses
 
 
+def trim_idle(times, poses):
+    """Drop the motionless lead-in/out; keep holds that are part of the gesture."""
+    joints = np.concatenate([poses[side][:, 1:7] for side in SIDES], axis=1)
+    moved = np.flatnonzero(np.abs(joints - joints[0]).max(axis=1) > IDLE_TURNS)
+    if not len(moved):
+        return times, poses
+    first = int(np.searchsorted(times, times[moved[0]] - IDLE_MARGIN_S))
+    last = len(times) - 1
+    # A final hold away from the first pose (namaste) is intentional.
+    if np.abs(joints[-1] - joints[0]).max() <= RETURNED_TURNS:
+        settling = np.flatnonzero(np.abs(joints - joints[-1]).max(axis=1) > IDLE_TURNS)
+        last = min(last, int(np.searchsorted(times, times[settling[-1]] + IDLE_MARGIN_S)))
+    if last - first < 1:
+        return times, poses
+    keep = slice(first, last + 1)
+    return times[keep] - times[first], {side: poses[side][keep] for side in SIDES}
+
+
+def ease_seconds(from_poses, to_poses):
+    distance = max(
+        float(np.max(np.abs(to_poses[side] - from_poses[side]))) for side in to_poses
+    )
+    return min(max(1.5 * distance / EASE_PEAK_TURNS_PER_S, MIN_EASE_S), MAX_EASE_S)
+
+
 def active_sides(poses):
     """Select arms with intentional motion, excluding lift and gripper noise."""
     return tuple(
@@ -133,6 +165,7 @@ def main():
     sides = active_sides(poses)
     if not sides:
         sys.exit("[gesture] no intentional arm movement found in this recording")
+    times, poses = trim_idle(times, poses)
     playback_times = times / args.speed
 
     with ExitStack() as stack:
@@ -211,7 +244,8 @@ def main():
                     buf["tau_mode"][:] = False
                     buf["compliance_mode"] = False
 
-        def ease(from_poses, to_poses, seconds):
+        def ease(from_poses, to_poses):
+            seconds = ease_seconds(from_poses, to_poses)
             started = time.monotonic()
             last = from_poses
             while True:
@@ -234,7 +268,7 @@ def main():
             torque(True)
             print(f"[gesture] torque on; easing into {name}", flush=True)
             first = {side: poses[side][0] for side in sides}
-            last = ease(starts, first, EASE_S)
+            last = ease(starts, first)
 
             if not interrupts:
                 print(f"[gesture] playing {name}", flush=True)
@@ -249,7 +283,7 @@ def main():
 
             if interrupts < 2:
                 print("[gesture] returning to the starting pose", flush=True)
-                ease(last, starts, EASE_S)
+                ease(last, starts)
                 time.sleep(0.3)
         finally:
             torque(False)

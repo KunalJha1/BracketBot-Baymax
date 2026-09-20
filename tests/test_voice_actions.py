@@ -451,3 +451,203 @@ def test_ticks_are_throttled_so_speech_cannot_pile_up(tmp_path):
         "Your heart rate looks like about 80 beats per minute. "
         "This is a camera estimate, not a medical measurement.",
     ]
+
+
+def look_controller(tmp_path, finder, announced):
+    gestures = FakeGestureController()
+    controller = voice_actions.VoiceActionController(gestures, tmp_path, person_finder=finder)
+    controller.bind(FakeSpeaker(), SimpleNamespace(), FakeLeds(), announce=announced.append)
+    return controller, gestures
+
+
+def test_look_at_me_turns_to_the_person_without_moving_the_arms(tmp_path):
+    announced = []
+    finder = FakeFinder({"found": True, "distance": "far", "turned_deg": 140})
+    controller, gestures = look_controller(tmp_path, finder, announced)
+
+    assert controller.start("look-at-me") == (True, "Okay. Looking for you.")
+    wait_for_controller(controller)
+
+    assert finder.purposes == ["look"]
+    assert gestures.actions == []
+    # Distance does not matter for a look, so no "come closer".
+    assert announced == ["There you are."]
+
+
+def test_look_at_me_confirms_when_already_facing_the_person(tmp_path):
+    announced = []
+    finder = FakeFinder({"found": True, "distance": "ok", "turned_deg": 4})
+    controller, _ = look_controller(tmp_path, finder, announced)
+
+    controller.start("look-at-me")
+    wait_for_controller(controller)
+
+    assert announced == ["I see you."]
+
+
+def test_look_at_me_says_so_when_nobody_or_no_tracker(tmp_path):
+    announced = []
+    controller, _ = look_controller(
+        tmp_path, FakeFinder({"found": False, "reason": "nobody"}), announced
+    )
+    controller.start("look-at-me")
+    wait_for_controller(controller)
+    assert announced == [voice_actions.NOT_FOUND_MESSAGE]
+
+    announced.clear()
+    controller, _ = look_controller(
+        tmp_path, FakeFinder({"found": False, "unavailable": True}), announced
+    )
+    controller.start("look-at-me")
+    wait_for_controller(controller)
+    assert announced == [voice_actions.TRACKER_MISSING_MESSAGE]
+
+
+def test_fist_bump_plays_its_sound_cue_during_the_gesture(tmp_path, monkeypatch):
+    with wave.open(str(tmp_path / "fist_bump_balalala.wav"), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(np.array([1000, -1000, 500, -500], dtype=np.int16).tobytes())
+    monkeypatch.setitem(voice_actions.GESTURE_SOUNDS, "fist bump", ("fist_bump_balalala.wav", 0.01))
+
+    speaker = FakeSpeaker()
+    gestures = FakeGestureController()
+    controller = voice_actions.VoiceActionController(gestures, tmp_path)
+    controller.bind(speaker, SimpleNamespace(sample_rate=16000, chunk_size=4, channels=1), FakeLeds())
+
+    assert controller.start("fist bump")[0] is True
+    deadline = time.monotonic() + 1.0
+    while not speaker.frames and time.monotonic() < deadline:
+        time.sleep(0.005)
+    gestures.active = False
+    wait_for_controller(controller)
+
+    assert len(speaker.frames) == 1
+
+
+def test_gesture_sound_is_skipped_when_the_gesture_already_ended(tmp_path, monkeypatch):
+    monkeypatch.setitem(voice_actions.GESTURE_SOUNDS, "fist bump", ("fist_bump_balalala.wav", 0.05))
+    speaker = FakeSpeaker()
+    gestures = FakeGestureController()
+    controller = voice_actions.VoiceActionController(gestures, tmp_path)
+    controller.bind(speaker, SimpleNamespace(sample_rate=16000, chunk_size=4, channels=1), FakeLeds())
+
+    assert controller.start("fist bump")[0] is True
+    gestures.active = False           # e.g. the safety check refused the motion
+    wait_for_controller(controller)
+    time.sleep(0.15)
+
+    assert speaker.frames == []
+
+
+# --- follow me -------------------------------------------------------------
+
+class FakeFollowRunner:
+    installed = True
+
+    def __init__(self, states=(), last="stopped; zero twist sent"):
+        self.states = states
+        self.last = last
+        self.started = threading.Event()
+
+    def follow(self, cancel, on_state=None):
+        self.started.set()
+        for state in self.states:
+            on_state(state)
+        if self.last.startswith("refusing"):
+            return self.last
+        cancel.wait(2.0)
+        return self.last
+
+
+def test_follow_me_faces_the_person_then_follows_until_stopped(tmp_path):
+    announced = []
+    leds = FakeLeds()
+    finder = FakeFinder({"found": True, "distance": "far", "turned_deg": 3})
+    runner = FakeFollowRunner(states=("SEARCHING", "FOLLOWING", "LOST", "FOLLOWING", "LOST"))
+    controller = voice_actions.VoiceActionController(
+        FakeGestureController(), tmp_path, person_finder=finder, follow_runner=runner
+    )
+    controller.bind(FakeSpeaker(), SimpleNamespace(), leds, announce=announced.append)
+
+    assert controller.start("follow-me")[0] is True
+    assert runner.started.wait(1.0)
+    assert controller.start("wave")[0] is False  # nothing else may move the robot meanwhile
+    assert controller.stop()[0] is True
+    wait_for_controller(controller)
+
+    assert finder.purposes == ["look"]
+    # Each state is spoken once, and a stop the person asked for needs no "I've stopped".
+    assert announced == [
+        voice_actions.FOLLOW_STATE_MESSAGES["FOLLOWING"],
+        voice_actions.FOLLOW_STATE_MESSAGES["LOST"],
+    ]
+    assert leds.effects[1][:2] == voice_actions.FOLLOW_STATE_LED["FOLLOWING"]
+
+
+def test_follow_me_does_not_start_when_nobody_is_found(tmp_path):
+    announced = []
+    runner = FakeFollowRunner()
+    controller = voice_actions.VoiceActionController(
+        FakeGestureController(), tmp_path,
+        person_finder=FakeFinder({"found": False, "reason": "nobody"}), follow_runner=runner,
+    )
+    controller.bind(FakeSpeaker(), SimpleNamespace(), FakeLeds(), announce=announced.append)
+
+    assert controller.start("follow-me")[0] is True
+    wait_for_controller(controller)
+
+    assert not runner.started.is_set()
+    assert announced == [voice_actions.NOT_FOUND_MESSAGE]
+
+
+def test_follow_me_says_why_the_runner_refused(tmp_path):
+    announced = []
+    runner = FakeFollowRunner(last="refusing to start: robot is not upright")
+    controller = voice_actions.VoiceActionController(
+        FakeGestureController(), tmp_path, follow_runner=runner
+    )
+    controller.bind(FakeSpeaker(), SimpleNamespace(), FakeLeds(), announce=announced.append)
+
+    assert controller.start("follow-me")[0] is True
+    wait_for_controller(controller)
+
+    assert announced == ["I can't follow you right now: robot is not upright."]
+
+
+def test_follow_me_is_refused_when_the_runner_is_not_installed(tmp_path):
+    controller = voice_actions.VoiceActionController(FakeGestureController(), tmp_path)
+    assert controller.start("follow-me") == (False, voice_actions.FOLLOW_MISSING_MESSAGE)
+    assert not controller._operation_lock.locked()
+
+
+FAKE_RUNNER = '''
+import json, sys
+assert sys.argv[1:] == ["--v-max", "0.15", "--ignore-writer", "person_tracker.py", "--no-led"], sys.argv
+print("[follow] state FOLLOWING", flush=True)
+print("FOLLOW_STATUS {}", flush=True)
+beats = 0
+for line in sys.stdin:
+    kind = json.loads(line)["type"]
+    beats += kind == "heartbeat"
+    if kind == "stop":
+        print(f"[follow] stopped after {beats} heartbeats", flush=True)
+        break
+'''
+
+
+def test_follow_runner_heartbeats_then_asks_the_process_to_stop(tmp_path, monkeypatch):
+    monkeypatch.setattr(voice_actions, "FOLLOW_HEARTBEAT_S", 0.02)
+    script = tmp_path / "robot_follow.py"
+    script.write_text(FAKE_RUNNER)
+    runner = voice_actions.FollowRunner(script, python_bin=sys.executable)
+    cancel = threading.Event()
+    states = []
+    threading.Timer(0.4, cancel.set).start()
+
+    last = runner.follow(cancel, on_state=states.append)
+
+    assert states == ["FOLLOWING"]
+    assert last.startswith("stopped after ")
+    assert int(last.split()[2]) >= 3

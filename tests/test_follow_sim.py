@@ -192,7 +192,7 @@ def test_bystander_crossing_does_not_steal_the_track():
 
 
 def test_obstacle_blocks_forward_motion_before_contact():
-    box_x = 1.4  # a 0.3 m box appears between the robot (~0.8 m) and the person (~1.8 m)
+    box_x = 1.25  # a 0.3 m box appears between the robot (~0.75 m) and the person (~1.8 m)
     result = run(Scenario(walking_away(0.2), duration=12.0,
                           obstacle=lambda t: (box_x, 0.0) if t >= 6.0 else None))
     blocked = [o for *_, o in result.samples(6.0) if o.state == BLOCKED]

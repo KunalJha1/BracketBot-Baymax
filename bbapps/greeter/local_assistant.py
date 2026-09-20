@@ -18,6 +18,8 @@ from concurrent.futures import ThreadPoolExecutor
 import math
 import os
 from pathlib import Path
+import socket
+import subprocess
 import sys
 import threading
 import time
@@ -49,7 +51,7 @@ try:
         default_question_response_cache,
         default_seed_pairs,
     )
-    from .voice_actions import SILENT_ACTIONS, RppgScanner, VoiceActionController
+    from .voice_actions import SILENT_ACTIONS, FollowRunner, RppgScanner, VoiceActionController
     from .reminders import default_reminder_db_path, default_timezone_name
     from .person_finder import PersonTrackerClient
 except ImportError:
@@ -76,7 +78,7 @@ except ImportError:
         default_question_response_cache,
         default_seed_pairs,
     )
-    from voice_actions import SILENT_ACTIONS, RppgScanner, VoiceActionController
+    from voice_actions import SILENT_ACTIONS, FollowRunner, RppgScanner, VoiceActionController
     from reminders import default_reminder_db_path, default_timezone_name
     from person_finder import PersonTrackerClient
 
@@ -259,6 +261,33 @@ def answer_text(router: VoiceRouter, utterance: str) -> str:
     return decision.reply or "I did not understand that."
 
 
+WHISPER_SERVER_PORT = 8910
+
+
+def start_whisper_server(whisper_bin: str, model: str, threads: int):
+    """Keep the model resident when no launcher did, e.g. under autostart.
+
+    Returns ``(url, process)``. The CLI remains the fallback, so a missing
+    binary or a server that is still loading never costs a turn.
+    """
+    url = f"http://127.0.0.1:{WHISPER_SERVER_PORT}"
+    with socket.socket() as probe:
+        probe.settimeout(0.2)
+        if probe.connect_ex(("127.0.0.1", WHISPER_SERVER_PORT)) == 0:
+            return url, None
+    binary = Path(whisper_bin).with_name("whisper-server")
+    if not binary.is_file() or not Path(model).is_file():
+        return "", None
+    process = subprocess.Popen(
+        [str(binary), "--model", model, "--host", "127.0.0.1",
+         "--port", str(WHISPER_SERVER_PORT), "--threads", str(threads)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    print(f"[local-assistant] Whisper model resident on {url}", flush=True)
+    return url, process
+
+
 def run_voice(args, router, transcriber, synthesizer, action_controller) -> None:
     mic_cfg = Config("mic")
     speaker_cfg = Config("speaker")
@@ -424,7 +453,7 @@ def main() -> None:
     parser.add_argument(
         "--trailing-silence",
         type=float,
-        default=0.8,
+        default=0.6,
         help="seconds of silence after speech before submitting the turn",
     )
     parser.add_argument(
@@ -483,6 +512,12 @@ def main() -> None:
         help="turns in place to face the person before camera actions",
     )
     parser.add_argument(
+        "--follow-script",
+        type=Path,
+        default=Path(__file__).parent.parent / "follow" / "robot_follow.py",
+        help="depth person-follow runner started by 'follow me'",
+    )
+    parser.add_argument(
         "--no-person-finder",
         action="store_true",
         help="never turn to look for the person; use whatever is in view",
@@ -504,6 +539,7 @@ def main() -> None:
         Path(__file__).parent.parent / "play_sound" / "wavs",
         heart_rate_scanner=RppgScanner(args.rppg_script),
         person_finder=person_finder,
+        follow_runner=FollowRunner(args.follow_script),
         reminder_db_path=args.reminder_db or default_reminder_db_path(),
         reminder_timezone=args.timezone or default_timezone_name(),
     )
@@ -518,6 +554,11 @@ def main() -> None:
         reminder_cancel_executor=action_controller.cancel_reminders,
         reminder_list_executor=action_controller.list_reminders,
     )
+    whisper_server = None
+    if not args.whisper_server and not (args.text or args.preflight_gesture or args.speak_text):
+        args.whisper_server, whisper_server = start_whisper_server(
+            args.whisper_bin, args.whisper_model, args.whisper_threads
+        )
     cli_transcriber = WhisperCppTranscriber(
         args.whisper_bin,
         args.whisper_model,
@@ -569,6 +610,8 @@ def main() -> None:
             return
         run_voice(args, router, transcriber, synthesizer, action_controller)
     finally:
+        if whisper_server is not None:
+            whisper_server.terminate()
         action_controller.close()
         gesture_controller.close()
         if person_finder is not None:

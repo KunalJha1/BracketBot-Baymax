@@ -90,6 +90,13 @@ STOP_ALIASES = frozenset(
         "cancel that",
         "cancel the action",
         "that's enough",
+        "stop following",
+        "stop following me",
+        "don't follow me",
+        "do not follow me",
+        "stay",
+        "stay here",
+        "stay there",
     }
 )
 
@@ -249,6 +256,42 @@ def match_reminder_request(text: str) -> ReminderRequest | None:
 # Keep this deliberately explicit. Adding an alias here is what grants spoken
 # language permission to start that motion.
 ACTION_ALIASES = {
+    "follow-me": frozenset(
+        {
+            "follow me",
+            "follow me please",
+            "please follow me",
+            "come with me",
+            "come along",
+            "come follow me",
+            "start following me",
+            "start following",
+            "can you follow me",
+            "could you follow me",
+            "walk with me",
+        }
+    ),
+    "look-at-me": frozenset(
+        {
+            "look at me",
+            "look over here",
+            "look here",
+            "look this way",
+            "look my way",
+            "turn to me",
+            "turn toward me",
+            "turn towards me",
+            "turn and look at me",
+            "turn around and look at me",
+            "face me",
+            "find me",
+            "can you look at me",
+            "can you see me",
+            "i'm over here",
+            "im over here",
+            "over here",
+        }
+    ),
     "goodbye": frozenset(
         {
             "bye",
@@ -557,8 +600,16 @@ def authorize_gesture_tool(utterance: str, gesture: str) -> tuple[bool, str]:
     if other_gestures:
         return False, "Only one unambiguous gesture may be requested at a time."
 
-    command_starts = normalized.startswith(terms) or normalized.startswith(
-        _REQUEST_PREFIXES
+    # Speech-to-text often wraps the command in stray words ("Faster. Fist
+    # bump."). One whole sentence that is exactly this gesture's command is
+    # still an explicit request; negation anywhere was already refused above.
+    sentence_commands = any(
+        match_action(sentence) == gesture for sentence in re.split(r"[.!?]+", utterance)
+    )
+    command_starts = (
+        sentence_commands
+        or normalized.startswith(terms)
+        or normalized.startswith(_REQUEST_PREFIXES)
     )
     if not command_starts:
         return False, "The transcript mentions a gesture but does not explicitly request it."
@@ -1453,6 +1504,8 @@ class VoiceRouter:
             "double-wave": "Of course. Waving twice.",
             "calm-moment": "Okay. Starting a calm moment.",
             "dance-party": "Let's start the dance party.",
+            "look-at-me": "Okay. Looking for you.",
+            "follow-me": "Okay. Stand in front of me and I'll follow you.",
             "heart-rate": (
                 "Okay. Let me find you. Then please look at my camera and hold "
                 "still for about twenty seconds while I check your heart rate."
@@ -1546,7 +1599,12 @@ class VoiceRouter:
         def handle_model_gesture(gesture: str) -> tuple[bool, str]:
             authorized, reason = authorize_gesture_tool(utterance, gesture)
             if not authorized:
-                return False, reason
+                # The reason is for the log; the person hears how to ask again.
+                print(f"[voice-router] gesture '{gesture}' not authorized: {reason}", flush=True)
+                return False, (
+                    f"I wasn't sure you wanted a {gesture}. "
+                    f"If you do, just say: do a {gesture}."
+                )
             started, status = self._execute(gesture)
             # In proposal-only mode, the caller will execute the returned action.
             return (True, status) if started is None else (started, status)

@@ -33,8 +33,8 @@ from check_in import (  # noqa: E402
 )
 
 
-def expression(label="sadness", confidence=0.9):
-    return Expression(20, 20, 40, 40, label, confidence)
+def expression(label="sadness", confidence=0.9, distress=0.9):
+    return Expression(20, 20, 40, 40, label, confidence, distress)
 
 
 def test_face_must_be_inside_a_yolo_person_box():
@@ -56,6 +56,26 @@ def test_robot_sadness_cue_is_debounced():
     assert not trigger.update(expression(), True, 1.49)
     assert trigger.update(expression(), True, 1.5)
     assert not trigger.update(expression(), True, 60)
+
+
+def test_trigger_uses_summed_negative_affect_not_the_sadness_label():
+    """A plain frown scores disgust=60%/sadness=20%, so the single "sadness"
+    class cannot gate the check-in; the four negative classes together can."""
+
+    trigger = SadVoiceTrigger(hold_seconds=1.0, confidence=0.6)
+    frown = expression(label="disgust", confidence=0.6, distress=0.87)
+
+    assert not trigger.update(frown, True, 0)
+    assert trigger.update(frown, True, 1.0)
+
+
+def test_trigger_ignores_a_confident_but_untroubled_face():
+    trigger = SadVoiceTrigger(hold_seconds=1.0, confidence=0.6)
+    calm = expression(label="surprise", confidence=0.66, distress=0.19)
+
+    assert not trigger.update(calm, True, 0)
+    assert not trigger.update(calm, True, 1.0)
+    assert not trigger.update(calm, True, 5.0)
 
 
 def test_yolo_pose_output_decodes_person_box():
@@ -201,13 +221,13 @@ def test_expression_probabilities_drop_contempt_and_valence_arousal():
 
 
 class FakeNet:
+    """Stands in for one entry of ExpressionAnalyzer.expression_nets, which
+    holds callables so the ONNX backend (onnxruntime or cv2.dnn) can vary."""
+
     def __init__(self, logits):
         self.logits = np.asarray(logits, dtype=np.float32)[None, :]
 
-    def setInput(self, _blob):
-        pass
-
-    def forward(self):
+    def __call__(self, _blob):
         return self.logits
 
 
@@ -248,6 +268,7 @@ def test_expression_analyzer_averages_model_ensemble():
     result = analyzer.analyze(frame)
 
     assert result.label == "sadness"
+    assert result.distress == pytest.approx(result.confidence)
     assert (result.x2 - result.x1) == (result.y2 - result.y1) == 100
 
 

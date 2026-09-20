@@ -100,7 +100,7 @@ These steps are read-only apart from copying files into `/tmp`.
 1. Copy the app, the signal chain, and the model:
 
    ```sh
-   scp scripts/robot_rppg.py rppg.py assets/models/face_landmarker.task bot:/tmp/
+   scp scripts/robot_rppg.py rppg.py assets/models/face_detection_yunet_2026may.onnx bot:/tmp/
    ```
 
 2. Check the camera and face gate with a willing person standing at about

@@ -25,7 +25,9 @@ MAX_TEXT_LENGTH = 4096
 # Settings > Accessibility > Spoken Content sounds better still and can be
 # selected with --voice without any other change.
 DEFAULT_VOICE = "Samantha"
-DEFAULT_RATE = 172
+# A touch slower than conversational: across a room, through a small speaker,
+# the extra gap between words does more for intelligibility than anything else.
+DEFAULT_RATE = 160
 # No artificial pitch shift: transposing the baseline is what gave the speech
 # its chipmunk-like, obviously-machine timbre.
 DEFAULT_PITCH = 0

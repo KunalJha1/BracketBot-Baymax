@@ -8,7 +8,7 @@ proxy_url="http://${proxy_host}:${proxy_port}"
 tts_port="${BAYMAX_TTS_PORT:-8900}"
 tts_url="http://${proxy_host}:${tts_port}/tts"
 tts_voice="${BAYMAX_TTS_VOICE:-Samantha}"
-tts_rate="${BAYMAX_TTS_RATE:-172}"
+tts_rate="${BAYMAX_TTS_RATE:-160}"
 tts_pitch="${BAYMAX_TTS_PITCH:-0}"
 whisper_port="${BAYMAX_WHISPER_PORT:-8910}"
 whisper_home="${WHISPER_CPP_HOME:-/home/bracketbot/.local/share/whisper.cpp}"
@@ -97,15 +97,16 @@ scp -q \
   bbapps/play_sound/wavs/low_battery_1.wav \
   bbapps/play_sound/wavs/baymax_calm.wav \
   bbapps/play_sound/wavs/baymax_celebration.wav \
+  bbapps/play_sound/wavs/fist_bump_balalala.wav \
   "$robot_host:/home/bracketbot/bbapps/play_sound/wavs/"
 echo "Syncing the read-only heart-rate scan..."
 ssh -o BatchMode=yes "$robot_host" "mkdir -p /home/bracketbot/bbapps/rppg"
 scp -q \
   scripts/robot_rppg.py \
   rppg.py \
-  assets/models/face_landmarker.task \
+  assets/models/face_detection_yunet_2026may.onnx \
   "$robot_host:/home/bracketbot/bbapps/rppg/"
-# Install the scan's MediaPipe/OpenCV/SciPy environment now, through the
+# Install the scan's OpenCV/SciPy environment now, through the
 # proxy, so the first "what's my heart rate" does not wait on downloads.
 if ! ssh -o BatchMode=yes "$robot_host" \
   "cd /home/bracketbot/bbapps/rppg && env HTTPS_PROXY='$proxy_url' https_proxy='$proxy_url' /home/bracketbot/.local/bin/uv run --quiet robot_rppg.py --help >/dev/null"; then
@@ -122,6 +123,14 @@ if ! ssh -o BatchMode=yes "$robot_host" \
   "cd /home/bracketbot/bbapps/person && env HTTPS_PROXY='$proxy_url' https_proxy='$proxy_url' /home/bracketbot/.local/bin/uv run --quiet person_tracker.py --check-deps"; then
   echo "Person tracker environment did not install; camera actions will use whatever is in view." >&2
 fi
+echo "Syncing the person follower (\"follow me\")..."
+ssh -o BatchMode=yes "$robot_host" "mkdir -p /home/bracketbot/bbapps/follow"
+scp -q \
+  scripts/robot_follow.py \
+  scripts/follow_core.py \
+  scripts/follow_perception.py \
+  scripts/follow_calibration.py \
+  "$robot_host:/home/bracketbot/bbapps/follow/"
 # Keep the Whisper model resident. The CLI reloads it from disk on every
 # spoken turn, which is fixed latency in front of every single answer. If the
 # server does not come up the assistant simply falls back to the CLI.

@@ -2,13 +2,13 @@
 rppg.py - contactless heart rate for BracketBot / "Baymax" scan.
 
 Pipeline:
-  camera (locked exposure/WB) -> MediaPipe FaceLandmarker -> forehead + cheek ROI mask
+  camera (locked exposure/WB) -> OpenCV YuNet face detector -> forehead + cheek ROI mask
   -> per-frame mean RGB + timestamp -> resample to uniform fs -> POS projection
   -> detrend + Butterworth bandpass -> Hann-windowed zero-padded FFT
   -> peak (parabolic interp) + SNR gate + tracking -> BPM, confidence
 
-Deps: numpy, scipy, opencv-python, mediapipe>=0.10 (Tasks API)
-Model: assets/models/face_landmarker.task (source and checksum in assets/models/README.md)
+Deps: numpy, scipy, opencv-python
+Model: assets/models/face_detection_yunet_2026may.onnx (source/checksum in assets/models/README.md)
 
 NOT a medical device. Demo accuracy only.
 """
@@ -24,7 +24,9 @@ from scipy.signal import butter, filtfilt, detrend
 # ----------------------------------------------------------------------------
 
 HR_LO_HZ, HR_HI_HZ = 0.7, 3.0          # 42-180 BPM
-DEFAULT_MODEL = Path(__file__).resolve().parent / "assets" / "models" / "face_landmarker.task"
+DEFAULT_MODEL = (
+    Path(__file__).resolve().parent / "assets" / "models" / "face_detection_yunet_2026may.onnx"
+)
 
 
 def resample_uniform(t, rgb, fs):
@@ -128,50 +130,76 @@ def estimate_hr(t, rgb, fs=30.0, method="pos", prev_bpm=None, track_bpm=15.0):
 
 
 # ----------------------------------------------------------------------------
-# ROI extraction (MediaPipe Face Mesh 478-landmark topology)
+# ROI extraction (OpenCV YuNet face box + five landmarks)
 # ----------------------------------------------------------------------------
 
-FOREHEAD = [10, 67, 69, 104, 108, 109, 151, 297, 299, 333, 337, 338]
-L_CHEEK = [36, 50, 101, 117, 118, 123, 142, 187, 205]
-R_CHEEK = [266, 280, 330, 346, 347, 352, 371, 411, 425]
-NOSE_TIP = 1
+FACE_SCORE = 0.75
+
+
+def face_skin_mask(face, image_shape):
+    """Return a conservative forehead/cheek mask from one YuNet detection.
+
+    YuNet rows are ``x, y, w, h``, five landmark pairs (eyes, nose, mouth
+    corners), then confidence. Fixed face-relative polygons avoid the eyes,
+    nose, mouth, hairline, and background. This is less anatomically precise
+    than a 478-point mesh, but rPPG only needs stable skin averages and YuNet
+    has supported ARM64 wheels through OpenCV, unlike the old MediaPipe stack.
+    """
+    import cv2
+
+    h_img, w_img = image_shape[:2]
+    values = np.asarray(face, dtype=float).reshape(-1)
+    if len(values) < 15 or not np.isfinite(values[:15]).all():
+        return None
+    x, y, w, h = values[:4]
+    if w <= 0 or h <= 0:
+        return None
+
+    def point(rx, ry):
+        px = int(np.clip(round(x + rx * w), 0, max(0, w_img - 1)))
+        py = int(np.clip(round(y + ry * h), 0, max(0, h_img - 1)))
+        return px, py
+
+    regions = (
+        # Forehead: below the hairline and above the eyebrows.
+        (point(0.24, 0.10), point(0.76, 0.10), point(0.69, 0.34), point(0.31, 0.34)),
+        # Camera-left and camera-right cheeks, clear of nose and mouth.
+        (point(0.10, 0.46), point(0.38, 0.42), point(0.40, 0.72), point(0.16, 0.76)),
+        (point(0.62, 0.42), point(0.90, 0.46), point(0.84, 0.76), point(0.60, 0.72)),
+    )
+    mask = np.zeros((h_img, w_img), np.uint8)
+    for region in regions:
+        cv2.fillConvexPoly(mask, np.asarray(region, dtype=np.int32), 255)
+    return mask
 
 
 class FaceROI:
     def __init__(self, model_path=DEFAULT_MODEL):
-        import mediapipe as mp
-        from mediapipe.tasks import python as mpp
-        from mediapipe.tasks.python import vision
-        self.mp = mp
-        opts = vision.FaceLandmarkerOptions(
-            base_options=mpp.BaseOptions(model_asset_path=str(model_path)),
-            running_mode=vision.RunningMode.VIDEO,
-            num_faces=1,
-        )
-        self.lm = vision.FaceLandmarker.create_from_options(opts)
-
-    def __call__(self, frame_bgr, t_ms):
-        """Returns (mean_rgb (3,), nose_xy, face_width_px, mask) or None if no face."""
         import cv2
+
+        self.cv2 = cv2
+        self.detector = cv2.FaceDetectorYN.create(
+            str(model_path), "", (320, 320), FACE_SCORE, 0.3, 50
+        )
+        self.detector_size = None
+
+    def __call__(self, frame_bgr, _t_ms):
+        """Returns (mean_rgb (3,), nose_xy, face_width_px, mask) or None if no face."""
         h, w = frame_bgr.shape[:2]
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        res = self.lm.detect_for_video(
-            self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=rgb), int(t_ms))
-        if not res.face_landmarks:
+        if self.detector_size != (w, h):
+            self.detector.setInputSize((w, h))
+            self.detector_size = (w, h)
+        _, faces = self.detector.detect(frame_bgr)
+        if faces is None or not len(faces):
             return None
-        pts = np.array([[p.x * w, p.y * h] for p in res.face_landmarks[0]], dtype=np.float32)
-
-        mask = np.zeros((h, w), np.uint8)
-        for region in (FOREHEAD, L_CHEEK, R_CHEEK):
-            hull = cv2.convexHull(pts[region].astype(np.int32))
-            cv2.fillConvexPoly(mask, hull, 255)
-        mask = cv2.erode(mask, np.ones((5, 5), np.uint8))   # stay off edges/hairline
-
-        if cv2.countNonZero(mask) < 400:                    # face too small/far
+        face = max(faces, key=lambda row: float(row[2] * row[3] * row[-1]))
+        mask = face_skin_mask(face, frame_bgr.shape)
+        if mask is None or self.cv2.countNonZero(mask) < 400:  # face too small/far
             return None
-        m = cv2.mean(rgb, mask=mask)[:3]
-        face_w = pts[:, 0].max() - pts[:, 0].min()
-        return np.array(m), pts[NOSE_TIP], face_w, mask
+        rgb = self.cv2.cvtColor(frame_bgr, self.cv2.COLOR_BGR2RGB)
+        mean_rgb = self.cv2.mean(rgb, mask=mask)[:3]
+        nose = np.asarray(face[8:10], dtype=np.float32)
+        return np.asarray(mean_rgb), nose, float(face[2]), mask
 
 
 # ----------------------------------------------------------------------------
@@ -219,7 +247,7 @@ def open_camera(width=640, height=480, fps=30, exposure_us=8333):
 # ----------------------------------------------------------------------------
 
 def measure_heart_rate(duration_s=15.0, window_s=10.0, fs=30.0,
-                       snr_min_db=-1.0, motion_max=0.03,
+                       snr_min_db=-1.0, motion_max=0.03, face_gap_max_s=0.75,
                        model_path=DEFAULT_MODEL, on_update=None, grab=None):
     """
     Blocking scan. Robot should be stationary (motors holding balance only)
@@ -227,6 +255,9 @@ def measure_heart_rate(duration_s=15.0, window_s=10.0, fs=30.0,
 
     motion_max: max nose displacement per frame as fraction of face width.
                 Frames above this are dropped; if too many drop, buffer resets.
+    face_gap_max_s: tolerate brief landmark misses without throwing away the
+                    several seconds of good signal already collected. Longer
+                    losses reset the window and peak tracker.
     on_update(bpm, snr, progress): optional hook for the face display.
     grab: zero-arg callable returning one BGR frame (or None if no new frame yet).
           Defaults to open_camera(); the robot passes its head-camera reader here.
@@ -235,7 +266,7 @@ def measure_heart_rate(duration_s=15.0, window_s=10.0, fs=30.0,
     grab = grab or open_camera(fps=int(fs))
     roi = FaceROI(model_path)
     buf_t, buf_rgb = deque(), deque()
-    last_nose, estimates, prev = None, [], None
+    last_nose, last_face_at, estimates, estimate_snrs, prev = None, None, [], [], None
     t0 = time.monotonic()
     next_est = t0 + 6.0
     bad_run = 0
@@ -246,9 +277,18 @@ def measure_heart_rate(duration_s=15.0, window_s=10.0, fs=30.0,
             continue
         r = roi(frame, now * 1000)
         if r is None:
-            buf_t.clear(); buf_rgb.clear(); last_nose = None
+            # A face detector will occasionally miss one frame even with a
+            # well-positioned subject. Clearing a 6-10 second pulse window on
+            # every such miss made the scan require a literally perfect run,
+            # despite the camera health gate accepting an 80% face rate.
+            # Interpolation safely bridges short gaps; a sustained loss still
+            # invalidates the subject and starts a fresh measurement.
+            if last_face_at is not None and now - last_face_at > face_gap_max_s:
+                buf_t.clear(); buf_rgb.clear(); last_nose = None
+                estimates.clear(); estimate_snrs.clear(); prev = None
             continue
         rgb, nose, face_w, _ = r
+        last_face_at = now
 
         if last_nose is not None and np.linalg.norm(nose - last_nose) / face_w > motion_max:
             bad_run += 1
@@ -268,15 +308,19 @@ def measure_heart_rate(duration_s=15.0, window_s=10.0, fs=30.0,
             bpm, snr = estimate_hr(np.array(buf_t), np.array(buf_rgb), fs, prev_bpm=prev)
             if bpm is not None and snr >= snr_min_db:
                 estimates.append(bpm)
+                estimate_snrs.append(snr)
                 prev = bpm
             if on_update:
-                on_update(bpm, snr, (now - t0) / duration_s)
+                # Do not present a rejected spectral peak as a live reading.
+                accepted_bpm = bpm if bpm is not None and snr >= snr_min_db else None
+                on_update(accepted_bpm, snr, (now - t0) / duration_s)
 
     if not estimates:
         return None
     tail = estimates[-5:]
+    snr_tail = estimate_snrs[-5:]
     return {"bpm": float(np.median(tail)),
-            "snr_db": float(snr) if snr is not None else None,
+            "snr_db": float(np.median(snr_tail)),
             "confident": len(estimates) >= 3 and np.ptp(tail) < 8,
             "n_estimates": len(estimates)}
 

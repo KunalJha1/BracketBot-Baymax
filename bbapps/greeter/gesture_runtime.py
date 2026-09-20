@@ -17,7 +17,9 @@ try:
     from .gesture_safety import (
         active_sides,
         depth_clearance,
+        ease_seconds,
         plan_recorded_gesture,
+        playback_speed,
         spoken_safety_refusal,
         trajectory_arrays,
     )
@@ -25,14 +27,14 @@ except ImportError:
     from gesture_safety import (
         active_sides,
         depth_clearance,
+        ease_seconds,
         plan_recorded_gesture,
+        playback_speed,
         spoken_safety_refusal,
         trajectory_arrays,
     )
 
 
-EASE_SECONDS = 3.0
-PLAYBACK_SPEED = 0.6
 TICK_SECONDS = 0.015
 ARM_SIDES = ("left", "right")
 ARM_RESERVATION_PATH = Path(
@@ -158,10 +160,11 @@ def play_recorded_movement(name, plan, cancel_event, shutdown_event):
                     buf["compliance_mode"] = False
 
         def ease(from_poses, to_poses):
+            seconds = ease_seconds(from_poses, to_poses)
             began = time.monotonic()
             last = from_poses
             while True:
-                alpha = _smoothstep((time.monotonic() - began) / EASE_SECONDS)
+                alpha = _smoothstep((time.monotonic() - began) / seconds)
                 last = {
                     side: from_poses[side]
                     + alpha * (to_poses[side] - from_poses[side])
@@ -189,7 +192,7 @@ def play_recorded_movement(name, plan, cancel_event, shutdown_event):
             last = ease(plan.starts, first)
 
             if not cancel_event.is_set() and not shutdown_event.is_set():
-                playback_times = plan.times / PLAYBACK_SPEED
+                playback_times = plan.times / playback_speed(name)
                 began = time.monotonic()
                 index = 0
                 while index < len(playback_times) - 1:

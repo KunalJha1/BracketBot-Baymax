@@ -216,6 +216,19 @@ def trim_silence(
     return samples[start:end]
 
 
+def whisper_audio_context(sample_count: int, sample_rate: int) -> int:
+    """Encoder frames needed for this utterance instead of whisper's fixed 30 s.
+
+    Whisper pads every clip to 30 s (1500 frames at 50 per second) and the
+    encoder is most of a turn's cost on this CPU, so a three-second command was
+    paying for thirty. Generous padding keeps the transcript unchanged.
+    """
+    seconds = sample_count / max(1, sample_rate)
+    frames = int(np.ceil(seconds * 50.0)) + 128
+    frames = -(-frames // 64) * 64
+    return int(min(1500, max(384, frames)))
+
+
 class WhisperCppTranscriber:
     """Transcribe mono PCM with the standalone whisper.cpp CLI."""
 
@@ -224,7 +237,8 @@ class WhisperCppTranscriber:
     # health vocabulary this robot is actually asked about.
     DEFAULT_PROMPT = (
         "Hey BracketBot. Baymax. Weather in Waterloo. Wave. Handshake. "
-        "Fist bump. Hug. Salute. Namaste. Dance. Point at the person. Stop. "
+        "Fist bump. Hug. Salute. Namaste. Dance. Point at the person. Look at "
+        "me. Stop. "
         "Remind me in four minutes to take my meds. Set a timer for four "
         "minutes. Cancel my reminder. Check my heart rate. Check me out. "
         "Start my checkup. "
@@ -286,6 +300,8 @@ class WhisperCppTranscriber:
                 "--beam-size",
                 "1",
                 "--no-fallback",
+                "--audio-ctx",
+                str(whisper_audio_context(len(audio), sample_rate)),
             ]
             result = self._runner(
                 command,
@@ -377,6 +393,7 @@ class WhisperServerTranscriber:
                 "response_format": "json",
                 "language": self.language,
                 "prompt": self.prompt,
+                "audio_ctx": str(whisper_audio_context(len(audio), sample_rate)),
             },
             "utterance.wav",
             _wav_bytes(audio, sample_rate),
@@ -428,6 +445,76 @@ def _resample(audio: np.ndarray, source_rate: int, target_rate: int) -> np.ndarr
     return np.interp(target_x, source_x, audio).clip(-32768, 32767).astype(np.int16)
 
 
+def _bell(freqs: np.ndarray, centre: float, gain_db: float, octaves: float) -> np.ndarray:
+    """A smooth EQ bump (in dB) centred on ``centre`` and ``octaves`` wide."""
+    distance = np.log2(np.maximum(freqs, 1.0) / centre) / octaves
+    return gain_db * np.exp(-0.5 * distance * distance)
+
+
+def clarify_speech(
+    audio: np.ndarray,
+    sample_rate: int,
+    *,
+    target_peak: float = 0.89,
+    threshold_db: float = -26.0,
+    ratio: float = 3.0,
+) -> np.ndarray:
+    """Make synthesized speech intelligible on the robot's small speaker.
+
+    Raw TTS puts most of its energy in the 120-500 Hz vowel body, which a small
+    driver turns into boom, while the 2-5 kHz consonant band that carries
+    intelligibility sits about 18 dB lower.  This removes what the speaker
+    cannot reproduce, lifts the consonants, evens out word-to-word level so
+    quiet syllables are not lost in the room, and normalizes the peak so every
+    line plays at the same loudness.
+    """
+    samples = np.asarray(audio, dtype=np.float64).reshape(-1) / 32768.0
+    if samples.size < 64 or not np.any(samples):
+        return np.asarray(audio, dtype=np.int16).reshape(-1)
+
+    # Zero-phase EQ in the frequency domain.
+    spectrum = np.fft.rfft(samples)
+    freqs = np.fft.rfftfreq(samples.size, 1.0 / sample_rate)
+    ratio_hp = (freqs / 150.0) ** 4
+    gain_db = 10.0 * np.log10(np.maximum(ratio_hp / (1.0 + ratio_hp), 1e-12))
+    gain_db += _bell(freqs, 300.0, -3.0, 0.9)  # mud
+    gain_db += _bell(freqs, 3200.0, 7.0, 1.1)  # consonant presence
+    gain_db += _bell(freqs, 7000.0, 3.0, 0.8)  # sibilant air
+    samples = np.fft.irfft(spectrum * 10.0 ** (gain_db / 20.0), n=samples.size)
+
+    # Downward compression driven by a smoothed RMS envelope.
+    window = max(1, int(0.02 * sample_rate))
+    kernel = np.hanning(window * 2 + 1)
+    kernel /= kernel.sum()
+    envelope = np.sqrt(np.convolve(samples * samples, kernel, mode="same") + 1e-12)
+    level_db = 20.0 * np.log10(envelope)
+    over = np.maximum(0.0, level_db - threshold_db)
+    samples = samples * 10.0 ** (-over * (1.0 - 1.0 / ratio) / 20.0)
+
+    # Short fades so the EQ never leaves a click at either edge.
+    fade = min(samples.size // 2, int(0.005 * sample_rate))
+    if fade:
+        ramp = np.linspace(0.0, 1.0, fade)
+        samples[:fade] *= ramp
+        samples[-fade:] *= ramp[::-1]
+
+    # Normalize on the body of the speech rather than its few tallest peaks,
+    # then round those peaks off above a knee.  A handful of plosives would
+    # otherwise hold the whole line several dB quieter than it needs to be.
+    body = float(np.percentile(np.abs(samples), 99.7))
+    if body > 0.0:
+        samples = samples * (target_peak * 0.8 / body)
+    knee = target_peak * 0.7
+    span = target_peak - knee
+    excess = np.abs(samples) - knee
+    samples = np.where(
+        excess > 0.0,
+        np.sign(samples) * (knee + span * np.tanh(np.maximum(excess, 0.0) / span)),
+        samples,
+    )
+    return (samples * 32767.0).clip(-32768, 32767).astype(np.int16)
+
+
 class EspeakSynthesizer:
     """Render text to mono PCM using the local espeak-ng executable."""
 
@@ -475,7 +562,7 @@ class EspeakSynthesizer:
                 f"espeak-ng exited with {result.returncode}: {detail}"
             )
         pcm, source_rate = _decode_wav(result.stdout, "espeak-ng")
-        return _resample(pcm, source_rate, target_rate)
+        return clarify_speech(_resample(pcm, source_rate, target_rate), target_rate)
 
 
 def _decode_wav(payload: bytes, provider: str) -> tuple[np.ndarray, int]:
@@ -524,7 +611,7 @@ class HttpTtsSynthesizer:
         except (error.URLError, TimeoutError, OSError) as exc:
             raise LocalVoiceError(f"Local natural voice unavailable: {exc}") from exc
         pcm, source_rate = _decode_wav(payload, "Local natural voice")
-        return _resample(pcm, source_rate, target_rate)
+        return clarify_speech(_resample(pcm, source_rate, target_rate), target_rate)
 
 
 class FallbackSynthesizer:

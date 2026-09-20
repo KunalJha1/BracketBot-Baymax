@@ -77,9 +77,32 @@ TICK_SPACING_S = 4.0
 # Actions aimed at a person: face them before starting. A missing person tracker
 # leaves these exactly as they were (no turning, no search).
 PERSON_GESTURES = frozenset({"handshake", "fist bump", "hug"})
+# A sound cue played partway through a gesture: (file, seconds after the
+# gesture starts). The fist bump's cue lands as the fist pulls back from the
+# bump, which is 2.5 s into the recording at 0.6x speed plus the ease-in.
+GESTURE_SOUNDS = {"fist bump": ("fist_bump_balalala.wav", 4.8)}
+# Turn to face the speaker and stop there: the person finder with no gesture.
+LOOK_ACTIONS = frozenset({"look-at-me"})
+TRACKER_MISSING_MESSAGE = "I can't look for people right now."
 NOT_FOUND_MESSAGE = (
     "I can't see you. Could you step in front of my camera and ask me again?"
 )
+# Drive behind a person. The follow runner owns drive.ctrl and led.ctrl while it runs.
+FOLLOW_ACTIONS = frozenset({"follow-me"})
+FOLLOW_MISSING_MESSAGE = "Following is not installed on this robot yet."
+FOLLOW_HEARTBEAT_S = 0.25         # the runner stops itself after 1 s of silence
+# Same colours the dashboard-run follower shows (follow_core.STATE_LED).
+FOLLOW_STATE_LED = {
+    "SEARCHING": ((70, 125, 255), "pulse"),
+    "FOLLOWING": ((70, 220, 120), "solid"),
+    "BLOCKED": ((255, 160, 0), "solid"),
+    "LOST": ((255, 160, 0), "blink"),
+}
+FOLLOW_STATE_MESSAGES = {
+    "FOLLOWING": "Okay. I'm following you.",
+    "LOST": "I lost you. Please stand in front of me.",
+    "BLOCKED": "Something is in my way.",
+}
 SCAN_LED = ((72, 205, 220), "pulse")
 REMINDER_LED = ((255, 185, 40), "blink", 8.0)
 MAX_REMINDER_SECONDS = 365 * 24 * 60 * 60
@@ -206,6 +229,87 @@ class RppgScanner:
         return result if isinstance(result, dict) else None
 
 
+class FollowRunner:
+    """Run ``robot_follow.py`` (depth person tracking + PID) as a separate process.
+
+    The runner stops the base by itself within a second if this process stops
+    sending heartbeats, so a crashed or killed assistant cannot leave it driving.
+    """
+
+    def __init__(self, script: Path, *, python_bin: str | Path | None = None, v_max: float = 0.15):
+        self.script = Path(script)
+        self.python_bin = str(python_bin or Path.home() / "bbos" / ".venv" / "bin" / "python")
+        self.v_max = v_max
+
+    @property
+    def installed(self) -> bool:
+        return self.script.is_file()
+
+    def follow(self, cancel: threading.Event, on_state=None) -> str:
+        """Follow until cancelled or the runner exits; returns the runner's last log line."""
+        process = subprocess.Popen(
+            [
+                self.python_bin, self.script.name, "--v-max", str(self.v_max),
+                # Ours, and idle: the action lock keeps it from turning while we drive.
+                "--ignore-writer", "person_tracker.py",
+                "--no-led",                # the assistant holds BBOS's only led.ctrl writer
+            ],
+            cwd=self.script.parent,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+        last = [""]
+
+        def pump():
+            for line in process.stdout:
+                line = line.strip()
+                if not line.startswith("[follow] "):
+                    continue  # FOLLOW_STATUS telemetry is for the dashboard
+                print(line, flush=True)
+                last[0] = line.removeprefix("[follow] ")
+                if on_state is not None and last[0].startswith("state "):
+                    on_state(last[0].removeprefix("state "))
+
+        reader = threading.Thread(target=pump, name="follow-stdout", daemon=True)
+        reader.start()
+
+        def send(message: str) -> bool:
+            try:
+                process.stdin.write(json.dumps({"type": message}) + "\n")
+                process.stdin.flush()
+                return True
+            except (OSError, ValueError):
+                return False
+
+        try:
+            while process.poll() is None and not cancel.wait(FOLLOW_HEARTBEAT_S):
+                send("heartbeat")
+            if process.poll() is None:
+                send("stop")               # the runner ramps to zero and exits
+                process.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            pass
+        finally:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=2.0)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    pass
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)   # drive.ctrl times out in 0.1 s
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            reader.join(timeout=1.0)
+        return last[0]
+
+
 def tick_message(bpm: float, index: int) -> str:
     """Short spoken reading for an in-progress scan. Kept terse so the next
     estimate is not still waiting on the speaker."""
@@ -251,6 +355,7 @@ class VoiceActionController:
         assets_dir: Path,
         heart_rate_scanner=None,
         person_finder=None,
+        follow_runner=None,
         reminder_db_path: str | Path | None = None,
         reminder_timezone: str | None = None,
         reminder_scheduler=None,
@@ -259,6 +364,7 @@ class VoiceActionController:
         self.assets_dir = Path(assets_dir)
         self.heart_rate_scanner = heart_rate_scanner
         self.person_finder = person_finder
+        self.follow_runner = follow_runner
         self.speaker = None
         self.speaker_cfg = None
         self.leds = None
@@ -266,6 +372,7 @@ class VoiceActionController:
         self.speaker_lock = threading.Lock()
         self._operation_lock = threading.Lock()
         self._cancel = threading.Event()
+        self._last_find: dict = {}
         self._shutdown = threading.Event()
         self._thread = None
         self._reminder_db_path = reminder_db_path
@@ -396,7 +503,26 @@ class VoiceActionController:
     def reminder_audit(self, reminder_id=None, limit=100):
         return self._ensure_reminder_scheduler().audit(reminder_id, limit)
 
+    def _start_gesture_sound(self, action: str) -> None:
+        """Play the gesture's sound cue at its moment, unless the gesture ends first."""
+        cue = GESTURE_SOUNDS.get(action)
+        if cue is None or self.speaker is None or self.speaker_cfg is None:
+            return
+        filename, delay = cue
+
+        def run():
+            if self._cancel.wait(delay) or not self.gesture_controller.running():
+                return
+            print(f"[voice-action] {action} sound cue: {filename}", flush=True)
+            try:
+                self._play_sound(self.assets_dir / filename, volume=0.9)
+            except Exception as exc:
+                print(f"[voice-action] {action} sound skipped: {exc}", flush=True)
+
+        threading.Thread(target=run, name=f"voice-sound-{action}", daemon=True).start()
+
     def _release_when_gesture_finishes(self, action: str) -> None:
+        self._start_gesture_sound(action)
         if action == "dance" and self.speaker is not None:
             self._play_sound(
                 self.assets_dir / SOUND_FILES["music-celebration"],
@@ -410,6 +536,7 @@ class VoiceActionController:
     def start(self, action: str):
         if action not in (
             GESTURES | LED_EFFECTS.keys() | SOUND_FILES.keys() | ROUTINES.keys() | HEALTH_ACTIONS
+            | LOOK_ACTIONS | FOLLOW_ACTIONS
         ):
             return False, f"Voice action '{action}' is not installed."
         if not self._operation_lock.acquire(blocking=False):
@@ -418,6 +545,12 @@ class VoiceActionController:
 
         if action in HEALTH_ACTIONS:
             return self._start_heart_rate_scan(checkup=action == "checkup")
+
+        if action in LOOK_ACTIONS:
+            return self._start_look_at_me()
+
+        if action in FOLLOW_ACTIONS:
+            return self._start_follow()
 
         if action in PERSON_GESTURES and self.person_finder is not None:
             return self._start_person_gesture(action)
@@ -460,15 +593,23 @@ class VoiceActionController:
         self._thread.start()
         return True, f"Started {action}"
 
-    def _face_person(self, purpose: str) -> bool:
+    def _face_person(
+        self, purpose: str, *, check_distance: bool = True, require_tracker: bool = False
+    ) -> bool:
         """Turn in place to find and face the person. False means do not continue."""
         if self.person_finder is None:
-            return True
+            if require_tracker:
+                self.announce(TRACKER_MISSING_MESSAGE)
+            return not require_tracker
         result = self.person_finder.acquire(purpose, self._cancel)
+        self._last_find = result
         print(f"[voice-action] person finder: {result}", flush=True)
         if self._cancel.is_set() or self._shutdown.is_set():
             return False
         if result.get("unavailable"):
+            if require_tracker:
+                self.announce(TRACKER_MISSING_MESSAGE)
+                return False
             return True               # behave as before the tracker existed
         if not result.get("found"):
             if result.get("refused"):
@@ -479,7 +620,7 @@ class VoiceActionController:
             else:
                 self.announce(NOT_FOUND_MESSAGE)
             return False
-        band = result.get("distance")
+        band = result.get("distance") if check_distance else None
         if band in ("far", "close"):
             self.announce(
                 "Please come a little closer."
@@ -491,6 +632,70 @@ class VoiceActionController:
         elif abs(result.get("turned_deg") or 0) >= 20:
             self.announce("There you are.")
         return True
+
+    def _start_look_at_me(self):
+        def run():
+            try:
+                # Facing someone has no reach to get right, so any distance is fine.
+                found = self._face_person(
+                    "look", check_distance=False, require_tracker=True
+                )
+                # A real turn already earned "There you are."
+                if found and abs(self._last_find.get("turned_deg") or 0) < 20:
+                    self.announce("I see you.")
+            except Exception as exc:
+                print(f"[voice-action] look-at-me failed safely: {exc}", flush=True)
+            finally:
+                self._operation_lock.release()
+
+        self._thread = threading.Thread(target=run, name="voice-action-look-at-me", daemon=True)
+        self._thread.start()
+        return True, "Okay. Looking for you."
+
+    def _start_follow(self):
+        runner = self.follow_runner
+        if runner is None or not getattr(runner, "installed", True):
+            self._operation_lock.release()
+            return False, FOLLOW_MISSING_MESSAGE
+
+        def run():
+            leds = self.leds
+            try:
+                # Lock-on needs the person within 30 degrees of straight ahead, so
+                # turn to them first. Without a tracker, follow whoever stands in front.
+                if not self._face_person("look", check_distance=False):
+                    return
+                spoken = set()
+
+                def on_state(state):
+                    if leds is not None and state in FOLLOW_STATE_LED:
+                        leds.start_effect(*FOLLOW_STATE_LED[state], 3600.0)
+                    message = FOLLOW_STATE_MESSAGES.get(state)
+                    # Say each state once: a person weaving through a doorway
+                    # would otherwise be told "I lost you" every few seconds.
+                    if message is None or state in spoken or self._cancel.is_set():
+                        return
+                    spoken.add(state)
+                    self.announce(message)
+
+                last = runner.follow(self._cancel, on_state=on_state)
+                if leds is not None:
+                    leds.clear_effect()
+                print(f"[voice-action] follow ended: {last}", flush=True)
+                if not self._cancel.is_set() and not self._shutdown.is_set():
+                    if last.startswith("refusing to start: "):
+                        reason = last.removeprefix("refusing to start: ")
+                        self.announce(f"I can't follow you right now: {reason}.")
+                    else:
+                        self.announce("I've stopped following.")
+            except Exception as exc:
+                print(f"[voice-action] follow-me failed safely: {exc}", flush=True)
+            finally:
+                self._operation_lock.release()
+
+        self._thread = threading.Thread(target=run, name="voice-action-follow-me", daemon=True)
+        self._thread.start()
+        return True, "Okay. Stand in front of me and I'll follow you."
 
     def _start_person_gesture(self, action: str):
         def run():
@@ -564,6 +769,7 @@ class VoiceActionController:
             started, message = self.gesture_controller.start(action)
             if not started:
                 raise RuntimeError(message)
+            self._start_gesture_sound(action)
             while self.gesture_controller.running() and not self._shutdown.wait(0.02):
                 if self._cancel.is_set():
                     self.gesture_controller.stop()

@@ -63,6 +63,29 @@ def test_default_model_ships_with_repo():
     assert rppg.DEFAULT_MODEL.exists()
 
 
+def test_face_skin_mask_covers_three_skin_regions_without_background():
+    # YuNet: bbox, right eye, left eye, nose, mouth corners, confidence.
+    face = np.array(
+        [20, 10, 100, 120, 50, 50, 90, 50, 70, 70, 52, 100, 88, 100, 0.99],
+        dtype=np.float32,
+    )
+    mask = rppg.face_skin_mask(face, (160, 160, 3))
+
+    assert mask.shape == (160, 160)
+    assert mask[25, 70] == 255       # forehead
+    assert mask[80, 45] == 255       # left cheek
+    assert mask[80, 95] == 255       # right cheek
+    assert mask[70, 70] == 0         # nose gap
+    assert mask[150, 150] == 0       # background
+
+
+def test_yunet_face_roi_loads_real_shipped_model():
+    roi = rppg.FaceROI()
+    frame = np.zeros((240, 320, 3), np.uint8)
+
+    assert roi(frame, 0) is None
+
+
 class FakeReader:
     """Stands in for bbos.Reader on a 2560x960 head-camera frame: left eye red, right eye blue."""
 
@@ -114,3 +137,69 @@ def test_head_camera_jpeg_path_splits_the_eye():
     frame = cam.grab()
     assert frame.shape == (960, 1280, 3)
     assert frame[480, 640, 1] > 150 and frame[480, 640, 2] < 50
+
+
+class SteppingClock:
+    def __init__(self, step=1 / 30):
+        self.now = -step
+        self.step = step
+
+    def __call__(self):
+        self.now += self.step
+        return self.now
+
+
+class SyntheticFaceROI:
+    """Stable synthetic skin signal with realistic one-frame detector misses."""
+
+    def __init__(self, bpm=72, miss_every=10):
+        self.bpm = bpm
+        self.miss_every = miss_every
+        self.calls = 0
+
+    def __call__(self, _frame, t_ms):
+        self.calls += 1
+        if self.miss_every and self.calls % self.miss_every == 0:
+            return None
+        t = t_ms / 1000
+        pulse = np.sin(2 * np.pi * self.bpm / 60 * t)
+        base = np.array([180.0, 130.0, 110.0])
+        weights = np.array([0.3, 1.0, 0.5])
+        rgb = base * (1 + 0.004 * pulse * weights)
+        return rgb, np.array([50.0, 50.0]), 100.0, None
+
+
+def test_measurement_tolerates_brief_face_detector_misses(monkeypatch):
+    roi = SyntheticFaceROI()
+    monkeypatch.setattr(rppg, "FaceROI", lambda _model: roi)
+    monkeypatch.setattr(rppg.time, "monotonic", SteppingClock())
+
+    result = rppg.measure_heart_rate(
+        duration_s=12.0,
+        window_s=10.0,
+        fs=30.0,
+        grab=lambda: np.zeros((4, 4, 3), np.uint8),
+    )
+
+    assert result is not None
+    assert abs(result["bpm"] - 72) < 2
+    assert result["n_estimates"] >= 3
+
+
+def test_measurement_does_not_publish_rejected_peak(monkeypatch):
+    monkeypatch.setattr(rppg, "FaceROI", lambda _model: SyntheticFaceROI(miss_every=0))
+    monkeypatch.setattr(rppg.time, "monotonic", SteppingClock())
+    monkeypatch.setattr(rppg, "estimate_hr", lambda *_args, **_kwargs: (72.0, -10.0))
+    updates = []
+
+    result = rppg.measure_heart_rate(
+        duration_s=7.2,
+        fs=30.0,
+        snr_min_db=-1.0,
+        on_update=lambda bpm, snr, progress: updates.append((bpm, snr, progress)),
+        grab=lambda: np.zeros((4, 4, 3), np.uint8),
+    )
+
+    assert result is None
+    assert updates
+    assert all(bpm is None for bpm, _snr, _progress in updates)

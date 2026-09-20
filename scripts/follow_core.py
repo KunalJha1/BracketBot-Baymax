@@ -35,22 +35,33 @@ class FollowConfig:
     gap_min: float = 0.6
     gap_max: float = 1.5
     band: float = 0.20  # acceptance band only; the controller never reads it
-    # Controller
+    # Controller: one PID on the range error (-> v) and one on the bearing (-> omega).
     deadband_range: float = 0.05
-    k_r: float = 0.8
+    v_kp: float = 0.6  # m/s per m
+    v_ki: float = 0.3  # removes the lag behind a steadily walking person
+    v_kd: float = 0.15  # damps the approach so the robot eases into the gap
+    v_i_max: float = 0.2  # most the integral may contribute (m/s)
+    v_i_zone: float = 0.3  # integrate only this close to the gap (m): no overshoot after a long approach
+    v_d_tau: float = 0.25  # low-pass on the error rate (s); range is noisy
     v_max: float = 0.15  # default rises to 0.30 only after robot gate G4b passes
-    k_theta: float = 1.5
+    w_kp: float = 1.2  # rad/s per rad
+    w_ki: float = 0.2
+    w_kd: float = 0.12
+    w_i_max: float = 0.15  # rad/s
+    w_i_zone: float = math.radians(20.0)
+    w_d_tau: float = 0.15
     deadband_bearing: float = math.radians(3.0)
-    omega_max: float = 0.8
+    # Slow turns on purpose: the depth cluster drops out above ~0.6 rad/s (G3 logs).
+    omega_max: float = 0.5
     turn_in_place_bearing: float = math.radians(35.0)
     # Rate limits applied to what is actually sent
-    accel_up: float = 0.4
-    accel_down: float = 0.8
-    alpha_max: float = 1.5
+    accel_up: float = 0.25
+    accel_down: float = 0.6
+    alpha_max: float = 1.0
     # Supervisor
     min_range: float = 0.45
     heartbeat_timeout: float = 1.0
-    perception_stale: float = 0.3
+    perception_stale: float = 0.5  # single dropped frames are common while turning
     points_stale: float = 0.3
     lost_after: float = 1.0
     lost_timeout: float = 10.0
@@ -338,14 +349,76 @@ class Tracker:
         return Track(forward, left, rng, math.atan2(left, forward), float(v_radial), self.age(t))
 
 
-def follow_command(track, gap, cfg):
+class PID:
+    """PID with a low-passed error rate and a clamped, conditionally integrated I term."""
+
+    def __init__(self, kp, ki, kd, i_max, d_tau, i_zone=math.inf, i_min=None):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.i_max = i_max
+        self.i_min = -i_max if i_min is None else i_min
+        self.d_tau = d_tau
+        self.i_zone = i_zone
+        self.reset()
+
+    def reset(self):
+        self.integral = 0.0  # already scaled by ki: the I term's output contribution
+        self.rate = 0.0
+        self._last_error = None
+
+    def drop_integral(self):
+        self.integral = 0.0
+
+    def step(self, error, dt, low, high):
+        """Output clamped to [low, high]; the integral only grows while that clamp is inactive."""
+        if self._last_error is not None and dt > 0:
+            raw = (error - self._last_error) / dt
+            self.rate += (raw - self.rate) * dt / (self.d_tau + dt)
+        self._last_error = error
+        if error == 0.0:
+            # Inside the deadband: bleed the integral so the robot settles instead of creeping.
+            self.integral *= max(0.0, 1.0 - 2.0 * dt)
+        unclamped = self.kp * error + self.integral + self.kd * self.rate
+        step = self.ki * error * dt
+        winding_up = (unclamped >= high and step > 0) or (unclamped <= low and step < 0)
+        if not winding_up and abs(error) <= self.i_zone:
+            self.integral = clamp(self.integral + step, self.i_min, self.i_max)
+        return clamp(self.kp * error + self.integral + self.kd * self.rate, low, high)
+
+
+class FollowController:
     """(v, omega) that holds ``gap`` to the tracked person. v is never negative."""
-    v = max(track.v_radial, 0.0) + cfg.k_r * shrink(track.range - gap, cfg.deadband_range)
-    v *= math.cos(track.bearing)
-    if abs(track.bearing) > cfg.turn_in_place_bearing:
-        v = 0.0  # face the person before driving
-    omega = cfg.k_theta * shrink(track.bearing, cfg.deadband_bearing)
-    return clamp(v, 0.0, cfg.v_max), clamp(omega, -cfg.omega_max, cfg.omega_max)
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        # The base never reverses, so a negative range integral could only delay the next start.
+        self.range_pid = PID(cfg.v_kp, cfg.v_ki, cfg.v_kd, cfg.v_i_max, cfg.v_d_tau, cfg.v_i_zone, i_min=0.0)
+        self.bearing_pid = PID(cfg.w_kp, cfg.w_ki, cfg.w_kd, cfg.w_i_max, cfg.w_d_tau, cfg.w_i_zone)
+
+    def reset(self):
+        self.range_pid.reset()
+        self.bearing_pid.reset()
+
+    def hold(self):
+        """The supervisor overrode the command: don't let the integrals wind up meanwhile."""
+        self.range_pid.drop_integral()
+        self.bearing_pid.drop_integral()
+
+    def command(self, track, gap, dt):
+        cfg = self.cfg
+        v = self.range_pid.step(shrink(track.range - gap, cfg.deadband_range), dt, 0.0, cfg.v_max)
+        v *= max(0.0, math.cos(track.bearing))
+        if abs(track.bearing) > cfg.turn_in_place_bearing:
+            v = 0.0  # face the person before driving
+            self.range_pid.drop_integral()
+        omega = self.bearing_pid.step(
+            shrink(track.bearing, cfg.deadband_bearing), dt, -cfg.omega_max, cfg.omega_max
+        )
+        return v, omega
+
+
+def follow_command(track, gap, cfg):
+    """The controller's first-tick (purely proportional) answer; handy in tests."""
+    return FollowController(cfg).command(track, gap, 0.0)
 
 
 class RateLimiter:
@@ -524,6 +597,7 @@ class FollowLoop:
         self.lock_on = LockOn(self.cfg)
         self.tracker = Tracker(self.cfg)
         self.corridor = CorridorGuard(self.cfg)
+        self.controller = FollowController(self.cfg)
         self.limiter = RateLimiter(self.cfg)
         self.odom_check = OdometryCheck(self.cfg)
         self.state = SEARCHING
@@ -550,7 +624,11 @@ class FollowLoop:
 
         tracking = self.state in (FOLLOWING, BLOCKED)
         track = self.tracker.track(inp.t, self.pose) if tracking else None
-        v_cmd, omega_cmd = follow_command(track, self.gap, cfg) if track else (0.0, 0.0)
+        if track:
+            v_cmd, omega_cmd = self.controller.command(track, self.gap, dt)
+        else:
+            self.controller.reset()
+            v_cmd, omega_cmd = 0.0, 0.0
         points_age = math.inf if self.last_points_t is None else inp.t - self.last_points_t
         verdict = supervise(
             cfg, v=v_cmd, omega=omega_cmd,
@@ -560,6 +638,8 @@ class FollowLoop:
             points_age=points_age, blocked=self.corridor.blocked,
             range_m=track.range if track else None,
         )
+        if verdict.rule != "ok":
+            self.controller.hold()
         if verdict.exit:
             self.limiter.reset()
             v, omega = 0.0, 0.0

@@ -232,3 +232,55 @@ def test_goodbye_safety_refusal_describes_the_wave():
     assert spoken_safety_refusal("goodbye", "robot is not upright") == (
         "I can't wave goodbye while I'm not upright."
     )
+
+
+def _recording(name):
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    folder = "bbapps/mimic/recordings" if name == "dance" else "bbapps/greeter/movements"
+    return json.loads((root / folder / f"{name}.json").read_text())
+
+
+def test_trim_idle_drops_dance_dead_time_but_keeps_the_motion():
+    from bbapps.greeter.gesture_safety import trajectory_arrays, trim_idle
+
+    times, poses = trajectory_arrays(_recording("dance"))
+    trimmed_times, trimmed = trim_idle(times, poses)
+
+    assert times[-1] - trimmed_times[-1] > 3.5
+    assert trimmed_times[0] == 0.0
+    for side in ("left", "right"):
+        assert np.allclose(
+            np.ptp(trimmed[side][:, 1:7], axis=0),
+            np.ptp(poses[side][:, 1:7], axis=0),
+            atol=0.01,
+        )
+
+
+def test_trim_idle_keeps_the_namaste_hold():
+    from bbapps.greeter.gesture_safety import trajectory_arrays, trim_idle
+
+    times, poses = trajectory_arrays(_recording("namaste"))
+    trimmed_times, trimmed = trim_idle(times, poses)
+
+    assert times[-1] - trimmed_times[-1] < 0.2
+    assert np.array_equal(trimmed["left"][-1], poses["left"][-1])
+
+
+def test_ease_seconds_scales_with_distance_within_bounds():
+    from bbapps.greeter.gesture_safety import MAX_EASE_SECONDS, MIN_EASE_SECONDS, ease_seconds
+
+    start = {"left": np.zeros(8, dtype=np.float32)}
+    assert ease_seconds(start, {"left": np.full(8, 0.02)}) == MIN_EASE_SECONDS
+    assert ease_seconds(start, {"left": np.full(8, 0.2)}) == pytest.approx(1.0)
+    assert ease_seconds(start, {"left": np.full(8, 0.9)}) == MAX_EASE_SECONDS
+
+
+def test_contact_gestures_keep_the_slow_playback_speed():
+    from bbapps.greeter.gesture_safety import playback_speed
+
+    for name in ("handshake", "fist bump", "hug", "dance"):
+        assert playback_speed(name) == 0.6
+    assert playback_speed("wave") == playback_speed("goodbye") == 0.75

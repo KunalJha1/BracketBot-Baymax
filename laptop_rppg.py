@@ -6,7 +6,7 @@ on the robot's head camera, so what you tune here is what the robot measures.
 
 NOT a medical device: a demo-grade estimate from a camera. See docs/rppg-robot-port.md.
 
-Uses the model at assets/models/face_landmarker.task, downloading it if absent.
+Uses the YuNet model at assets/models/face_detection_yunet_2026may.onnx.
 
 Setup:
   uv run --extra rppg python laptop_rppg.py                  # live, camera 0
@@ -27,19 +27,15 @@ The 'r' recording holds someone's pulse trace: treat the CSV as personal data (g
 """
 import argparse
 import csv
-import os
+from pathlib import Path
 import sys
 import time
-import urllib.request
 from collections import deque
 
 import cv2
 import numpy as np
 
 from rppg import analyze, FaceROI, DEFAULT_MODEL, HR_LO_HZ, HR_HI_HZ
-
-MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/face_landmarker/"
-             "face_landmarker/float16/1/face_landmarker.task")
 
 PANEL_W = 440
 COL = {"g": (80, 220, 80), "c": (230, 200, 60), "y": (60, 220, 240), "r": (70, 70, 240),
@@ -51,9 +47,11 @@ COL = {"g": (80, 220, 80), "c": (230, 200, 60), "y": (60, 220, 240), "r": (70, 7
 # ----------------------------------------------------------------------------
 
 def ensure_model(path):
-    if not os.path.exists(path):
-        print(f"Downloading FaceLandmarker model -> {path}")
-        urllib.request.urlretrieve(MODEL_URL, path)
+    if not Path(path).is_file():
+        sys.exit(
+            f"YuNet face model not found at {path}; restore "
+            "assets/models/face_detection_yunet_2026may.onnx"
+        )
 
 
 def open_webcam(index, w, h, fps):

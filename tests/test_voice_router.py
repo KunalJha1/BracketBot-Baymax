@@ -58,6 +58,12 @@ def test_allowlisted_phrases_match_actions():
     assert match_action("Baymax fist bump me") == "fist bump"
     assert match_action("Could you please shake my hand?") == "handshake"
     assert match_action("Wave for me") == "wave"
+    assert match_action("Hey BracketBot, look at me") == "look-at-me"
+    assert match_action("Baymax, I'm over here") == "look-at-me"
+    assert match_action("Look at this picture") is None
+    assert match_action("Hey Baymax, follow me") == "follow-me"
+    assert match_action("Could you follow me?") == "follow-me"
+    assert match_action("Follow the recipe for me") is None
     assert match_action("Baymax, give me a salute") == "salute"
     assert match_action("Baymax point at a person") == "point"
     assert match_action("point at the person on the left") == "point-left"
@@ -1283,3 +1289,14 @@ def test_the_robot_launcher_ships_the_seed_beside_the_greeter_modules():
     assert SEED_FILENAME in launcher, (
         "the seed must be copied to the robot or the cache starts empty"
     )
+
+
+def test_a_whole_sentence_command_survives_stray_transcribed_words():
+    from bbapps.greeter.voice_router import match_explicit_gesture_request
+
+    assert match_explicit_gesture_request("Faster. Fist bump.") == "fist bump"
+    assert match_explicit_gesture_request("No. Fist bump. Breathe.") == "fist bump"
+    # Negation, discussion, and two gestures at once still never move the arm.
+    assert match_explicit_gesture_request("Don't. Fist bump.") is None
+    assert match_explicit_gesture_request("I saw a fist bump yesterday") is None
+    assert match_explicit_gesture_request("Fist bump. Wave.") is None

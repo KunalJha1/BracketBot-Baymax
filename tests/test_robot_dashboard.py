@@ -12,6 +12,7 @@ from scripts import robot_dashboard
 from scripts.robot_dashboard import (
     ACTION_LIST,
     ACTIONS,
+    CAMERA_GEOMETRY_MODULE,
     CAMERA_POINT_RUNNER,
     DEFAULT_SSH_HOSTS,
     DEMO_CUES,
@@ -622,6 +623,7 @@ def test_action_bundle_contains_each_runner_and_asset_once():
     assert EFFECT_RUNNER in bundle
     assert GREETER_ACTION_RUNNER in bundle
     assert CAMERA_POINT_RUNNER in bundle
+    assert CAMERA_GEOMETRY_MODULE in bundle  # imported by the pointing runner
     assert TABLE_REST_RUNNER in bundle
     assert len(bundle) == len(set(bundle))
     assert all(path.is_file() for path in bundle)
@@ -654,7 +656,7 @@ def test_camera_point_dispatches_to_robot_local_greeter(monkeypatch):
 
     controller._execute_camera_gesture("bot", ACTIONS["point-person"])
 
-    assert deployed == [GREETER_ACTION_RUNNER, CAMERA_POINT_RUNNER]
+    assert deployed == [GREETER_ACTION_RUNNER, CAMERA_POINT_RUNNER, CAMERA_GEOMETRY_MODULE]
     assert commands[0][0] == "bot"
     assert REMOTE_GREETER_ACTION_RUNNER in commands[0][1]
     assert "point --pid-file /tmp/test-point.pid" in commands[0][1]

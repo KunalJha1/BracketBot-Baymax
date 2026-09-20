@@ -44,8 +44,13 @@ EFFECT_RUNNER = ROOT / "scripts" / "robot_effect.py"
 BASE_RUNNER = ROOT / "scripts" / "robot_base_mode.py"
 GREETER_ACTION_RUNNER = ROOT / "scripts" / "greeter_action.py"
 CAMERA_POINT_RUNNER = ROOT / "scripts" / "camera_point_motion.py"
+# camera_point_motion.py imports this from its own directory on the robot.
+CAMERA_GEOMETRY_MODULE = ROOT / "scripts" / "camera_geometry.py"
 TABLE_REST_RUNNER = ROOT / "scripts" / "table_rest.py"
 REMOTE_RUNNER = "/tmp/gesture_test.py"
+# Free-space gestures play faster; contact gestures and the dance stay at 0.6.
+# Keep in step with PLAYBACK_SPEEDS in bbapps/greeter/gesture_safety.py.
+GESTURE_SPEEDS = {"wave": 0.75, "salute": 0.75, "namaste": 0.75}
 REMOTE_EFFECT_RUNNER = "/tmp/robot_effect.py"
 REMOTE_BASE_RUNNER = "/tmp/robot_base_mode.py"
 REMOTE_GREETER_ACTION_RUNNER = "/tmp/greeter_action.py"
@@ -267,7 +272,7 @@ ACTION_LIST = (
             channels=("right-arm",), key="2", resource="handshake.json", risk="contact-motion"),
     _action("fist-bump", "Fist bump", "Offer a right-handed fist bump", "Gestures", "gesture",
             channels=("right-arm",), key="3", resource="fist bump.json", risk="contact-motion"),
-    _action("hug", "Hug", "Open both arms for a hug", "Gestures", "gesture",
+    _action("hug", "Hug", "Reach both arms forward and wrap them in for a hug", "Gestures", "gesture",
             channels=("left-arm", "right-arm"), key="4", resource="hug.json", risk="contact-motion"),
     _action("namaste", "Namaste", "Bring both hands together at chest height", "Gestures", "gesture",
             channels=("left-arm", "right-arm"), key="n", resource="namaste.json", risk="motion"),
@@ -388,6 +393,7 @@ def action_bundle_paths():
         BASE_RUNNER,
         GREETER_ACTION_RUNNER,
         CAMERA_POINT_RUNNER,
+        CAMERA_GEOMETRY_MODULE,
         TABLE_REST_RUNNER,
         FOLLOW_RUNNER,
         *FOLLOW_MODULES,
@@ -1389,7 +1395,7 @@ class RobotController:
             REMOTE_RUNNER,
             "/tmp/" + info.resource,
             "--name", info.label,
-            "--speed", "0.6",
+            "--speed", str(GESTURE_SPEEDS.get(info.id, 0.6)),
             "--execute",
             "--pid-file", pid_file,
         )
@@ -1411,7 +1417,7 @@ class RobotController:
 
     def _execute_camera_gesture(self, host, info):
         self.state.add_log(f"Connecting to the robot camera through {host}")
-        self._deploy(host, GREETER_ACTION_RUNNER, CAMERA_POINT_RUNNER)
+        self._deploy(host, GREETER_ACTION_RUNNER, CAMERA_POINT_RUNNER, CAMERA_GEOMETRY_MODULE)
         with self.state.lock:
             if self.state.cancel_requested:
                 return
