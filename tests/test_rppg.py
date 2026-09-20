@@ -146,12 +146,12 @@ def test_yunet_detection_uses_bounded_preview_but_full_resolution_mask(monkeypat
 
     result = roi(frame, 0)
 
-    assert detector.input_size == (640, 480)
-    assert detector.detected_shape == (480, 640, 3)
+    assert detector.input_size == (560, 420)
+    assert detector.detected_shape == (420, 560, 3)
     assert result is not None
     _rgb, nose, face_width, mask = result
-    assert face_width == pytest.approx(200)
-    assert nose.tolist() == pytest.approx([120, 160])
+    assert face_width == pytest.approx(100 * 1280 / 560)
+    assert nose.tolist() == pytest.approx([60 * 1280 / 560, 80 * 960 / 420])
     assert mask.shape == (960, 1280)
 
 

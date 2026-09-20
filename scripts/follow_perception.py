@@ -67,6 +67,48 @@ def without_self(points_local, boxes):
     return p[outside_self_mask(p, boxes)]
 
 
+def floor_line(points_local, *, max_forward=1.8, half_width=1.0, max_z=0.35, max_slope=0.3):
+    """Fit the visible floor as z = slope * forward + offset, or None if too little floor shows.
+
+    camera.points assumes a fixed camera pitch, but the mount is a few degrees off
+    and a balancing base leans as it accelerates, so the floor arrives as a ramp
+    (measured: 0.13 m per metre). Uncorrected it survives the floor cut, joins
+    every cluster into one room-sized blob, and fills the obstacle corridor.
+    """
+    p = np.asarray(points_local, dtype=np.float64).reshape(-1, 3)
+    low = p[(p[:, 0] <= max_forward) & (np.abs(p[:, 1]) <= half_width) & (p[:, 2] <= max_z)]
+    if len(low) < 200:
+        return None
+    # Low percentile per forward bin: feet and low clutter sit above the floor, never below.
+    edges = np.arange(0.0, max_forward + 0.2, 0.2)
+    which = np.digitize(low[:, 0], edges)
+    centres, heights = [], []
+    for k in np.unique(which):
+        sel = low[which == k]
+        if len(sel) >= 40:
+            centres.append(np.median(sel[:, 0]))
+            heights.append(np.percentile(sel[:, 2], 30))
+    if len(centres) < 3:
+        return None
+    slope, offset = np.polyfit(centres, heights, 1)
+    near = low[np.abs(low[:, 2] - (slope * low[:, 0] + offset)) <= 0.05]
+    if len(near) >= 200:
+        slope, offset = np.polyfit(near[:, 0], near[:, 2], 1)
+    if abs(slope) > max_slope:
+        return None
+    return float(slope), float(offset)
+
+
+def level_floor(points_local, line):
+    """Shear the cloud so the fitted floor sits at z = 0. ``line`` None leaves it alone."""
+    p = np.asarray(points_local, dtype=np.float64).reshape(-1, 3)
+    if line is None:
+        return p
+    out = p.copy()
+    out[:, 2] -= line[0] * out[:, 0] + line[1]
+    return out
+
+
 def clothing_histogram(colors):
     """Coarse chromaticity/brightness cue, not a person ID or a learned ReID model.
 

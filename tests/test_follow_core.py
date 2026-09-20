@@ -289,8 +289,19 @@ def test_corridor_blocks_at_once_and_clears_with_hysteresis():
     assert guard.update(0.61, 0) is False
 
 
-def test_odometry_check_needs_a_sustained_opposite_sign():
+def test_odometry_check_ignores_a_balancing_lean_but_trips_on_real_opposite_travel():
     check = OdometryCheck(CFG)
+    # Logged on the robot: wheels roll back ~0.08 m to lean into a forward start.
+    for i in range(9):
+        assert check.update(i * 0.05, 0.15, 0.0, -0.2, 0.0) is False
+    assert check.update(0.45, 0.15, 0.0, 0.05, 0.0) is False
+    # A real sign bug keeps going the wrong way.
+    tripped = [check.update(0.5 + i * 0.05, 0.15, 0.0, -0.15, 0.0) for i in range(30)]
+    assert tripped[5] is False and tripped[-1] is True
+
+
+def test_odometry_check_needs_a_sustained_opposite_sign():
+    check = OdometryCheck(dataclasses.replace(CFG, odom_mismatch_travel=0.0, odom_mismatch_turn=0.0))
     assert check.update(0.0, 0.2, 0.0, -0.1, 0.0) is False
     assert check.update(0.3, 0.2, 0.0, -0.1, 0.0) is False
     assert check.update(0.6, 0.2, 0.0, -0.1, 0.0) is True
@@ -374,6 +385,20 @@ def test_loop_locks_on_then_follows():
         out = loop.tick(tick_inputs(t, perception=frame))
     assert out.state == FOLLOWING
     assert out.v > 0.0
+
+
+@pytest.mark.parametrize("odom_check, exits", [(True, True), (False, False)])
+def test_wheels_opposing_the_command_only_end_the_run_when_the_check_is_on(odom_check, exits):
+    loop = FollowLoop(dataclasses.replace(FAST, odom_check=odom_check))
+    out = None
+    for i in range(300):
+        t = i * 0.02
+        frame = Perception(t, (person(1.6),), np.empty((0, 3))) if i % 3 == 0 else None
+        out = loop.tick(tick_inputs(t, perception=frame, measured_v=-0.2))
+        if out.exit:
+            break
+    assert out.exit is exits
+    assert (out.rule == "odometry-mismatch") is exits
 
 
 def test_loop_exits_on_heartbeat_loss():

@@ -651,7 +651,7 @@ def test_follow_me_is_refused_when_the_runner_is_not_installed(tmp_path):
 
 FAKE_RUNNER = '''
 import json, sys
-assert sys.argv[1:] == ["--v-max", "0.15", "--ignore-writer", "person_tracker.py", "--no-led", "--relock"], sys.argv
+assert sys.argv[1:] == ["--v-max", "0.3", "--ignore-writer", "person_tracker.py", "--no-led", "--relock", "--no-odom-check", "--human-gate"], sys.argv
 print("[follow] state FOLLOWING", flush=True)
 print("FOLLOW_STATUS {}", flush=True)
 beats = 0

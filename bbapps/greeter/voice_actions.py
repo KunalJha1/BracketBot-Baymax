@@ -246,7 +246,7 @@ class FollowRunner:
     sending heartbeats, so a crashed or killed assistant cannot leave it driving.
     """
 
-    def __init__(self, script: Path, *, python_bin: str | Path | None = None, v_max: float = 0.15):
+    def __init__(self, script: Path, *, python_bin: str | Path | None = None, v_max: float = 0.30):
         self.script = Path(script)
         self.python_bin = str(python_bin or Path.home() / "bbos" / ".venv" / "bin" / "python")
         self.v_max = v_max
@@ -264,6 +264,8 @@ class FollowRunner:
                 "--ignore-writer", "person_tracker.py",
                 "--no-led",                # the assistant holds BBOS's only led.ctrl writer
                 "--relock",                # keep following until told to stop
+                "--no-odom-check",         # false-alarms whenever this balancing base turns
+                "--human-gate",            # lock onto people the vision app's YOLO sees, not shapes
             ],
             cwd=self.script.parent,
             stdin=subprocess.PIPE,

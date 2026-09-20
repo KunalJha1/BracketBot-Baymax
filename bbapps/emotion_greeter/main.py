@@ -36,6 +36,7 @@ from ground_safety import (
     GroundAssessment,
     Keypoint,
     assess_ground_pose,
+    box_position_in_base_frame,
     keypoints_in_base_frame,
 )
 
@@ -1382,8 +1383,16 @@ def run(args: argparse.Namespace) -> int:
                 )
                 tracked = tracker.update(detections)
                 ground_assessments: dict[int, GroundAssessment] = {}
+                box_positions: dict[int, tuple[float, float, float] | None] = {}
                 if depth_aligned and point_indices is not None and depth_points is not None:
                     for item in tracked:
+                        box = item.detection
+                        box_positions[item.track_id] = box_position_in_base_frame(
+                            (box.x1, box.y1, box.x2, box.y2),
+                            point_indices,
+                            depth_points,
+                            frame.shape[1],
+                        )
                         pose_3d = keypoints_in_base_frame(
                             item.detection.keypoints,
                             point_indices,
@@ -1454,6 +1463,9 @@ def run(args: argparse.Namespace) -> int:
                             "body_extent_m": assessment.body_extent_m,
                             "body_radius_m": assessment.body_radius_m,
                             "base_position": assessment.base_position,
+                            # From the box, so it survives a turned back; the follow
+                            # runner's human gate reads this first.
+                            "box_position": box_positions.get(item.track_id),
                             "map_position": assessment.map_position,
                         }
                     )

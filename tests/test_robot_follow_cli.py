@@ -163,3 +163,43 @@ def test_ground_runner_holds_zero_while_speaking_and_stops_on_signal(tmp_path, m
     assert writes[-1] == (0, 0)
     if not arrive:
         assert any(v > 0 for v, _ in writes)
+
+
+class OneFrame:
+    def __init__(self):
+        self.data, self.left = "frame", 1
+
+    def ready(self):
+        self.left -= 1
+        return self.left >= 0
+
+
+def wait_for(worker):
+    import time
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        try:
+            latest = worker.take()
+        except Exception as exc:
+            return exc
+        if latest is not None:
+            return latest
+        time.sleep(0.005)
+    raise AssertionError("worker produced nothing")
+
+
+def test_perception_worker_hands_over_each_frame_once():
+    with robot_follow.PerceptionWorker(OneFrame(), lambda data, t: (data.upper(), "[]")) as worker:
+        perception, ms, candidates = wait_for(worker)
+        assert (perception, candidates) == ("FRAME", "[]") and ms >= 0
+        assert worker.take() is None
+
+
+def test_perception_worker_failure_reaches_the_control_thread():
+    def boom(data, t):
+        raise RuntimeError("non-finite camera.points")
+
+    with robot_follow.PerceptionWorker(OneFrame(), boom) as worker:
+        assert isinstance(wait_for(worker), RuntimeError)
+        with pytest.raises(RuntimeError):
+            worker.take()

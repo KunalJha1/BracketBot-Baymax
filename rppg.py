@@ -210,7 +210,7 @@ def estimate_hr(t, rgb, fs=30.0, method="pos", prev_bpm=None, track_bpm=15.0):
 # ----------------------------------------------------------------------------
 
 FACE_SCORE = 0.75
-FACE_DETECT_MAX_WIDTH = 640
+FACE_DETECT_MAX_WIDTH = 560
 
 
 def face_skin_mask(face, image_shape):

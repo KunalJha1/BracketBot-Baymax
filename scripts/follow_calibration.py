@@ -21,6 +21,9 @@ class Calibration:
     wheel_order: tuple = (0, 1)
     wheel_signs: tuple = (1.0, 1.0)
     motion_speed_limit: float = 0.15
+    # follow_core's omega is CCW-positive. -1 when this base turns right on a positive
+    # drive.ctrl omega; wheel_order must then stay the daemon's [left, right].
+    omega_sign: float = 1.0
 
 
 def number(value):
@@ -63,7 +66,10 @@ def load_calibration(path, *, required=True, hostname=None):
         limit = number(data["motion_speed_limit"])
         if not 0 < limit <= 0.30:
             raise ValueError("motion_speed_limit must be above 0 and at most 0.30 m/s")
-        return Calibration(sign, tuple(boxes), order, signs, limit)
+        omega_sign = number(data.get("omega_sign", 1.0))
+        if omega_sign not in (-1.0, 1.0):
+            raise ValueError("omega_sign must be -1 or 1")
+        return Calibration(sign, tuple(boxes), order, signs, limit, omega_sign)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise RuntimeError(
             f"follow calibration unavailable or invalid: {path}: {exc}. "

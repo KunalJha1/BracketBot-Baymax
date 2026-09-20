@@ -19,6 +19,7 @@ from contextlib import ExitStack
 import csv
 from dataclasses import replace
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -35,7 +36,9 @@ from follow_core import (
     parse_command, start_refusal, status_line, wheel_twist,
 )
 from follow_calibration import Calibration, DEFAULT_PATH, load_calibration
-from follow_perception import ClusterConfig, base_to_local, find_people, outside_self_mask, without_self
+from follow_perception import (
+    ClusterConfig, base_to_local, find_people, floor_line, level_floor, outside_self_mask, without_self,
+)
 from ground_approach import GroundApproachLoop, GROUND_LINE, approach_config, target_from_payload
 
 PERIOD = 0.02  # 50 Hz control loop; drive.ctrl times out after 0.1 s
@@ -83,6 +86,12 @@ def build_parser():
     parser.add_argument("--ignore-writer", action="append", default=[], metavar="PATTERN",
                         help="a DRIVE_WRITER_PATTERNS entry the caller guarantees is idle (the voice "
                              "assistant passes person_tracker.py, which it keeps from turning meanwhile)")
+    parser.add_argument("--no-odom-check", action="store_true",
+                        help="do not exit on wheel feedback opposing the command (false alarms while "
+                             "a balancing base turns); stop, heartbeat and tilt exits remain")
+    parser.add_argument("--human-gate", action="store_true",
+                        help="lock only onto shapes the vision app's YOLO confirms are people "
+                             "(read from --ground-alert-file)")
     parser.add_argument("--relock", action="store_true",
                         help="after a long loss, search again and follow whoever stands in the "
                              "lock-on zone instead of waiting for a restart")
@@ -107,8 +116,15 @@ def parse_args(argv=None):
 def loop_config(args):
     if args.ground_approach:
         return approach_config(0.0 if args.rotate_only else args.v_max)
-    return replace(FollowConfig(), v_max=0.0 if args.rotate_only else args.v_max,
-                   relock_after_loss=args.relock)
+    cfg = replace(FollowConfig(), v_max=0.0 if args.rotate_only else args.v_max,
+                  relock_after_loss=args.relock, odom_check=not args.no_odom_check)
+    if args.relock:
+        # "Follow whoever is in front until told to stop": after a short loss, lock again
+        # (0.5 s) instead of spending 10 s re-confirming clothing colour. Logged on the
+        # robot: 5.5 s stuck "confirming" a person standing 1 m away. And 30-90 stray
+        # points held it BLOCKED; a chair leg at 0.5 m returns several hundred.
+        cfg = replace(cfg, lost_timeout=1.5, corridor_min_points=150)
+    return cfg
 
 
 def read_ground_target(path, wall_now, calibration):
@@ -117,6 +133,75 @@ def read_ground_target(path, wall_now, calibration):
     except (OSError, ValueError):
         return None
     return target_from_payload(payload, wall_now, calibration.left_sign)
+
+
+def people_from_payload(payload, wall_now, left_sign, max_age=1.0):
+    """The vision app's YOLO people as robot-local (forward, left), or None if not trustworthy now."""
+    try:
+        if payload["schema_version"] != 1 or payload["depth_aligned"] is not True:
+            return None
+        ages = (wall_now - payload["camera_timestamp_ns"] / 1e9, wall_now - payload["published_at"])
+        if not all(np.isfinite(age) and 0 <= age <= max_age for age in ages):
+            return None
+        humans = []
+        for obs in payload["observations"]:
+            # box_position works from any side; base_position needs a visible torso pose.
+            position = obs.get("box_position") or obs.get("base_position")
+            if position is None:
+                continue  # seen in the image, but no depth on them
+            right, forward = float(position[0]), float(position[1])
+            if np.isfinite([right, forward]).all():
+                humans.append((forward, right * left_sign))
+        return tuple(humans)
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError, OverflowError):
+        return None
+
+
+class HumanGate:
+    """Feeds lock-on the people YOLO currently sees, so it never locks a plant or a pillar.
+
+    Reuses the always-on vision app's detections: a second YOLO would cost ~0.2 s a
+    frame on an already saturated CPU. If that app goes quiet the gate opens after
+    ``patience`` seconds, so follow degrades to shape-only lock instead of never starting.
+    """
+
+    def __init__(self, path, left_sign, patience=3.0):
+        self.path, self.left_sign, self.patience = path, left_sign, patience
+        self._last_ok = None
+        self._open = False
+        self._explained = -math.inf
+
+    def humans(self, wall_now):
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = None
+        humans = None if payload is None else people_from_payload(payload, wall_now, self.left_sign)
+        if self._last_ok is None:
+            self._last_ok = wall_now       # patience counts from the first look
+        if humans is not None:
+            if self._open:
+                print("[follow] human gate back; locking only onto detected people", flush=True)
+            self._last_ok, self._open = wall_now, False
+            return humans
+        if wall_now - self._last_ok > self.patience:
+            if not self._open:
+                print("[follow] human gate unavailable; shape-only lock", flush=True)
+            self._open = True
+            return None
+        return ()
+
+    def explain(self, t, perception, gate_dist, every=2.0):
+        """Say why nothing is lockable, so one test run shows a shape/detector disagreement."""
+        if perception.humans is None or not perception.people or t - self._explained < every:
+            return
+        if any(math.hypot(o.forward - f, o.left - l) <= gate_dist
+               for o in perception.people for f, l in perception.humans):
+            return
+        self._explained = t
+        shapes = [(round(o.forward, 2), round(o.left, 2)) for o in perception.people]
+        seen = [(round(f, 2), round(l, 2)) for f, l in perception.humans]
+        print(f"[follow] gate: shapes at {shapes} but YOLO people at {seen}", flush=True)
 
 
 def check_ground_service(path):
@@ -160,6 +245,7 @@ def perceive(points_base, t, cluster_cfg=ClusterConfig(), calibration=None, colo
     """One camera.points frame -> Perception with every person-sized cluster."""
     calibration = calibration or Calibration()
     local = base_to_local(points_base, calibration.left_sign)
+    local = level_floor(local, floor_line(local))
     keep = outside_self_mask(local, calibration.self_mask)
     if colors is not None:
         colors = np.asarray(colors)
@@ -223,6 +309,57 @@ def start_command_reader(commands):
     threading.Thread(target=read, name="follow-stdin", daemon=True).start()
 
 
+class PerceptionWorker:
+    """Clusters camera.points off the control thread.
+
+    Inline it took ~50 ms a frame, so the loop ticked at ~11 Hz with gaps beyond the
+    base's 0.1 s drive.ctrl timeout: the base kept zeroing the twist mid-follow.
+    """
+
+    def __init__(self, points, process):
+        self.points, self.process = points, process
+        self._lock = threading.Lock()
+        self._latest = self._error = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="follow-perception", daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def step(self):
+        """Process one frame if there is one; False when there was nothing to read."""
+        if not self.points.ready():
+            return False
+        started = time.monotonic()
+        perception, candidates = self.process(self.points.data, started)
+        result = (perception, (time.monotonic() - started) * 1000.0, candidates)
+        with self._lock:
+            self._latest = result
+        return True
+
+    def _run(self):
+        try:
+            while not self._stop.is_set():
+                if not self.step():
+                    self._stop.wait(0.002)
+        except Exception as exc:  # surfaced on the control thread, which stops the robot
+            self._error = exc
+
+    def take(self):
+        """Newest unread ``(perception, ms, candidates)``, or None. Re-raises a worker failure."""
+        if self._error is not None:
+            raise self._error
+        with self._lock:
+            latest, self._latest = self._latest, None
+        return latest
+
+
 def write_twist(writer, v, omega):
     with writer.buf() as frame:
         frame["twist"] = np.array([v, omega], dtype=np.float32)
@@ -252,6 +389,7 @@ def run_check(reader_cls, seconds=3.0, calibration=None):
                 data = points.data
                 xyz = cloud(data)
                 local = base_to_local(xyz, cal.left_sign)
+                local = level_floor(local, floor_line(local))   # same view the follow loop gets
                 keep = outside_self_mask(local, cal.self_mask)
                 colors = point_colors(data, len(xyz))
                 people = find_people(local[keep], colors=None if colors is None else colors[keep])
@@ -282,8 +420,24 @@ def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width, calibr
     last_flush = now
     candidates = "[]"
     state, state_since = None, now
+
+    gate = HumanGate(args.ground_alert_file, calibration.left_sign) if args.human_gate else None
+
+    def process(data, t):
+        if args.ground_approach:
+            return ground_perception(data, t, time.time(), calibration), None
+        xyz = cloud(data)
+        perception = perceive(xyz, t, calibration=calibration, colors=point_colors(data, len(xyz)))
+        if gate is not None:
+            perception = replace(perception, humans=gate.humans(time.time()))
+            gate.explain(t, perception, cfg.human_gate_dist)
+        return perception, json.dumps([
+            {"forward": round(p.forward, 3), "left": round(p.left, 3), "appearance": p.hist is not None}
+            for p in perception.people
+        ], separators=(",", ":"))
+
     log_path = args.log_dir / f"baymax_follow_{time.strftime('%Y%m%d_%H%M%S')}.csv"
-    with log_path.open("w", newline="") as log_file:
+    with log_path.open("w", newline="") as log_file, PerceptionWorker(points, process) as worker:
         log = csv.DictWriter(log_file, fieldnames=CSV_FIELDS)
         log.writeheader()
         print(f"[follow] logging to {log_path}", flush=True)
@@ -316,19 +470,11 @@ def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width, calibr
             if t - last_imu > STATE_TIMEOUT or t - last_drive > STATE_TIMEOUT:
                 raise RuntimeError("stale imu.orientation or drive.state; stopping follow")
             perception = perception_ms = None
-            if points.ready():
-                perception_started = time.monotonic()
-                if args.ground_approach:
-                    perception = ground_perception(points.data, t, time.time(), calibration)
-                else:
-                    data = points.data
-                    xyz = cloud(data)
-                    perception = perceive(xyz, t, calibration=calibration, colors=point_colors(data, len(xyz)))
-                    candidates = json.dumps([
-                        {"forward": round(p.forward, 3), "left": round(p.left, 3), "appearance": p.hist is not None}
-                        for p in perception.people
-                    ], separators=(",", ":"))
-                perception_ms = (time.monotonic() - perception_started) * 1000.0
+            latest = worker.take()
+            if latest is not None:
+                perception, perception_ms, frame_candidates = latest
+                if frame_candidates is not None:
+                    candidates = frame_candidates
 
             # Include perception work in freshness and heartbeat checks.
             t = time.monotonic()
@@ -348,7 +494,8 @@ def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width, calibr
             else:
                 out = loop.tick(inputs)
             if drive is not None:
-                write_twist(drive, *clamped_twist(out, cfg))
+                v, omega = clamped_twist(out, cfg)
+                write_twist(drive, v, calibration.omega_sign * omega)
             if out.state != state:
                 print(f"[follow] state {out.state}", flush=True)
                 state, state_since = out.state, t
@@ -470,6 +617,8 @@ def run(args):
             print(f"[follow] follow active (ground approach, {mode}, 1.0 m body standoff)", flush=True)
         else:
             print(f"[follow] follow active ({mode}, gap {args.gap:.2f} m) - stand in front of the robot", flush=True)
+            if not cfg.odom_check:
+                print("[follow] odometry check off", flush=True)
         try:
             control_loop(args, cfg, (points, imu, drive_state), drive, led, wheel_diam, robot_width, calibration, speech)
         finally:

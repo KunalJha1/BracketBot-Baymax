@@ -152,6 +152,17 @@ def robot(tmp_path, monkeypatch):
         Config=configs.__getitem__, Reader=Reader, Writer=Writer, Type=lambda name: name))
     monkeypatch.setattr(robot_follow, "time", SimpleNamespace(
         monotonic=lambda: state.t, sleep=sleep, strftime=lambda _: "test"))
+    class InlineWorker(robot_follow.PerceptionWorker):
+        """Fake time is single-threaded: process each frame on the control thread."""
+
+        def __enter__(self):
+            return self
+
+        def take(self):
+            self.step()
+            return super().take()
+
+    monkeypatch.setattr(robot_follow, "PerceptionWorker", InlineWorker)
     monkeypatch.setattr(robot_follow, "other_drive_writers", lambda ignore=(): [])
     monkeypatch.setattr(robot_follow, "start_command_reader", lambda _: None)
     monkeypatch.setattr(robot_follow, "STOP_REQUESTED", False)
@@ -215,3 +226,14 @@ def test_speed_above_robot_profile_is_refused_before_writers(robot):
     with pytest.raises(RuntimeError, match="calibrated limit"):
         robot.run("--v-max", "0.3")
     assert robot.opened == []
+
+
+def test_omega_sign_defaults_to_one_and_accepts_only_a_sign(tmp_path):
+    path = tmp_path / "follow.json"
+    path.write_text(json.dumps(profile()))
+    assert load_calibration(path).omega_sign == 1.0
+    path.write_text(json.dumps(profile() | {"omega_sign": -1}))
+    assert load_calibration(path).omega_sign == -1.0
+    path.write_text(json.dumps(profile() | {"omega_sign": 0.5}))
+    with pytest.raises(RuntimeError):
+        load_calibration(path)

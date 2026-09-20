@@ -70,11 +70,19 @@ class FollowConfig:
     relock_after_loss: bool = False
     upright_deg: float = 25.0
     odom_mismatch_time: float = 0.5
+    # A balancing base rolls its wheels backwards to lean into a forward start and
+    # again to brake (logged: -0.2 m/s for 0.4 s, ~0.08 m). Only opposite travel
+    # beyond that is a sign bug. 0 trips on time alone.
+    odom_mismatch_travel: float = 0.15  # m
+    # Off for voice follow: on this balancing base the wheel-measured v goes negative in
+    # every hard turn, either direction, even at v = 0, so the check ends healthy runs.
+    odom_check: bool = True
+    odom_mismatch_turn: float = 0.3  # rad
     # Obstacle corridor (robot-local metres)
     robot_width: float = 0.3275
     corridor_margin: float = 0.10
     corridor_length: float = 0.60
-    corridor_z_min: float = 0.05
+    corridor_z_min: float = 0.10  # the levelled floor still scatters to ~0.03 m
     corridor_z_max: float = 1.70
     corridor_min_points: int = 30
     corridor_clear_time: float = 0.5
@@ -90,6 +98,7 @@ class FollowConfig:
     lock_assoc_dist: float = 0.3
     lock_min_frames: int = 4
     lock_frame_gap: float = 0.25
+    human_gate_dist: float = 0.5  # a shape this close to a detected human is that human (m)
     # Tracking
     gate_sigma: float = 3.0
     hist_max_distance: float = 0.4
@@ -159,6 +168,9 @@ class Perception:
     t: float
     people: tuple[PersonObservation, ...]
     points: np.ndarray  # (N, 3) forward, left, up
+    # (forward, left) of people a detector confirmed this moment. None: no detector,
+    # lock onto any person-sized shape. (): detector sees nobody, lock onto nothing.
+    humans: tuple[tuple[float, float], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -542,20 +554,29 @@ class OdometryCheck:
                  omega_sent_min=0.2, omega_measured_min=0.1):
         self.cfg = cfg
         self._since = None
+        self._last_t = None
+        self._travel = self._turn = 0.0
         self.v_sent_min, self.v_measured_min = v_sent_min, v_measured_min
         self.omega_sent_min, self.omega_measured_min = omega_sent_min, omega_measured_min
 
     def update(self, t, v_sent, omega_sent, v_meas, omega_meas):
-        wrong = (
-            (abs(v_sent) >= self.v_sent_min and abs(v_meas) >= self.v_measured_min and v_meas * v_sent < 0)
-            or (abs(omega_sent) >= self.omega_sent_min and abs(omega_meas) >= self.omega_measured_min and omega_meas * omega_sent < 0)
-        )
-        if not wrong:
+        wrong_v = abs(v_sent) >= self.v_sent_min and abs(v_meas) >= self.v_measured_min and v_meas * v_sent < 0
+        wrong_omega = (abs(omega_sent) >= self.omega_sent_min and abs(omega_meas) >= self.omega_measured_min
+                       and omega_meas * omega_sent < 0)
+        dt = 0.0 if self._last_t is None else max(0.0, t - self._last_t)
+        self._last_t = t
+        if not (wrong_v or wrong_omega):
             self._since = None
+            self._travel = self._turn = 0.0
             return False
         if self._since is None:
             self._since = t
-        return t - self._since >= self.cfg.odom_mismatch_time
+        self._travel += abs(v_meas) * dt if wrong_v else 0.0
+        self._turn += abs(omega_meas) * dt if wrong_omega else 0.0
+        if t - self._since < self.cfg.odom_mismatch_time:
+            return False
+        return ((wrong_v and self._travel >= self.cfg.odom_mismatch_travel)
+                or (wrong_omega and self._turn >= self.cfg.odom_mismatch_turn))
 
 
 @dataclass(frozen=True)
@@ -665,6 +686,7 @@ class FollowLoop:
         self.limiter = RateLimiter(self.cfg)
         self.odom_check = OdometryCheck(self.cfg)
         self.state = SEARCHING
+        self.confirmed_human = False
         self.lost_since = None
         self.last_t = None
         self.last_points_t = None
@@ -697,7 +719,7 @@ class FollowLoop:
         verdict = supervise(
             cfg, v=v_cmd, omega=omega_cmd,
             stop_requested=inp.stop_requested, heartbeat_age=inp.heartbeat_age,
-            roll_deg=inp.roll_deg, pitch_deg=inp.pitch_deg, odom_mismatch=mismatch,
+            roll_deg=inp.roll_deg, pitch_deg=inp.pitch_deg, odom_mismatch=mismatch and cfg.odom_check,
             tracking=tracking, track_age=track.age if track else None,
             points_age=points_age, blocked=self.corridor.blocked,
             range_m=track.range if track else None,
@@ -724,12 +746,23 @@ class FollowLoop:
             return
         positions = [self.pose.to_odom(o.forward, o.left) for o in frame.people]
         if self.state == SEARCHING:
-            locked = self.lock_on.update(frame.t, frame.people, positions)
+            people = frame.people
+            if frame.humans is not None and not self.confirmed_human:
+                # Only the first lock is gated: a plant or pillar is person-sized too. Re-locks
+                # after a loss are not: logged on the robot, YOLO reports nobody for a person
+                # walking away at 1.5 m (back turned, seen from above), so it would wait forever.
+                keep = [i for i, o in enumerate(people)
+                        if any(math.hypot(o.forward - f, o.left - l) <= self.cfg.human_gate_dist
+                               for f, l in frame.humans)]
+                people = tuple(people[i] for i in keep)
+                positions = [positions[i] for i in keep]
+            locked = self.lock_on.update(frame.t, people, positions)
             if locked is not None:
                 obs, xy = locked
                 self.tracker.start(frame.t, xy, obs.hist)
                 self.lock_on.reset()
                 self.state = FOLLOWING
+                self.confirmed_human = True
         elif self.lost_since is None or frame.t - self.lost_since <= self.cfg.lost_timeout:
             result = self.tracker.update(frame.t, frame.people, positions)
             if result == "updated" and self.state == LOST:

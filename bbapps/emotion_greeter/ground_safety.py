@@ -80,6 +80,51 @@ def _pixel_point_lookup(
     return lookup
 
 
+def box_position_in_base_frame(
+    box: tuple[int, int, int, int],
+    point_indices: np.ndarray,
+    points: np.ndarray,
+    image_width: int,
+    *,
+    min_points: int = 25,
+    body_depth_m: float = 0.4,
+) -> tuple[float, float, float] | None:
+    """Where a detected person stands (right, forward, up), from the depth inside their box.
+
+    Pose joints need a visible torso, so a person who turns their back or is cut
+    off by the frame gets no ``base_position``. The box is there from any side.
+    Only its central part is used, and only the nearest surface in it: the
+    corners and the far side of the box are floor and wall behind the person.
+    """
+
+    x1, y1, x2, y2 = box
+    indices = np.asarray(point_indices, dtype=np.int64).reshape(-1)
+    points = np.asarray(points, dtype=np.float32)
+    count = min(len(indices), len(points))
+    if count == 0 or x2 <= x1 or y2 <= y1:
+        return None
+    indices, points = indices[:count], points[:count]
+    xs, ys = indices % image_width, indices // image_width
+    width, height = x2 - x1, y2 - y1
+    inside = (
+        (indices >= 0)
+        & (xs >= x1 + 0.25 * width) & (xs <= x2 - 0.25 * width)
+        & (ys >= y1 + 0.15 * height) & (ys <= y2 - 0.30 * height)
+        & np.isfinite(points).all(axis=1)
+        & (points[:, 1] > 0.1) & (points[:, 1] < 8.0)
+        & (points[:, 2] > -0.25) & (points[:, 2] < 2.5)
+    )
+    body = points[inside]
+    if len(body) < min_points:
+        return None
+    nearest = np.percentile(body[:, 1], 20)
+    body = body[body[:, 1] <= nearest + body_depth_m]
+    if len(body) < min_points:
+        return None
+    right, forward, up = np.median(body, axis=0)
+    return float(right), float(forward), float(up)
+
+
 def keypoints_in_base_frame(
     keypoints: Iterable[Keypoint],
     point_indices: np.ndarray,

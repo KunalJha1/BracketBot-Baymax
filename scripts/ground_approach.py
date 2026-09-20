@@ -24,6 +24,8 @@ def approach_config(v_max=0.05):
         accel_up=0.04, accel_down=0.2, alpha_max=0.30,
         perception_stale=TARGET_MAX_AGE, corridor_z_min=0.03,
         corridor_length=0.85, corridor_margin=0.20, corridor_min_points=10,
+        # Creep speed: opposite travel never accumulates, so trip on time alone.
+        odom_mismatch_travel=0.0, odom_mismatch_turn=0.0,
     )
 
 

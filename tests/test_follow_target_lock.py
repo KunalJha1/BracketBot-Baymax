@@ -8,7 +8,7 @@ import pytest
 
 from follow_core import FollowConfig, FollowLoop, LockOn, Perception, PersonObservation, Tracker, TickInputs, Pose2D, FOLLOWING, LOST, SEARCHING, hist_distance
 from follow_perception import clothing_histogram, find_people
-from robot_follow import perceive, point_colors
+from robot_follow import HumanGate, people_from_payload, perceive, point_colors
 from test_follow_perception import standing_person
 from test_follow_sim import Scenario, run
 
@@ -108,6 +108,65 @@ def test_relock_after_loss_searches_again_and_follows_whoever_stands_in_front():
     for i in range(160, 180):
         out = tick(loop, i * .1, [obs(hist=BLUE)])
     assert out.state == FOLLOWING
+
+
+def gated_tick(loop, t, people, humans):
+    return loop.tick(TickInputs(t, 0, False, 0, 0, 0, 0,
+                               Perception(t, tuple(people), np.empty((0, 3)), humans=humans)))
+
+
+def test_human_gate_never_locks_a_person_sized_shape_the_detector_does_not_confirm():
+    loop = FollowLoop(CFG)
+    for i in range(30):       # a pillar in the lock zone; YOLO sees a person elsewhere, or nobody
+        out = gated_tick(loop, i * .1, [obs()], humans=((1.2, 1.5),) if i % 2 else ())
+    assert out.state == SEARCHING
+
+
+def test_human_gate_locks_the_shape_standing_where_the_detector_sees_a_person():
+    loop = FollowLoop(CFG)
+    for i in range(11):       # YOLO's depth is a little off and a little old; the pillar is ignored
+        out = gated_tick(loop, i * .1, [obs(), obs(1.4, -.9, BLUE)], humans=((1.35, .1),))
+    assert out.state == FOLLOWING
+    assert abs(out.bearing) < .1
+
+
+def test_human_gate_does_not_block_a_relock_when_the_detector_misses_a_turned_back():
+    loop = FollowLoop(replace(CFG, relock_after_loss=True, lost_timeout=1.5))
+    for i in range(11):
+        out = gated_tick(loop, i * .1, [obs()], humans=((1.2, 0),))
+    assert out.state == FOLLOWING
+    for i in range(11, 45):
+        out = gated_tick(loop, i * .1, [], humans=())
+    assert out.state == SEARCHING
+    for i in range(45, 60):   # walking away: YOLO sees nobody, the shape is still there
+        out = gated_tick(loop, i * .1, [obs(1.5, 0)], humans=())
+    assert out.state == FOLLOWING
+
+
+def test_human_gate_unavailable_falls_back_to_shape_only_lock():
+    loop = FollowLoop(CFG)
+    for i in range(11):
+        out = gated_tick(loop, i * .1, [obs()], humans=None)
+    assert out.state == FOLLOWING
+
+
+def test_people_payload_is_used_only_while_fresh_and_depth_aligned():
+    payload = {"schema_version": 1, "depth_aligned": True, "published_at": 100.0,
+               "camera_timestamp_ns": int(99.7e9),
+               "observations": [{"track_id": 4, "base_position": [-0.3, 1.4, 0.9]},
+                                {"track_id": 5, "base_position": None}]}
+    assert people_from_payload(payload, 100.2, 1.0) == ((1.4, -0.3),)
+    assert people_from_payload(payload, 100.2, -1.0) == ((1.4, 0.3),)
+    assert people_from_payload(payload, 102.0, 1.0) is None
+    assert people_from_payload({**payload, "depth_aligned": False}, 100.2, 1.0) is None
+    assert people_from_payload({**payload, "observations": []}, 100.2, 1.0) == ()
+
+
+def test_human_gate_opens_only_after_the_vision_app_stays_quiet(tmp_path):
+    gate = HumanGate(tmp_path / "missing.json", 1.0, patience=3.0)
+    assert gate.humans(10.0) == ()
+    assert gate.humans(12.9) == ()
+    assert gate.humans(13.1) is None
 
 
 def test_geometry_only_does_not_switch_when_one_person_disappears_after_an_ambiguous_crossing():

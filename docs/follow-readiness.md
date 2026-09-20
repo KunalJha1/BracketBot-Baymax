@@ -84,9 +84,17 @@ deliberately incomplete and must not be treated as measured calibration:
   "self_mask": null,
   "wheel_order": [0, 1],
   "wheel_signs": [1, 1],
-  "motion_speed_limit": 0.15
+  "motion_speed_limit": 0.15,
+  "omega_sign": 1
 }
 ```
+
+`omega_sign` (optional, default `1`) multiplies omega as it is written to
+`drive.ctrl`. If a rotate-only run trips `odometry-mismatch`, or the person's
+bearing grows while the robot "turns toward" them, set it to `-1`. Do not swap
+`wheel_order` to silence the mismatch: `drive.state` is already `[left, right]`,
+and swapping only hides the inverted turn from the odometry, after which a
+standing person appears to race sideways and the tracker coasts to LOST.
 
 Fill `evidence` with the date, calibration observations, and where the probe
 artifacts are stored. `left_sign` is `-1` or `1`. `self_mask` is a list of
