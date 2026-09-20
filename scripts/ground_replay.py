@@ -46,18 +46,27 @@ def main() -> None:
     files = sorted(glob.glob(str(args.recording / "f*.npz")))
     statuses, reasons, tiles, sources = collections.Counter(), collections.Counter(), [], collections.Counter()
     start = None
+    rect_dets, floor_dets, rect_at, floor_at, focus, misses = [], [], 0.0, 0.0, None, 0
     for index, path in enumerate(files):
         data = np.load(path)
         now = float(data["t"])
         start = start if start is not None else now
         frame = cv2.cvtColor(data["rect"], cv2.COLOR_RGB2BGR)
-        detections = detector.detect(frame)
-        sources["rect"] += len(detections)
-        if not args.no_floor_roi and "raw_left" in data.files:
+        # Same one-pass-per-frame schedule as the robot (see main.py).
+        has_raw = not args.no_floor_roi and "raw_left" in data.files
+        if has_raw and (focus == "floor" or (focus is None and index % 3 == 2)):
             crop = cv2.cvtColor(np.ascontiguousarray(floor_crop(data["raw_left"])), cv2.COLOR_RGB2BGR)
-            extra = greeter.detections_from_floor_crop(detector.detect(crop), frame.shape[1], frame.shape[0])
-            sources["floor crop"] += len(extra)
-            detections = greeter.merge_detections(detections, extra)
+            floor_dets = greeter.detections_from_floor_crop(detector.detect(crop), frame.shape[1], frame.shape[0])
+            floor_at = now
+            sources["floor crop passes"] += 1
+        else:
+            rect_dets, rect_at = detector.detect(frame), now
+            sources["rect passes"] += 1
+        if now - rect_at > greeter.VIEW_CARRY_S:
+            rect_dets = []
+        if now - floor_at > greeter.VIEW_CARRY_S:
+            floor_dets = []
+        detections = greeter.merge_detections(rect_dets, floor_dets)
         sources["merged"] += len(detections)
         tracked = tracker.update(detections)
         assessments = {
@@ -65,6 +74,7 @@ def main() -> None:
             for item in tracked
         }
         latched = alerts.update(assessments, now)
+        focus, misses = greeter.next_view_focus(focus, misses, latched, tracked, floor_dets)
         overall = "alert" if "alert" in latched.values() else "checking" if "checking" in latched.values() else "clear"
         statuses[overall] += 1
         for item in tracked:
@@ -84,7 +94,7 @@ def main() -> None:
             tiles.append(frame)
 
     print(f"{len(files)} frames: {dict(statuses)}")
-    print("people per frame:", {key: round(value / max(1, len(files)), 2) for key, value in sources.items()})
+    print("per frame:", {key: round(value / max(1, len(files)), 2) for key, value in sources.items()})
     for (state, reason), count in reasons.most_common(6):
         print(f"  {count:4d}  {state:26s} {reason}")
     if args.sheet and tiles:

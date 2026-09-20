@@ -13,7 +13,9 @@ from floor_roi import (  # noqa: E402
     crop_pixels_to_rect, floor_crop, left_eye, raw_pixels_to_rect,
 )
 from ground_safety import Keypoint  # noqa: E402
-from main import Detection, detections_from_floor_crop, merge_detections  # noqa: E402
+from main import (  # noqa: E402
+    Detection, TrackedDetection, detections_from_floor_crop, merge_detections, next_view_focus,
+)
 
 
 def test_raw_pixels_follow_the_fisheye_model_into_the_rect_image():
@@ -63,3 +65,17 @@ def test_merge_adds_people_only_the_crop_saw_and_keeps_the_fuller_pose():
 
     assert merged == [same_person_full_pose, only_rect, only_crop]
     assert merge_detections([only_rect], [person(302, 3)]) == [only_rect]
+
+
+
+def test_view_focus_follows_whichever_view_sees_the_low_person():
+    near, far = person(100, 8), person(300, 8)
+    tracked = [TrackedDetection(1, near), TrackedDetection(2, far)]
+
+    assert next_view_focus(None, 0, {1: "clear", 2: "clear"}, tracked, [far]) == (None, 0)
+    assert next_view_focus(None, 0, {2: "checking"}, tracked, [far]) == ("floor", 0)
+    assert next_view_focus("floor", 0, {1: "alert"}, tracked, [far]) == ("rect", 0)
+    # Robot drew near: the body left the crop. One miss waits, the second switches view.
+    assert next_view_focus("floor", 0, {2: "alert"}, [], []) == ("floor", 1)
+    assert next_view_focus("floor", 1, {2: "alert"}, [], []) == ("rect", 0)
+    assert next_view_focus("rect", 1, {2: "alert"}, [], []) == ("floor", 0)
