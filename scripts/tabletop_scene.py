@@ -21,6 +21,7 @@ import numpy as np
 
 PLANE_INLIER_METRES = 0.012
 MAX_TABLE_TILT_DEGREES = 20.0
+RANSAC_SCORE_POINTS = 15000
 REGION_X = (0.05, 1.20)
 REGION_Y = 0.80
 REGION_Z = (0.45, 1.15)
@@ -103,6 +104,11 @@ def fit_table_plane(arm_points, iterations=300, seed=0) -> TablePlane:
     if len(candidates) < 200:
         raise RuntimeError(f"too few depth points near table height ({len(candidates)})")
     rng = np.random.default_rng(seed)
+    # Score hypotheses on a subsample: counting inliers over every depth point
+    # 300 times was most of a scan. The refit below still uses all points.
+    scored = candidates
+    if len(candidates) > RANSAC_SCORE_POINTS:
+        scored = candidates[rng.choice(len(candidates), RANSAC_SCORE_POINTS, replace=False)]
     min_nz = math.cos(math.radians(MAX_TABLE_TILT_DEGREES))
     best_count, best = 0, None
     for _ in range(iterations):
@@ -116,7 +122,8 @@ def fit_table_plane(arm_points, iterations=300, seed=0) -> TablePlane:
             normal = -normal
         if normal[2] < min_nz:
             continue
-        count = int(np.count_nonzero(np.abs((candidates - sample[0]) @ normal) < PLANE_INLIER_METRES))
+        count = int(np.count_nonzero(
+            np.abs(scored @ normal - sample[0] @ normal) < PLANE_INLIER_METRES))
         if count > best_count:
             best_count, best = count, (sample[0], normal)
     if best is None:
@@ -140,31 +147,49 @@ def fit_table_plane(arm_points, iterations=300, seed=0) -> TablePlane:
     )
 
 
-def _clusters(cells: np.ndarray, allowed: set) -> list[np.ndarray]:
-    """8-connected components over occupied grid cells, as point-index arrays."""
+_CELL_OFFSET = 1 << 20  # keeps packed cell coordinates non-negative
 
-    members: dict[tuple[int, int], list[int]] = {}
-    for index, cell in enumerate(map(tuple, cells)):
-        if cell in allowed:
-            members.setdefault(cell, []).append(index)
-    seen: set = set()
-    components = []
-    for start in members:
-        if start in seen:
+
+def _cell_keys(cells: np.ndarray) -> np.ndarray:
+    """Pack integer (cx, cy) grid cells into one sortable int64 each."""
+
+    cells = np.asarray(cells, dtype=np.int64)
+    return ((cells[:, 0] + _CELL_OFFSET) << 22) | (cells[:, 1] + _CELL_OFFSET)
+
+
+def _clusters(cells: np.ndarray, allowed_keys: np.ndarray) -> list[np.ndarray]:
+    """8-connected components over occupied grid cells, as point-index arrays.
+
+    Only the flood fill over *distinct* cells runs in Python (a few hundred);
+    everything per-point is vectorised.
+    """
+
+    keys = _cell_keys(cells)
+    kept = np.flatnonzero(np.isin(keys, allowed_keys))
+    if not len(kept):
+        return []
+    unique, inverse = np.unique(keys[kept], return_inverse=True)
+    number = {int(key): index for index, key in enumerate(unique)}
+    steps = [(dx << 22) + dy for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy]
+    label = np.full(len(unique), -1, dtype=np.int64)
+    count = 0
+    for start in range(len(unique)):
+        if label[start] >= 0:
             continue
-        seen.add(start)
-        queue, indices = deque([start]), []
+        label[start] = count
+        queue = deque([start])
         while queue:
-            cell = queue.popleft()
-            indices.extend(members[cell])
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    neighbour = (cell[0] + dx, cell[1] + dy)
-                    if neighbour in members and neighbour not in seen:
-                        seen.add(neighbour)
-                        queue.append(neighbour)
-        components.append(np.asarray(indices))
-    return components
+            key = int(unique[queue.popleft()])
+            for step in steps:
+                neighbour = number.get(key + step)
+                if neighbour is not None and label[neighbour] < 0:
+                    label[neighbour] = count
+                    queue.append(neighbour)
+        count += 1
+    point_label = label[inverse]
+    order = np.argsort(point_label, kind="stable")
+    bounds = np.searchsorted(point_label[order], np.arange(count + 1))
+    return [kept[order[bounds[i]:bounds[i + 1]]] for i in range(count)]
 
 
 def find_objects(arm_points, plane: TablePlane) -> list[TableObject]:
@@ -175,18 +200,15 @@ def find_objects(arm_points, plane: TablePlane) -> list[TableObject]:
     height = plane.height_above(arm)
     on_table = np.abs(height) < PLANE_INLIER_METRES
     above = (height > OBJECT_MIN_HEIGHT) & (height < OBJECT_MAX_HEIGHT)
-    table_cells = {
-        tuple(cell) for cell in np.floor(arm[on_table, :2] / CLUSTER_CELL_METRES).astype(int)
-    }
+    table_cells = np.unique(
+        np.floor(arm[on_table, :2] / CLUSTER_CELL_METRES).astype(np.int64), axis=0)
     reach = TABLE_NEIGHBOURHOOD_CELLS
     # Only cells over (or right beside) observed tabletop count, so people and
     # chairs beyond the table edge are not reported as objects.
-    near_table = {
-        (cx + dx, cy + dy)
-        for cx, cy in table_cells
-        for dx in range(-reach, reach + 1)
-        for dy in range(-reach, reach + 1)
-    }
+    spread = np.arange(-reach, reach + 1)
+    offsets = np.stack(np.meshgrid(spread, spread, indexing="ij"), axis=-1).reshape(-1, 2)
+    near_table = np.unique(_cell_keys(
+        (table_cells[:, None, :] + offsets[None, :, :]).reshape(-1, 2)))
     points = arm[above]
     heights = height[above]
     cells = np.floor(points[:, :2] / CLUSTER_CELL_METRES).astype(int)

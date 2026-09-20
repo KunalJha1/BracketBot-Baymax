@@ -8,6 +8,7 @@ to the model so it cannot truthfully claim a rejected action happened.
 
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
@@ -393,7 +394,7 @@ ACTION_ALIASES = {
 }
 
 _WAKE_PREFIX = re.compile(
-    r"^(?:(?:hey|hi|hello|ok|okay)\s+)?"
+    r"^(?:(?:hey|hi|hello|ok|okay|oh)\s+)?"
     r"(?:baymax|bamax|(?:bracket|racket)\s*bot)\s+"
 )
 _LEADING_POLITE = re.compile(r"^(?:please\s+|can you please\s+|could you please\s+)")
@@ -429,6 +430,10 @@ def match_action(text: str) -> str | None:
 
 _HEART_RATE_TERMS = re.compile(r"\b(?:heart ?rate|heart ?beat|pulse)\b")
 _CHECKUP_TERMS = re.compile(r"\b(?:check ?up|health check|wellness check)\b")
+# "Check me out" only counts as a scan request when it is the whole request.
+# Anchoring it keeps "check out my new hat" and "check me out on the leaderboard"
+# with the model instead of pointing the camera at someone.
+_CHECK_ME_OUT = re.compile(r"^check (?:me|us) (?:out|over)$")
 _PERSONAL = re.compile(r"\b(?:my|me)\b")
 _PAST_TENSE = re.compile(r"\b(?:was|were|had|yesterday|last)\b")
 _HEALTH_REQUEST_STARTS = (
@@ -461,6 +466,8 @@ def match_health_request(text: str) -> str | None:
         or normalized.startswith(_REQUEST_PREFIXES)
         or normalized.startswith(_HEALTH_REQUEST_STARTS)
     )
+    if _CHECK_ME_OUT.match(normalized):
+        return "heart-rate"
     if _CHECKUP_TERMS.search(normalized):
         if requested or _CHECKUP_TERMS.match(normalized):
             return "checkup"
@@ -591,9 +598,23 @@ _TIME_SENSITIVE_CACHE_TERMS = re.compile(
     r"available|availability|open|closed|near me|local|next|last|upcoming"
     r")\b"
 )
+# Words that only mean something given an earlier turn. First-person words
+# are deliberately absent: "what do I do if I cut my finger" is the same
+# question every time it is asked, and excluding "my" quietly made most of
+# the first-aid questions this robot exists to answer uncacheable.
 _CONTEXT_DEPENDENT_CACHE_TERMS = re.compile(
-    r"\b(?:this|that|these|those|it|its|they|them|he|she|him|her|my|mine|our|"
-    r"ours|earlier|again)\b"
+    r"\b(?:this|that|these|those|it|its|they|them|he|she|him|her|"
+    r"earlier|again)\b"
+)
+# First-person questions about the person's own live state, which the robot
+# measures or stores per person and must never answer from a saved reply.
+_PERSONAL_STATE_TERMS = re.compile(
+    r"\b(?:my|our)\s+(?:"
+    r"heart ?rate|heart ?beat|pulse|blood pressure|oxygen|temperature|fever|"
+    r"weight|height|age|name|reminders?|timers?|alarms?|schedule|calendar|"
+    r"appointments?|medication schedule|battery|charge|readings?|results?|"
+    r"vitals?|checkup|scan"
+    r")\b"
 )
 _CONTEXT_DEPENDENT_CACHE_PREFIX = re.compile(
     r"^(?:and |also |what about |how about |tell me more|explain more|go on)"
@@ -705,6 +726,8 @@ def is_cacheable_question(text: str) -> bool:
         return False
     if _CONTEXT_DEPENDENT_CACHE_TERMS.search(normalized):
         return False
+    if _PERSONAL_STATE_TERMS.search(normalized):
+        return False
     return not _CONTEXT_DEPENDENT_CACHE_PREFIX.match(normalized)
 
 
@@ -770,13 +793,18 @@ class QuestionResponseCache:
             print(f"[voice-router] Response cache disabled: {exc}", flush=True)
         self._enabled = False
 
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path, timeout=2.0)
+    def _connect(self):
+        # ``sqlite3.connect`` as a context manager commits the transaction but
+        # does not close the handle, and the connection sits in a reference
+        # cycle, so every spoken turn left one open until the cyclic collector
+        # happened to run. ``closing`` makes the close deterministic; the inner
+        # ``with connection`` at each call site still commits.
+        return closing(sqlite3.connect(self.path, timeout=2.0))
 
     def _initialize(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self._connect() as connection:
+            with self._connect() as connection, connection:
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS question_responses (
@@ -812,7 +840,7 @@ class QuestionResponseCache:
             return None
         cache_key = self._key(question, model, system_prompt)
         try:
-            with self._lock, self._connect() as connection:
+            with self._lock, self._connect() as connection, connection:
                 row = connection.execute(
                     "SELECT answer, created_at FROM question_responses WHERE cache_key = ?",
                     (cache_key,),
@@ -867,7 +895,7 @@ class QuestionResponseCache:
             return
         cache_key = self._key(question, model, system_prompt)
         try:
-            with self._lock, self._connect() as connection:
+            with self._lock, self._connect() as connection, connection:
                 connection.execute(
                     """
                     INSERT INTO question_responses(
@@ -910,7 +938,16 @@ class QuestionResponseCache:
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_SEED_PATH = REPOSITORY_ROOT / "assets" / "response-cache-seed.json"
+SEED_FILENAME = "response-cache-seed.json"
+# The greeter modules are deployed flat to the robot without the repository
+# around them, so the seed is looked for beside the module as well as in the
+# repository's assets directory. Only checking the repository path meant the
+# robot silently started with no prepared answers at all.
+SEED_PATH_CANDIDATES = (
+    Path(__file__).resolve().parent / SEED_FILENAME,
+    REPOSITORY_ROOT / "assets" / SEED_FILENAME,
+)
+DEFAULT_SEED_PATH = SEED_PATH_CANDIDATES[-1]
 
 
 def load_seed_pairs(path: str | Path) -> tuple[tuple[str, str], ...]:
@@ -932,19 +969,32 @@ def load_seed_pairs(path: str | Path) -> tuple[tuple[str, str], ...]:
             continue
         question = str(entry.get("question", "")).strip()
         answer = str(entry.get("answer", "")).strip()
-        if question and answer:
-            pairs.append((question, answer))
+        if not question or not answer:
+            continue
+        pairs.append((question, answer))
+        # A question whose meaning rides on a single topic word ("a fever")
+        # can only ever match exactly, so one reviewed answer may list the
+        # other ways people say it rather than repeating the answer per row.
+        aliases = entry.get("aliases")
+        if isinstance(aliases, list):
+            for alias in aliases:
+                if not isinstance(alias, str) or not alias.strip():
+                    continue
+                pairs.append((alias.strip(), answer))
     return tuple(pairs)
 
 
 def default_seed_path() -> Path | None:
-    """The configured seed file, or the repository's own if it is present."""
+    """The configured seed file, or the first shipped one that is present."""
     configured = os.environ.get("BAYMAX_RESPONSE_CACHE_SEED", "").strip()
     if configured.lower() in {"off", "none", "disabled"}:
         return None
     if configured:
         return Path(configured).expanduser()
-    return DEFAULT_SEED_PATH if DEFAULT_SEED_PATH.is_file() else None
+    for candidate in SEED_PATH_CANDIDATES:
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def default_seed_pairs() -> tuple[tuple[str, str], ...]:
@@ -1104,6 +1154,9 @@ class OpenRouterClient:
             "messages": messages,
             "max_tokens": 180,
             "temperature": 0.4,
+            # The reply is spoken, so time to first word matters more than
+            # picking the cheapest host for the same model.
+            "provider": {"sort": "throughput"},
         }
         if tools:
             payload_body["tools"] = tools
@@ -1201,9 +1254,8 @@ class OpenRouterClient:
         gesture_handler: Callable[[str], tuple[bool, str]] | None = None,
     ) -> ModelResponse:
         with self._lock:
-            cacheable = (
-                self.response_cache is not None
-                and is_cacheable_question(utterance)
+            cacheable = self.response_cache is not None and is_cacheable_question(
+                utterance
             )
             if cacheable:
                 cached_reply = self.response_cache.get(
@@ -1227,7 +1279,12 @@ class OpenRouterClient:
                 {"role": "user", "content": utterance},
             ]
             tools = []
-            if self.web_search.configured:
+            # A question with no time-sensitive wording is one whose answer we
+            # are willing to keep for a month, so it does not need the live
+            # web. Offering the tool anyway invited the model to spend a whole
+            # extra round trip searching before it said anything.
+            standalone = is_cacheable_question(utterance)
+            if self.web_search.configured and not standalone:
                 tools.append(WEB_SEARCH_TOOL)
             if gesture_handler is not None:
                 tools.append(PERFORM_GESTURE_TOOL)

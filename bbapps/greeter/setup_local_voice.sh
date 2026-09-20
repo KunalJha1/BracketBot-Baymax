@@ -6,6 +6,7 @@ model_name="${WHISPER_CPP_MODEL_NAME:-base.en}"
 
 if command -v espeak-ng >/dev/null \
   && [[ -x "$install_root/build/bin/whisper-cli" ]] \
+  && [[ -x "$install_root/build/bin/whisper-server" ]] \
   && [[ -f "$install_root/models/ggml-$model_name.bin" ]]; then
   echo "Local voice dependencies are already ready."
   exit 0
@@ -35,4 +36,7 @@ cmake --build "$install_root/build" -j4 --config Release
 
 echo "Local voice dependencies are ready."
 echo "Whisper CLI: $install_root/build/bin/whisper-cli"
+# The server keeps the model in memory, so a spoken turn pays for inference
+# only. run_robot_local_voice.sh starts it and falls back to the CLI without it.
+echo "Whisper server: $install_root/build/bin/whisper-server"
 echo "Whisper model: $install_root/models/ggml-$model_name.bin"

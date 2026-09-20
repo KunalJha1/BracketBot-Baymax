@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import queue
 import shutil
 import signal
 import subprocess
@@ -68,6 +69,11 @@ SILENT_ACTIONS = AUDIO_ACTIONS | AUDIO_ROUTINES | {"dance"}
 # Read-only camera scans. They never open a motor or arm writer.
 HEALTH_ACTIONS = frozenset({"heart-rate", "checkup"})
 TYPICAL_RESTING_BPM = (60, 100)
+# The scan estimates once a second, but speaking every estimate would queue
+# speech faster than the speaker can drain it. Speak a few spaced readings and
+# let the rest go to the log only.
+SPOKEN_TICKS = 4
+TICK_SPACING_S = 4.0
 # Actions aimed at a person: face them before starting. A missing person tracker
 # leaves these exactly as they were (no turning, no search).
 PERSON_GESTURES = frozenset({"handshake", "fist bump", "hug"})
@@ -108,12 +114,20 @@ class RppgScanner:
     def installed(self) -> bool:
         return self.script.is_file()
 
-    def scan(self, cancel: threading.Event) -> dict | None:
+    def scan(self, cancel: threading.Event, on_tick=None) -> dict | None:
+        """Run the scan, optionally reporting per-second estimates as they arrive.
+
+        ``on_tick(bpm, progress)`` is called for every intermediate estimate the
+        scan publishes, with ``bpm`` None until the signal locks. It runs on this
+        thread, so a slow tick handler (speaking one, for instance) only delays
+        the next tick; the scan process keeps measuring either way.
+        """
         if not self.installed:
             raise HeartRateScanError(f"scan script is missing: {self.script}")
         command = [
             self.uv_bin, "run", "--quiet", self.script.name,
             "--duration", str(self.duration_s),
+            "--progress-json",
         ]
         process = subprocess.Popen(
             command,
@@ -121,34 +135,83 @@ class RppgScanner:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            bufsize=1,
             start_new_session=True,
         )
         deadline = time.monotonic() + self.timeout_s
-        stdout = stderr = ""
+        lines: "queue.Queue[str | None]" = queue.Queue()
+
+        def pump():
+            try:
+                for line in process.stdout:
+                    lines.put(line)
+            finally:
+                lines.put(None)
+
+        reader = threading.Thread(target=pump, name="rppg-stdout", daemon=True)
+        reader.start()
+
+        def stop(reason: str | None):
+            # uv runs the scan in a child Python; stop both.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            if reason is not None:
+                raise HeartRateScanError(reason)
+
+        report = None
         while True:
             try:
-                stdout, stderr = process.communicate(timeout=0.2)
+                line = lines.get(timeout=0.2)
+            except queue.Empty:
+                if cancel.is_set():
+                    stop(None)
+                    return None
+                if time.monotonic() > deadline:
+                    stop("scan timed out")
+                continue
+            if line is None:
                 break
-            except subprocess.TimeoutExpired:
-                if cancel.is_set() or time.monotonic() > deadline:
-                    # uv runs the scan in a child Python; stop both.
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    process.communicate()
-                    if cancel.is_set():
-                        return None
-                    raise HeartRateScanError("scan timed out")
-        try:
-            report = json.loads(stdout)
-        except json.JSONDecodeError:
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # uv or a library wrote a non-JSON line; ignore it.
+            if not isinstance(message, dict):
+                continue
+            if "result" in message:
+                report = message
+                continue
+            if on_tick is not None and "progress" in message:
+                bpm = message.get("bpm")
+                on_tick(
+                    None if bpm is None else float(bpm),
+                    float(message.get("progress") or 0.0),
+                )
+            if cancel.is_set():
+                stop(None)
+                return None
+
+        process.wait()
+        if cancel.is_set():
+            return None
+        if report is None:
+            stderr = process.stderr.read() if process.stderr else ""
             tail = (stderr or "").strip().splitlines()[-1:] or ["no output"]
             raise HeartRateScanError(
                 f"scan exited with code {process.returncode}: {tail[0]}"
-            ) from None
-        result = report.get("result") if isinstance(report, dict) else None
+            )
+        result = report.get("result")
         return result if isinstance(result, dict) else None
+
+
+def tick_message(bpm: float, index: int) -> str:
+    """Short spoken reading for an in-progress scan. Kept terse so the next
+    estimate is not still waiting on the speaker."""
+    if index == 0:
+        return f"I'm reading about {round(bpm)} beats per minute."
+    return f"About {round(bpm)}."
 
 
 def heart_rate_message(result: dict | None, checkup: bool = False) -> str:
@@ -458,8 +521,29 @@ class VoiceActionController:
                 if leds is not None:
                     rgb, pattern = SCAN_LED
                     leds.start_effect(rgb, pattern, 600.0)
+                spoken = []
+                last_tick = [0.0]
+
+                def on_tick(bpm, progress):
+                    # Every estimate is logged; only a spaced few are spoken.
+                    print(
+                        f"[voice-action] heart-rate tick {progress:.0%} "
+                        f"bpm={'--' if bpm is None else round(bpm, 1)}",
+                        flush=True,
+                    )
+                    if bpm is None or len(spoken) >= SPOKEN_TICKS:
+                        return
+                    if self._cancel.is_set() or self._shutdown.is_set():
+                        return
+                    now = time.monotonic()
+                    if spoken and now - last_tick[0] < TICK_SPACING_S:
+                        return
+                    last_tick[0] = now
+                    self.announce(tick_message(bpm, len(spoken)))
+                    spoken.append(bpm)
+
                 try:
-                    result = scanner.scan(self._cancel)
+                    result = scanner.scan(self._cancel, on_tick=on_tick)
                     message = heart_rate_message(result, checkup=checkup)
                 except Exception as exc:
                     print(f"[voice-action] heart-rate scan failed safely: {exc}", flush=True)

@@ -565,6 +565,15 @@ _debug = {
 
 # ── MJPEG feed queue ─────────────────────────────────────────────────
 _web_jpeg_queue = queue.Queue(maxsize=3)
+# Open /feed connections. Annotating and JPEG-encoding a frame is only worth
+# the CPU while somebody is watching; detection itself never depends on it.
+_feed_clients = 0
+_feed_clients_lock = threading.Lock()
+# The debug page polls /api/status at 5 Hz; waveform/level stats are only
+# computed while that is happening.
+_last_status_poll = 0.0
+DEBUG_STATS_WINDOW_S = 2.0
+DETECT_PERIOD_S = 0.1  # ~10 Hz
 
 # ── Greeting logic ───────────────────────────────────────────────────
 GREET_COOLDOWN = 30.0  # seconds before re-greeting
@@ -662,10 +671,17 @@ def detector_loop():
                 time.sleep(0.05)
                 continue
 
-            stereo = cam.data["rgb"].copy()
-            left = stereo[:, :img_w, :]  # RGB
-            frame_bgr = cv2.cvtColor(left, cv2.COLOR_RGB2BGR)
-            orig_h, orig_w = frame_bgr.shape[:2]
+            loop_started = time.monotonic()
+            # Copy only the left eye out of shared memory, not the full stereo pair.
+            left = np.ascontiguousarray(cam.data["rgb"][:, :img_w, :])  # RGB
+            orig_h, orig_w = left.shape[:2]
+            viewing = _feed_clients > 0
+            with _greet_lock:
+                greet_due = (time.time() - _last_greet_time) >= GREET_COOLDOWN
+            # The face gate only feeds the greeting trigger and the feed
+            # labels, so skip it while neither can use the result.
+            need_faces = viewing or greet_due
+            frame_bgr = cv2.cvtColor(left, cv2.COLOR_RGB2BGR) if need_faces else None
 
             # ── Run inference manually (bypass Detector._postprocess) ──
             try:
@@ -726,7 +742,7 @@ def detector_loop():
 
             has_face_this_frame = False
 
-            for x1, y1, x2, y2, conf in detections:
+            for x1, y1, x2, y2, conf in detections if need_faces else ():
                 # Face detection within person bbox
                 person_crop = frame_bgr[y1:y2, x1:x2]
                 face_found = False
@@ -757,6 +773,8 @@ def detector_loop():
                 ):
                     label = f"Point target | {label}"
 
+                if not viewing:
+                    continue
                 cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 2)
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 (tw, th), _ = cv2.getTextSize(label, font, 0.55, 1)
@@ -774,17 +792,18 @@ def detector_loop():
                     threading.Thread(target=_greet_person, daemon=True).start()
 
             # Encode annotated frame for MJPEG feed
-            _, encoded = cv2.imencode('.jpg', frame_bgr,
-                [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            frame_bytes = encoded.tobytes()
-            try:
-                _web_jpeg_queue.put_nowait(frame_bytes)
-            except queue.Full:
+            if viewing:
+                _, encoded = cv2.imencode('.jpg', frame_bgr,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                frame_bytes = encoded.tobytes()
                 try:
-                    _web_jpeg_queue.get_nowait()
-                except queue.Empty:
-                    pass
-                _web_jpeg_queue.put_nowait(frame_bytes)
+                    _web_jpeg_queue.put_nowait(frame_bytes)
+                except queue.Full:
+                    try:
+                        _web_jpeg_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    _web_jpeg_queue.put_nowait(frame_bytes)
 
             frame_count += 1
             _debug["camera_frames"] = frame_count
@@ -794,7 +813,8 @@ def detector_loop():
                 print(f"[detector] {frame_count} frames, {num_dets} persons", flush=True)
                 last_det_log = now
 
-            time.sleep(0.1)  # ~10 Hz
+            # Hold the period, not period + processing time.
+            time.sleep(max(0.0, DETECT_PERIOD_S - (time.monotonic() - loop_started)))
 
     except Exception as e:
         print(f"[detector] Error: {e}\n{traceback.format_exc()}", flush=True)
@@ -1124,6 +1144,8 @@ def dashboard():
 
 @web_app.get("/api/status")
 def api_status():
+    global _last_status_poll
+    _last_status_poll = time.monotonic()
     return _debug
 
 @web_app.post("/api/set")
@@ -1187,13 +1209,27 @@ def api_action_stop(request: Request):
     return {"ok": True, "message": "Stop requested"}
 
 async def _generate_frames():
-    while not stop_event.is_set():
-        try:
-            frame = _web_jpeg_queue.get_nowait()
-            yield (b"--frame\r\n"
-                   b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
-        except queue.Empty:
-            await asyncio.sleep(0.05)
+    global _feed_clients
+    with _feed_clients_lock:
+        if _feed_clients == 0:
+            # Frames left over from the last viewer are stale by now.
+            while not _web_jpeg_queue.empty():
+                try:
+                    _web_jpeg_queue.get_nowait()
+                except queue.Empty:
+                    break
+        _feed_clients += 1
+    try:
+        while not stop_event.is_set():
+            try:
+                frame = _web_jpeg_queue.get_nowait()
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+            except queue.Empty:
+                await asyncio.sleep(0.05)
+    finally:
+        with _feed_clients_lock:
+            _feed_clients -= 1
 
 @web_app.get("/feed")
 async def feed():
@@ -1213,7 +1249,7 @@ def audio_io_loop(volume):
          Writer("speaker.audio", Type("speaker_audio")) as w_spk:
 
         while not w_spk.ready():
-            pass
+            time.sleep(0.001)
         for _ in range(3):
             with w_spk.buf() as b:
                 b["audio"] = np.zeros((CHUNK, CFG.channels), dtype=np.int16)
@@ -1231,12 +1267,13 @@ def audio_io_loop(volume):
                 did_work = True
                 audio = r_mic.data["audio"].copy()
                 mic_chunks_sent += 1
-                flat = audio.flatten()
-                _debug["mic_rms"] = int(np.sqrt(np.mean(flat.astype(np.float64)**2)))
-                _debug["mic_peak"] = int(np.max(np.abs(flat)))
                 _debug["mic_chunks_in"] = mic_chunks_sent
-                step = max(1, len(flat) // 800)
-                _debug["mic_waveform"] = flat[::step].tolist()
+                if time.monotonic() - _last_status_poll < DEBUG_STATS_WINDOW_S:
+                    flat = audio.flatten()
+                    _debug["mic_rms"] = int(np.sqrt(np.mean(flat.astype(np.float64)**2)))
+                    _debug["mic_peak"] = int(np.max(np.abs(flat)))
+                    step = max(1, len(flat) // 800)
+                    _debug["mic_waveform"] = flat[::step].tolist()
                 try:
                     mic_queue.put_nowait(audio)
                 except queue.Full:
@@ -1272,8 +1309,9 @@ def audio_io_loop(volume):
                     chunk = np.zeros(CHUNK, dtype=np.int16)
 
                 _debug["spk_chunks_out"] = spk_chunks_played
-                step = max(1, len(chunk) // 800)
-                _debug["spk_waveform"] = chunk[::step].tolist()
+                if time.monotonic() - _last_status_poll < DEBUG_STATS_WINDOW_S:
+                    step = max(1, len(chunk) // 800)
+                    _debug["spk_waveform"] = chunk[::step].tolist()
 
                 with w_spk.buf() as b:
                     b["audio"] = chunk.reshape(-1, CFG.channels)

@@ -387,3 +387,22 @@ def test_check_in_falls_back_when_llm_is_offline(monkeypatch):
     check_in.converse()
 
     assert synthesizer.spoken == [OPENING_LINE, FALLBACK_REPLY]
+
+
+def test_dashboard_only_encodes_frames_while_someone_is_watching():
+    state = DashboardState()
+    frame = np.zeros((48, 64, 3), dtype=np.uint8)
+
+    state.publish(frame, {"frame": 1})
+    assert state.jpeg is None
+    assert state.status()["frame"] == 1
+
+    state.add_viewer(1)
+    state.publish(frame, {"frame": 2})
+    sequence, jpeg = state.wait_for_frame(-1, timeout=0.1)
+    assert sequence == 2
+    assert jpeg is not None and jpeg[:2] == b"\xff\xd8"
+
+    state.add_viewer(-1)
+    state.publish(frame, {"frame": 3})
+    assert state.jpeg is None

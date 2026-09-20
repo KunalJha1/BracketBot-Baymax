@@ -1,5 +1,5 @@
 {
-  "note": "Prepared answers warmed into the spoken-question cache at greeter startup. Each entry must be true of the robot as built, must not claim medical authority, and must read well aloud in one or two sentences. Time-sensitive or context-dependent questions are never cached, so none belong here. Written and reviewed by hand; the assistant never edits this file.",
+  "note": "Prepared answers warmed into the spoken-question cache at greeter startup. Each entry must be true of the robot as built, must not claim medical authority, and must read well aloud in one or two sentences. The first-aid entries are ordinary household first aid with a clear escalation cue, never a diagnosis. Common injuries are seeded under several phrasings on purpose: a one-topic-word question only ever matches exactly. Time-sensitive or context-dependent questions are never cached, so none belong here. Written and reviewed by hand; the assistant never edits this file without being asked.",
   "entries": [
     {
       "question": "What are you?",
@@ -64,6 +64,155 @@
     {
       "question": "How do you balance?",
       "answer": "Two wheels and a balance controller keep me upright, the same idea as a segway. If the robot is tipped too far, the safety checks refuse to move the arms at all."
+    },
+    {
+      "question": "What should I do if I cut my finger?",
+      "answer": "Rinse the cut under cool water, press a clean cloth on it until the bleeding stops, then cover it with a bandage. If it keeps bleeding after ten minutes of pressure, or the cut is deep or gaping, please get medical help.",
+      "aliases": [
+        "How do I treat a cut?",
+        "I cut my hand, what should I do?",
+        "I have a cut, what should I do?",
+        "What do I do about a cut?",
+        "What do I do for a cut?",
+        "What helps a cut?",
+        "What should I do about a cut?",
+        "What should I do for a cut?",
+        "What should I do if I have a cut?"
+      ]
+    },
+    {
+      "question": "How do I stop bleeding?",
+      "answer": "Press firmly on the wound with a clean cloth and keep pressing without lifting to peek, and raise the injured part above the heart if you can. If blood soaks through or spurts, call emergency services right away."
+    },
+    {
+      "question": "What should I do if I burn my hand?",
+      "answer": "Hold the burn under cool running water for about twenty minutes, then cover it loosely with a clean non fluffy cloth. Do not use ice, butter, or ointments, and get medical help for anything bigger than your palm, blistered, or on the face or hands.",
+      "aliases": [
+        "How do I treat a burn?",
+        "I have a burn, what should I do?",
+        "What do I do about a burn?",
+        "What do I do for a burn?",
+        "What helps a burn?",
+        "What should I do about a burn?",
+        "What should I do for a burn?",
+        "What should I do if I have a burn?"
+      ]
+    },
+    {
+      "question": "What should I do about a nosebleed?",
+      "answer": "Sit upright, lean slightly forward, and pinch the soft part of your nose for ten full minutes without checking. If it has not stopped after twenty minutes or followed a hard blow to the head, please get medical help.",
+      "aliases": [
+        "How do I stop a nosebleed?",
+        "How do I treat a nosebleed?",
+        "I have a nosebleed, what should I do?",
+        "What do I do about a nosebleed?",
+        "What do I do for a nosebleed?",
+        "What helps a nosebleed?",
+        "What should I do for a nosebleed?",
+        "What should I do if I have a nosebleed?"
+      ]
+    },
+    {
+      "question": "What should I do for a sprained ankle?",
+      "answer": "Rest it, put something cold wrapped in a cloth on it for twenty minutes at a time, wrap it snugly, and keep it raised. If you cannot put weight on it at all or it looks misshapen, please have it looked at.",
+      "aliases": [
+        "How do I treat a sprain?",
+        "I have a sprain, what should I do?",
+        "What do I do about a sprain?",
+        "What do I do for a sprain?",
+        "What helps a sprain?",
+        "What should I do about a sprain?",
+        "What should I do for a sprain?",
+        "What should I do if I have a sprain?"
+      ]
+    },
+    {
+      "question": "What should I do if someone is choking?",
+      "answer": "If they cannot speak, cough, or breathe, call emergency services and give firm back blows between the shoulder blades, then abdominal thrusts. If they can still cough forcefully, encourage them to keep coughing."
+    },
+    {
+      "question": "What should I do about a bee sting?",
+      "answer": "Scrape the stinger out sideways with something with a firm edge, wash the spot, and use something cold for the swelling. If there is trouble breathing, swelling of the face or throat, or dizziness, call emergency services immediately."
+    },
+    {
+      "question": "What should I do for a headache?",
+      "answer": "Try water, a rest in a dim quiet room, and the pain reliever you normally use as directed. If it is the worst headache of your life, came on suddenly, or comes with confusion, weakness, or a stiff neck, get help right away.",
+      "aliases": [
+        "How do I treat a headache?",
+        "I have a headache, what should I do?",
+        "What do I do about a headache?",
+        "What do I do for a headache?",
+        "What helps a headache?",
+        "What should I do about a headache?",
+        "What should I do if I have a headache?"
+      ]
+    },
+    {
+      "question": "What should I do if I have a fever?",
+      "answer": "Rest, sip fluids steadily, and dress lightly. Please seek medical care for a fever above thirty nine and a half degrees Celsius, one lasting more than three days, or any fever with a stiff neck, rash, confusion, or trouble breathing.",
+      "aliases": [
+        "How do I treat a fever?",
+        "I have a fever, what should I do?",
+        "What do I do about a fever?",
+        "What do I do for a fever?",
+        "What helps a fever?",
+        "What should I do about a fever?",
+        "What should I do for a fever?"
+      ]
+    },
+    {
+      "question": "What should I do if I feel dizzy?",
+      "answer": "Sit or lie down right away so a faint cannot hurt you, and sip some water. If dizziness comes with chest pain, slurred speech, weakness on one side, or a bad headache, call emergency services."
+    },
+    {
+      "question": "How do I get a splinter out?",
+      "answer": "Wash your hands and the skin, then pull the splinter out along the angle it went in using clean tweezers, and wash again afterwards. If it is deep, under a nail, or will not come out, let a clinician remove it."
+    },
+    {
+      "question": "What should I do for a scrape?",
+      "answer": "Rinse the scrape with cool running water to get the grit out, pat it dry, and cover it with a clean bandage. Watch for spreading redness, warmth, or pus over the next few days and get it checked if you see them.",
+      "aliases": [
+        "How do I treat a scrape?",
+        "I have a scrape, what should I do?",
+        "What do I do about a scrape?",
+        "What do I do for a scrape?",
+        "What helps a scrape?",
+        "What should I do about a scrape?",
+        "What should I do if I have a scrape?"
+      ]
+    },
+    {
+      "question": "What should I do about an allergic reaction?",
+      "answer": "For trouble breathing, swelling of the lips, tongue, or throat, or faintness, use an epinephrine injector if one is prescribed and call emergency services at once. Mild itching or hives alone can usually wait for your regular clinician."
+    },
+    {
+      "question": "When should I call an ambulance?",
+      "answer": "Call emergency services for chest pain, trouble breathing, heavy bleeding that will not stop, sudden weakness or slurred speech, a seizure, or anyone who cannot be woken. When you are unsure, calling is the right choice."
+    },
+    {
+      "question": "What should I do if someone faints?",
+      "answer": "Lay them on their back and raise their legs a little, loosen tight clothing, and check that they are breathing. If they do not wake within a minute, or they are not breathing normally, call emergency services."
+    },
+    {
+      "question": "How do I do CPR?",
+      "answer": "Call emergency services first and put the phone on speaker, then push hard and fast in the centre of the chest, about twice a second, and let the chest come all the way back up each time. The dispatcher will count with you until help arrives."
+    },
+    {
+      "question": "What should I do about a bruise?",
+      "answer": "Put something cold wrapped in a cloth on it for twenty minutes at a time for the first day, and keep it raised if you can. Get it checked if the pain is severe, the joint will not move, or bruises keep appearing on their own.",
+      "aliases": [
+        "How do I treat a bruise?",
+        "I have a bruise, what should I do?",
+        "What do I do about a bruise?",
+        "What do I do for a bruise?",
+        "What helps a bruise?",
+        "What should I do for a bruise?",
+        "What should I do if I have a bruise?"
+      ]
+    },
+    {
+      "question": "What should I do if I hit my head?",
+      "answer": "Rest, use something cold on the sore spot, and have someone stay nearby for the next day. Get urgent care for vomiting, worsening headache, confusion, one pupil larger than the other, or any loss of consciousness."
     }
   ]
 }

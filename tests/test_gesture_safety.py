@@ -2,6 +2,10 @@ import numpy as np
 import pytest
 
 from bbapps.greeter.gesture_safety import (
+    HARD_COLLISION_RADIUS_METRES,
+    PROFILES,
+    ClearanceProfile,
+    active_profile,
     depth_clearance,
     plan_recorded_gesture,
     spoken_safety_refusal,
@@ -119,18 +123,94 @@ def test_exact_hand_path_ignores_geometry_elsewhere_in_broad_workspace():
     assert result["left"] == 0
 
 
+def to_camera(points):
+    """Base frame (forward, left, height) into camera frame (right, forward, height)."""
+    return np.column_stack((-points[:, 1], points[:, 0], points[:, 2]))
+
+
 def test_exact_hand_path_rejects_dense_nearby_geometry():
     rng = np.random.default_rng(13)
     path = {"left": np.array([[0.2, -0.3, 1.2], [0.3, -0.3, 1.25]])}
-    obstacle_base = rng.normal([0.25, -0.3, 1.22], 0.015, size=(80, 3))
-    obstacle_camera = np.column_stack(
-        (-obstacle_base[:, 1], obstacle_base[:, 0], obstacle_base[:, 2])
+    obstacle = to_camera(rng.normal([0.25, -0.3, 1.22], 0.015, size=(80, 3)))
+
+    # This obstacle's centroid sits ~54 mm off the nearest waypoint: inside the
+    # cautious 60 mm bubble, outside the balanced 45 mm one. It is the exact
+    # case the looser profile is meant to stop refusing.
+    with pytest.raises(RuntimeError, match="inside the arm clearance zone"):
+        depth_clearance(
+            np.vstack((clear_depth(), obstacle)),
+            ("left",),
+            path,
+            profile=PROFILES["cautious"],
+        )
+
+    counts = depth_clearance(
+        np.vstack((clear_depth(), obstacle)),
+        ("left",),
+        path,
+        profile=PROFILES["balanced"],
+    )
+    assert counts["left"] < PROFILES["balanced"].min_blocking_points
+
+
+@pytest.mark.parametrize("name", sorted(PROFILES))
+def test_obstacle_on_the_hand_path_blocks_under_every_profile(name):
+    # Whatever the padding, geometry the hand actually passes through is a
+    # collision, and the hard gate must catch it even at the boldest setting.
+    rng = np.random.default_rng(21)
+    path = {"left": np.array([[0.2, -0.3, 1.2], [0.3, -0.3, 1.25]])}
+    obstacle = to_camera(rng.normal([0.2, -0.3, 1.2], 0.01, size=(120, 3)))
+
+    with pytest.raises(RuntimeError, match="inside the arm clearance zone"):
+        depth_clearance(
+            np.vstack((clear_depth(), obstacle)),
+            ("left",),
+            path,
+            profile=PROFILES[name],
+        )
+
+
+def test_no_profile_may_reach_inside_the_hard_collision_radius():
+    with pytest.raises(ValueError, match="hard collision radius"):
+        ClearanceProfile("reckless", HARD_COLLISION_RADIUS_METRES - 0.001, 200, 40)
+
+    for profile in PROFILES.values():
+        assert profile.hand_path_clearance_m >= HARD_COLLISION_RADIUS_METRES
+
+
+def test_broad_workspace_fallback_keeps_the_conservative_point_budget():
+    # With no hand path there is no hard gate to backstop a looser budget, so
+    # the fallback must not follow the profile down.
+    rng = np.random.default_rng(9)
+    obstacle = np.column_stack(
+        (
+            rng.normal(-0.35, 0.01, 70),
+            rng.normal(0.45, 0.01, 70),
+            rng.normal(1.0, 0.01, 70),
+        )
     )
 
     with pytest.raises(RuntimeError, match="inside the arm clearance zone"):
         depth_clearance(
-            np.vstack((clear_depth(), obstacle_camera)), ("left",), path
+            np.vstack((clear_depth(), obstacle)),
+            ("left",),
+            None,
+            profile=PROFILES["bold"],
         )
+
+
+def test_risk_profile_comes_from_the_environment(monkeypatch):
+    monkeypatch.setenv("BAYMAX_GESTURE_RISK", "bold")
+    assert active_profile() is PROFILES["bold"]
+
+    monkeypatch.setenv("BAYMAX_GESTURE_RISK", " Cautious ")
+    assert active_profile() is PROFILES["cautious"]
+
+    monkeypatch.setenv("BAYMAX_GESTURE_RISK", "yolo")
+    assert active_profile() is PROFILES["balanced"]
+
+    monkeypatch.delenv("BAYMAX_GESTURE_RISK")
+    assert active_profile() is PROFILES["balanced"]
 
 
 def test_spoken_safety_refusal_hides_depth_diagnostics():

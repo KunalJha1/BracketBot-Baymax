@@ -1,9 +1,11 @@
 import json
 import sqlite3
 from http.client import RemoteDisconnected
+from pathlib import Path
 
 from bbapps.greeter.voice_router import (
     DEFAULT_SEED_PATH,
+    SEED_FILENAME,
     BrowserbaseSearchClient,
     OpenRouterClient,
     QuestionResponseCache,
@@ -11,6 +13,8 @@ from bbapps.greeter.voice_router import (
     VoiceRouter,
     authorize_gesture_tool,
     cache_normalize,
+    default_seed_pairs,
+    default_seed_path,
     is_cacheable_question,
     is_question,
     load_seed_pairs,
@@ -998,6 +1002,27 @@ def test_heart_rate_and_checkup_requests_match_the_camera_scan():
         assert match_health_request(phrase) == "checkup", phrase
 
 
+def test_check_me_out_starts_the_camera_scan():
+    for phrase in (
+        "Oh BracketBot, check me out",
+        "hey baymax check me out",
+        "check me out",
+        "check us over",
+    ):
+        assert match_health_request(phrase) == "heart-rate", phrase
+
+
+def test_check_me_out_only_counts_as_the_whole_request():
+    # The idiom is common enough that it must not fire mid-sentence.
+    for phrase in (
+        "check out my new hat",
+        "check me out on the leaderboard",
+        "people always check me out",
+        "don't check me out",
+    ):
+        assert match_health_request(phrase) is None, phrase
+
+
 def test_heart_rate_discussion_does_not_start_a_scan():
     for phrase in (
         "what is a normal heart rate",
@@ -1094,3 +1119,134 @@ def test_openrouter_answers_in_text_when_tool_rounds_are_exhausted():
     # The forced final turn must offer no tools, or the model can loop again.
     assert "tools" not in requests[-1]
     assert requests[0]["tools"][0]["function"]["name"] == "web_search"
+
+
+def test_first_person_health_questions_are_cacheable():
+    # The robot exists to answer these, and "my" alone used to disqualify them.
+    assert is_cacheable_question("What should I do if I cut my finger?") is True
+    assert is_cacheable_question("I cut my finger, what do I do?") is True
+    assert is_cacheable_question("What should I do if I burn my hand?") is True
+    assert is_cacheable_question("How do I clean my wound?") is True
+
+
+def test_questions_about_the_persons_own_live_state_are_never_cacheable():
+    assert is_cacheable_question("What is my heart rate?") is False
+    assert is_cacheable_question("What was my pulse?") is False
+    assert is_cacheable_question("What are my reminders?") is False
+    assert is_cacheable_question("When is my appointment?") is False
+    assert is_cacheable_question("What is my blood pressure?") is False
+
+
+def test_repository_seed_answers_common_first_aid_questions_as_asked(tmp_path):
+    cache = QuestionResponseCache(tmp_path / "cache.sqlite3")
+    cache.seed(load_seed_pairs(DEFAULT_SEED_PATH), "model", "prompt")
+
+    spoken = [
+        "Hey BracketBot, what should I do if I cut my finger?",
+        "um, what do I do if I cut my finger",
+        "I cut my finger, what do I do?",
+        "What should I do if I burn my hand?",
+        "How do I treat a burn?",
+        "How do I stop a nosebleed?",
+        "What do I do for a headache?",
+        "I have a fever, what should I do?",
+        "What should I do if someone is choking?",
+        "When should I call an ambulance?",
+    ]
+    for question in spoken:
+        assert is_cacheable_question(question), question
+        assert cache.get(question, "model", "prompt"), question
+
+
+def test_seed_aliases_share_one_reviewed_answer(tmp_path):
+    path = tmp_path / "seed.json"
+    path.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {
+                        "question": "What should I do for a fever?",
+                        "answer": "Rest and fluids.",
+                        "aliases": ["What helps a fever?", "  ", 7],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert load_seed_pairs(path) == (
+        ("What should I do for a fever?", "Rest and fluids."),
+        ("What helps a fever?", "Rest and fluids."),
+    )
+
+
+def test_standalone_questions_skip_the_web_search_tool_round_trip():
+    seen = []
+
+    def opener(api_request, timeout):
+        seen.append(json.loads(api_request.data.decode("utf-8")))
+        return FakeResponse(
+            {"choices": [{"message": {"content": "Press a clean cloth on it."}}]}
+        )
+
+    client = OpenRouterClient(
+        api_key="test-key",
+        opener=opener,
+        web_search=BrowserbaseSearchClient(api_key="search-key"),
+    )
+
+    client.ask("What should I do if I cut my finger?")
+    assert "tools" not in seen[-1]
+
+    client.ask("What is the weather today?")
+    tool_names = [tool["function"]["name"] for tool in seen[-1]["tools"]]
+    assert "web_search" in tool_names
+
+
+def test_spoken_turns_ask_for_the_fastest_provider():
+    seen = []
+
+    def opener(api_request, timeout):
+        seen.append(json.loads(api_request.data.decode("utf-8")))
+        return FakeResponse({"choices": [{"message": {"content": "Sure."}}]})
+
+    OpenRouterClient(api_key="test-key", opener=opener).ask("Why is the sky blue?")
+    assert seen[-1]["provider"] == {"sort": "throughput"}
+
+
+def test_seed_is_found_in_the_flat_robot_deployment(tmp_path, monkeypatch):
+    # The greeter modules ship to the robot without the repository around
+    # them, so a seed beside the module has to be found. Missing this meant
+    # the robot started with no prepared answers at all.
+    monkeypatch.delenv("BAYMAX_RESPONSE_CACHE_SEED", raising=False)
+    deployed = tmp_path / "bbapps" / "greeter"
+    deployed.mkdir(parents=True)
+    beside_module = deployed / SEED_FILENAME
+    beside_module.write_text(
+        json.dumps({"entries": [{"question": "What are you?", "answer": "A robot."}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "bbapps.greeter.voice_router.SEED_PATH_CANDIDATES",
+        (beside_module, tmp_path / "absent" / SEED_FILENAME),
+    )
+    assert default_seed_path() == beside_module
+    assert default_seed_pairs() == (("What are you?", "A robot."),)
+
+
+def test_seed_lookup_falls_through_to_the_repository_assets(tmp_path, monkeypatch):
+    monkeypatch.delenv("BAYMAX_RESPONSE_CACHE_SEED", raising=False)
+    monkeypatch.setattr(
+        "bbapps.greeter.voice_router.SEED_PATH_CANDIDATES",
+        (tmp_path / "absent" / SEED_FILENAME, DEFAULT_SEED_PATH),
+    )
+    assert default_seed_path() == DEFAULT_SEED_PATH
+
+
+def test_the_robot_launcher_ships_the_seed_beside_the_greeter_modules():
+    launcher = (
+        Path(__file__).resolve().parents[1] / "scripts" / "run_robot_local_voice.sh"
+    ).read_text(encoding="utf-8")
+    assert SEED_FILENAME in launcher, (
+        "the seed must be copied to the robot or the cache starts empty"
+    )

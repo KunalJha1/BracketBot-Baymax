@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# One shared, kept-alive SSH connection to the robot for every dev tool and
+# session. Finds whichever route is up (USB, mDNS, hotspot), remembers it, and
+# multiplexes all calls over a single control socket, so a command costs a few
+# milliseconds instead of a fresh handshake.
+#
+#   scripts/bot <command...>        run a shell command on the robot
+#   scripts/bot py <args...>        run the BBOS venv python on the robot
+#   scripts/bot push <file...> [--to DIR]   copy files (default /tmp/baymax)
+#   scripts/bot pull <remote> [local]       copy a file or folder back
+#   scripts/bot host                print the route in use
+#   scripts/bot status              is the shared connection up?
+#   scripts/bot close               drop the shared connection
+#
+# BOT_HOST=<ssh host> skips discovery.
+set -uo pipefail
+PY='~/bbos/.venv/bin/python'
+SSH_OPTS=(-o ControlMaster=auto -o ControlPath=/tmp/baymax-bot-%C -o ControlPersist=1800
+          -o ConnectTimeout=5 -o BatchMode=yes -o ServerAliveInterval=15)
+HOST_CACHE=/tmp/baymax-bot-host
+CANDIDATES=(bot bracketbot@bracketbot-184.local botwifi)
+
+host() {
+  if [ -n "${BOT_HOST:-}" ]; then echo "$BOT_HOST"; return 0; fi
+  if [ -s "$HOST_CACHE" ]; then
+    local cached; cached=$(cat "$HOST_CACHE")
+    # A live control socket answers without a network round trip.
+    if ssh "${SSH_OPTS[@]}" -O check "$cached" 2>/dev/null \
+       || ssh "${SSH_OPTS[@]}" "$cached" true 2>/dev/null; then echo "$cached"; return 0; fi
+  fi
+  local h
+  for h in "${CANDIDATES[@]}"; do
+    if ssh "${SSH_OPTS[@]}" "$h" true 2>/dev/null; then echo "$h" | tee "$HOST_CACHE"; return 0; fi
+  done
+  echo "no route to the robot (tried ${CANDIDATES[*]})" >&2; return 1
+}
+
+[ $# -gt 0 ] || { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+cmd=$1
+case "$cmd" in
+  host)   host ;;
+  status) h=$(host) || exit 1; ssh "${SSH_OPTS[@]}" -O check "$h" ;;
+  close)  [ -s "$HOST_CACHE" ] && ssh "${SSH_OPTS[@]}" -O exit "$(cat "$HOST_CACHE")" 2>/dev/null
+          rm -f "$HOST_CACHE" ;;
+  py)     shift; h=$(host) || exit 1
+          ssh "${SSH_OPTS[@]}" "$h" "$PY $(printf '%q ' "$@")" ;;
+  push)   shift; to=/tmp/baymax; files=()
+          while [ $# -gt 0 ]; do
+            if [ "$1" = --to ]; then to=$2; shift 2; else files+=("$1"); shift; fi
+          done
+          [ ${#files[@]} -gt 0 ] || { echo "push: no files given" >&2; exit 2; }
+          h=$(host) || exit 1
+          ssh "${SSH_OPTS[@]}" "$h" "mkdir -p $to" && scp -q "${SSH_OPTS[@]}" -r "${files[@]}" "$h:$to/" ;;
+  pull)   shift; [ $# -ge 1 ] || { echo "pull: no remote path given" >&2; exit 2; }
+          h=$(host) || exit 1
+          scp -q "${SSH_OPTS[@]}" -r "$h:$1" "${2:-.}" ;;
+  *)      h=$(host) || exit 1
+          ssh "${SSH_OPTS[@]}" "$h" "$@" ;;
+esac

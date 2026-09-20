@@ -86,8 +86,7 @@ def find_people(points_local, cfg=ClusterConfig()):
     cols = int(np.ceil(2 * cfg.left_max / cfg.cell)) + 1
     gi = np.clip(((p[:, 0] - cfg.forward_min) / cfg.cell).astype(int), 0, rows - 1)
     gj = np.clip(((p[:, 1] + cfg.left_max) / cfg.cell).astype(int), 0, cols - 1)
-    counts = np.zeros((rows, cols), dtype=int)
-    np.add.at(counts, (gi, gj), 1)
+    counts = np.bincount(gi * cols + gj, minlength=rows * cols).reshape(rows, cols)
     labels = _label(counts >= cfg.min_cell_points)
     point_labels = labels[gi, gj]
 

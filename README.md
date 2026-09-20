@@ -374,6 +374,13 @@ model-authored tool argument cannot independently authorize motion:
    and depth points in a conservative active-arm clearance volume before any
    gesture writer is opened. Missing depth fails closed. The real started or
    rejected result is sent back to the LLM before it speaks.
+
+   How much padding that clearance volume keeps is tunable with
+   `BAYMAX_GESTURE_RISK` (`cautious`, `balanced` (default), `bold`). The profile
+   only shrinks *soft* margins around the recorded hand path, where a separate
+   hard collision gate still backstops the decision. The upright check and the
+   hard collision radius are hazards rather than caution and no profile can
+   reach them, so a bolder setting buys willingness to act, not contact.
 4. Questions can use the separate read-only Browserbase Search tool. Similar
    but unapproved text, such as “tell me about fist bumps”, cannot trigger a
    gesture. Add new voice authority in code and tests, not only in a prompt.

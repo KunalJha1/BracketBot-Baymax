@@ -14,6 +14,7 @@ It intentionally does not start the camera/YOLO greeter.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import math
 import os
 from pathlib import Path
@@ -29,12 +30,17 @@ try:
     from .local_voice import (
         EspeakSynthesizer,
         FallbackSynthesizer,
+        FallbackTranscriber,
         HttpTtsSynthesizer,
         LocalVoiceError,
         SpeechSegmenter,
         WhisperCppTranscriber,
+        WhisperServerTranscriber,
+        condition_utterance,
         play_dance_music,
         speaker_chunks,
+        split_sentences,
+        trim_silence,
     )
     from .voice_router import (
         OpenRouterClient,
@@ -51,12 +57,17 @@ except ImportError:
     from local_voice import (
         EspeakSynthesizer,
         FallbackSynthesizer,
+        FallbackTranscriber,
         HttpTtsSynthesizer,
         LocalVoiceError,
         SpeechSegmenter,
         WhisperCppTranscriber,
+        WhisperServerTranscriber,
+        condition_utterance,
         play_dance_music,
         speaker_chunks,
+        split_sentences,
+        trim_silence,
     )
     from voice_router import (
         OpenRouterClient,
@@ -85,19 +96,61 @@ def load_env(path: Path) -> None:
             os.environ.setdefault(key, value)
 
 
-def play_speech(writer, synthesizer, text, speaker_cfg, volume: float) -> None:
-    pcm = synthesizer.synthesize(text, speaker_cfg.sample_rate)
-    pcm = (pcm.astype(np.float32) * volume).clip(-32768, 32767).astype(np.int16)
-    chunks = speaker_chunks(pcm, speaker_cfg.chunk_size, speaker_cfg.channels)
+def play_speech(
+    writer,
+    synthesizer,
+    text,
+    speaker_cfg,
+    volume: float,
+    *,
+    stream: bool = True,
+) -> None:
+    """Speak ``text``, synthesizing the next sentence while the current plays.
+
+    Waiting for the whole reply to render before any of it is audible puts the
+    full synthesis cost in front of the first word, which is the part of the
+    delay a person actually notices.  Sentences are rendered one ahead instead,
+    so speech starts after the first sentence and the rest arrives behind it.
+    """
+    sentences = split_sentences(text) if stream else [text.strip()]
+    sentences = [sentence for sentence in sentences if sentence]
+    if not sentences:
+        return
+
+    def render(sentence: str) -> np.ndarray:
+        pcm = synthesizer.synthesize(sentence, speaker_cfg.sample_rate)
+        return (pcm.astype(np.float32) * volume).clip(-32768, 32767).astype(np.int16)
+
     # Match the BBOS speaker consumer exactly. Sending 10% fast eventually
-    # overwrote ring-buffer chunks and made longer replies sound choppy.
+    # overwrote ring-buffer chunks and made longer replies sound choppy. The
+    # clock runs across the whole reply so the sentence seams stay gapless.
     period = speaker_cfg.chunk_size / speaker_cfg.sample_rate
-    due = time.monotonic()
-    for chunk in chunks:
-        with writer.buf() as data:
-            data["audio"] = chunk.reshape(-1, speaker_cfg.channels)
-        due += period
-        time.sleep(max(0.0, due - time.monotonic()))
+    due = None
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pcm = render(sentences[0])
+        for index, _sentence in enumerate(sentences):
+            upcoming = (
+                pool.submit(render, sentences[index + 1])
+                if index + 1 < len(sentences)
+                else None
+            )
+            chunks = speaker_chunks(
+                pcm,
+                speaker_cfg.chunk_size,
+                speaker_cfg.channels,
+                # Only the first sentence needs the jitter-buffer lead-in; a
+                # lead on every sentence would insert an audible gap at each seam.
+                lead_chunks=4 if index == 0 else 0,
+            )
+            if due is None:
+                due = time.monotonic()
+            for chunk in chunks:
+                with writer.buf() as data:
+                    data["audio"] = chunk.reshape(-1, speaker_cfg.channels)
+                due += period
+                time.sleep(max(0.0, due - time.monotonic()))
+            if upcoming is not None:
+                pcm = upcoming.result()
 
 
 class LedStatus:
@@ -216,6 +269,7 @@ def run_voice(args, router, transcriber, synthesizer, action_controller) -> None
         trailing_silence_s=args.trailing_silence,
         start_grace_s=args.wake_grace,
         max_utterance_s=args.max_utterance,
+        level_gain=args.mic_gain,
     )
     last_wake_active = False
     pending_wake = False
@@ -286,9 +340,6 @@ def run_voice(args, router, transcriber, synthesizer, action_controller) -> None
                     print(f"[local-assistant] mic frame shape {raw_audio.shape}", flush=True)
                     mic_shape_logged = True
                 audio = raw_audio.reshape(-1).copy()
-                boosted = (
-                    audio.astype(np.float32) * args.mic_gain
-                ).clip(-32768, 32767).astype(np.int16)
                 if pending_wake:
                     # A wake event and mic frame are produced by independent
                     # daemons. Keep the wake latched until a real audio frame
@@ -296,20 +347,23 @@ def run_voice(args, router, transcriber, synthesizer, action_controller) -> None
                     triggered = True
                     pending_wake = False
                 if args.always_listen and not segmenter.recording:
-                    rms = max(
-                        1.0,
-                        float(np.sqrt(np.mean(boosted.astype(np.float64) ** 2))),
+                    triggered = (
+                        segmenter.level_dbfs(audio) >= args.vad_threshold_db
                     )
-                    dbfs = 20.0 * np.log10(rms / 32768.0)
-                    triggered = dbfs >= args.vad_threshold_db
 
-                utterance_audio = segmenter.push(boosted, triggered=triggered)
+                utterance_audio = segmenter.push(audio, triggered=triggered)
                 if utterance_audio is None:
                     continue
                 leds.set("processing")
                 try:
+                    # Normalize instead of clipping, and do not hand whisper
+                    # seconds of room silence it can invent words for.
+                    prepared = condition_utterance(
+                        trim_silence(utterance_audio, mic_cfg.sample_rate),
+                        max_gain=max(1.0, args.mic_gain),
+                    )
                     transcript = transcriber.transcribe(
-                        utterance_audio, mic_cfg.sample_rate
+                        prepared, mic_cfg.sample_rate
                     )
                     if not transcript:
                         print("[local-assistant] No speech recognized")
@@ -366,17 +420,17 @@ def main() -> None:
     parser.add_argument("--mic-gain", type=float, default=3.0)
     parser.add_argument("--volume", type=float, default=1.0)
     parser.add_argument("--vad-threshold-db", type=float, default=-38.0)
-    parser.add_argument("--pre-roll", type=float, default=1.5)
+    parser.add_argument("--pre-roll", type=float, default=1.0)
     parser.add_argument(
         "--trailing-silence",
         type=float,
-        default=1.5,
+        default=0.8,
         help="seconds of silence after speech before submitting the turn",
     )
     parser.add_argument(
         "--wake-grace",
         type=float,
-        default=1.5,
+        default=0.9,
         help="minimum listening time after the wake-word trigger",
     )
     parser.add_argument("--max-utterance", type=float, default=8.0)
@@ -399,6 +453,15 @@ def main() -> None:
         default="/home/bracketbot/.local/share/whisper.cpp/models/ggml-base.en.bin",
     )
     parser.add_argument("--whisper-threads", type=int, default=6)
+    parser.add_argument(
+        "--whisper-server",
+        default=os.environ.get("WHISPER_SERVER_URL", ""),
+        help=(
+            "resident whisper.cpp server URL, e.g. http://127.0.0.1:8910. It "
+            "keeps the model in memory so a turn does not pay to load it; the "
+            "CLI stays the fallback."
+        ),
+    )
     parser.add_argument("--espeak-bin", default="espeak-ng")
     parser.add_argument("--espeak-voice", default="en-us")
     parser.add_argument("--espeak-speed", type=int, default=165)
@@ -455,10 +518,17 @@ def main() -> None:
         reminder_cancel_executor=action_controller.cancel_reminders,
         reminder_list_executor=action_controller.list_reminders,
     )
-    transcriber = WhisperCppTranscriber(
+    cli_transcriber = WhisperCppTranscriber(
         args.whisper_bin,
         args.whisper_model,
         threads=args.whisper_threads,
+    )
+    transcriber = (
+        FallbackTranscriber(
+            WhisperServerTranscriber(args.whisper_server), cli_transcriber
+        )
+        if args.whisper_server
+        else cli_transcriber
     )
     offline_synthesizer = EspeakSynthesizer(
         args.espeak_bin,

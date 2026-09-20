@@ -8,6 +8,7 @@ poses the motion thread is allowed to play.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -21,8 +22,60 @@ UPRIGHT_DEGREES = 25.0
 MIN_VALID_DEPTH_POINTS = 150
 MIN_BLOCKING_POINTS = 60
 HAND_PATH_CLEARANCE_METRES = 0.06
+# The real "the hand will touch this" boundary. Never widened, never narrowed,
+# never profile-dependent: it is geometry, not caution.
 HARD_COLLISION_RADIUS_METRES = 0.035
 MIN_HARD_COLLISION_POINTS = 8
+
+
+@dataclass(frozen=True)
+class ClearanceProfile:
+    """How much padding to keep beyond the hard collision boundary.
+
+    Only the soft margins live here. The upright check and the hard collision
+    radius are hazards rather than caution, so no profile can reach them.
+    """
+
+    name: str
+    hand_path_clearance_m: float
+    min_blocking_points: int
+    min_valid_depth_points: int
+
+    def __post_init__(self):
+        if self.hand_path_clearance_m < HARD_COLLISION_RADIUS_METRES:
+            raise ValueError(
+                f"{self.name}: clearance {self.hand_path_clearance_m} m is inside the "
+                f"hard collision radius {HARD_COLLISION_RADIUS_METRES} m"
+            )
+
+
+# "cautious" is the original behaviour. The looser profiles only shrink padding
+# around the recorded hand path, where the hard collision gate still backstops
+# every decision, so a smaller margin buys willingness and not contact.
+PROFILES = {
+    "cautious": ClearanceProfile("cautious", 0.060, 60, 150),
+    "balanced": ClearanceProfile("balanced", 0.045, 90, 110),
+    "bold": ClearanceProfile("bold", HARD_COLLISION_RADIUS_METRES, 120, 80),
+}
+DEFAULT_PROFILE = "balanced"
+PROFILE_ENV_VAR = "BAYMAX_GESTURE_RISK"
+
+
+def active_profile() -> ClearanceProfile:
+    """The configured profile, falling back to the default when unset or unknown."""
+    requested = os.environ.get(PROFILE_ENV_VAR, "").strip().lower()
+    if not requested:
+        return PROFILES[DEFAULT_PROFILE]
+    profile = PROFILES.get(requested)
+    if profile is None:
+        print(
+            f"[gesture-safety] Unknown {PROFILE_ENV_VAR}={requested!r}; "
+            f"using {DEFAULT_PROFILE}. Choices: {', '.join(sorted(PROFILES))}.",
+            flush=True,
+        )
+        return PROFILES[DEFAULT_PROFILE]
+    return profile
+
 
 # Conservative arm workspace in the base/IK frame: forward, left, height.
 # The middle strip excludes the robot body. Floor points are below this volume.
@@ -101,14 +154,16 @@ def depth_clearance(
     points: object,
     sides: Sequence[str],
     sweep_paths: Mapping[str, object] | None = None,
+    profile: ClearanceProfile | None = None,
 ) -> dict[str, int]:
     """Reject dense geometry in the conservative volume swept by active arms."""
+    profile = profile or active_profile()
     raw = np.asarray(points, dtype=np.float64).reshape(-1, 3)
     finite_camera = raw[np.isfinite(raw).all(axis=1)]
-    if len(finite_camera) < MIN_VALID_DEPTH_POINTS:
+    if len(finite_camera) < profile.min_valid_depth_points:
         raise RuntimeError(
             "surroundings check unavailable: not enough fresh depth points "
-            f"({len(finite_camera)} < {MIN_VALID_DEPTH_POINTS})"
+            f"({len(finite_camera)} < {profile.min_valid_depth_points})"
         )
 
     # camera.points is lateral/right, forward, height. Arm/base coordinates
@@ -132,7 +187,7 @@ def depth_clearance(
             # Follow the actual recorded hand path so a table elsewhere in the
             # arm's large theoretical workspace does not cause a false block.
             minimum_distance_squared = np.full(len(base), np.inf)
-            radius_squared = HAND_PATH_CLEARANCE_METRES**2
+            radius_squared = profile.hand_path_clearance_m**2
             for waypoint in path:
                 minimum_distance_squared = np.minimum(
                     minimum_distance_squared,
@@ -163,7 +218,13 @@ def depth_clearance(
             )
             detail = "broad-workspace fallback"
         counts[side] = count
-        if count >= MIN_BLOCKING_POINTS or (
+        # The soft point budget only loosens where a real hand path exists,
+        # because only there does the hard collision gate below backstop it.
+        # The broad-workspace fallback keeps the original conservative budget.
+        soft_limit = (
+            profile.min_blocking_points if sweep_paths is not None else MIN_BLOCKING_POINTS
+        )
+        if count >= soft_limit or (
             sweep_paths is not None and hard_count >= MIN_HARD_COLLISION_POINTS
         ):
             blocked.append(f"{side} arm ({count} depth points; {detail})")
@@ -180,6 +241,7 @@ def plan_recorded_gesture(
     starts: Mapping[str, object],
     rpy_degrees: object,
     depth_points: object | None,
+    profile: ClearanceProfile | None = None,
 ) -> GesturePlan:
     """Validate observations and make a lift-preserving playback plan."""
     times, poses = trajectory_arrays(frames)
@@ -217,5 +279,9 @@ def plan_recorded_gesture(
         safe_starts[side] = start.copy()
         safe_poses[side] = trajectory
 
-    clearance = depth_clearance(depth_points, sides) if depth_points is not None else {}
+    clearance = (
+        depth_clearance(depth_points, sides, profile=profile)
+        if depth_points is not None
+        else {}
+    )
     return GesturePlan(times, safe_poses, safe_starts, sides, clearance)

@@ -122,6 +122,9 @@ def main():
     p.add_argument("--window", type=float, default=10.0, help="analysis window in seconds")
     p.add_argument("--fs", type=float, default=30.0, help="resample rate in Hz")
     p.add_argument("--model", type=Path, help="face_landmarker.task (default: next to this script)")
+    p.add_argument("--progress-json", action="store_true",
+                   help="stream one compact JSON object per line on stdout (per-second estimates "
+                        "tagged \"progress\", then the final \"result\" line) instead of a human report")
     a = p.parse_args()
 
     model = a.model or next((m for m in (HERE / "face_landmarker.task", DEFAULT_MODEL) if m.exists()), None)
@@ -138,13 +141,23 @@ def main():
             return
 
         def progress(bpm, snr, done):
+            if a.progress_json:
+                # One line per estimate so a caller can speak intermediate readings
+                # while the scan is still running.
+                print(json.dumps({"progress": round(float(done), 3),
+                                  "bpm": None if bpm is None else round(float(bpm), 1),
+                                  "snr_db": None if snr is None else round(float(snr), 1)}),
+                      flush=True)
+                return
             print(f"{done * 100:5.1f}%  bpm={'--' if bpm is None else round(bpm, 1)}  "
                   f"snr={'--' if snr is None else round(snr, 1)} dB", file=sys.stderr, flush=True)
 
         result = measure_heart_rate(duration_s=a.duration, window_s=a.window, fs=a.fs,
                                     model_path=model, on_update=progress, grab=cam.grab)
-        print(json.dumps({"result": result, "fps": round(cam.fps, 1), "frames": cam.frames,
-                          "note": "camera-based demo estimate, not a medical measurement"}, indent=2))
+        report = {"result": result, "fps": round(cam.fps, 1), "frames": cam.frames,
+                  "note": "camera-based demo estimate, not a medical measurement"}
+        # The streaming form must stay one object per line; the human form stays indented.
+        print(json.dumps(report) if a.progress_json else json.dumps(report, indent=2), flush=True)
         sys.exit(0 if result else 1)
 
 

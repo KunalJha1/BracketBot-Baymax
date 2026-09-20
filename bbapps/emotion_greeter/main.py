@@ -488,6 +488,9 @@ class DashboardState:
         self.condition = threading.Condition()
         self.sequence = 0
         self.jpeg: bytes | None = None
+        # Open /stream.mjpg connections; frames are only JPEG-encoded while
+        # somebody is watching.
+        self.viewers = 0
         self.targets: tuple[Detection, ...] = ()
         self.targets_at = 0.0
         self.frame_width = 0
@@ -512,14 +515,23 @@ class DashboardState:
             "scan_fps": 0.0,
         }
 
-    def publish(self, frame: np.ndarray, metrics: dict[str, Any]) -> None:
-        ok, encoded = cv2.imencode(
-            ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82]
-        )
-        if not ok:
-            return
+    def add_viewer(self, delta: int) -> None:
         with self.condition:
-            self.jpeg = encoded.tobytes()
+            self.viewers += delta
+
+    def publish(self, frame: np.ndarray, metrics: dict[str, Any]) -> None:
+        with self.condition:
+            watched = self.viewers > 0
+        jpeg = None
+        if watched:
+            ok, encoded = cv2.imencode(
+                ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82]
+            )
+            if not ok:
+                return
+            jpeg = encoded.tobytes()
+        with self.condition:
+            self.jpeg = jpeg
             self.metrics = {"ready": True, **metrics}
             self.sequence += 1
             self.condition.notify_all()
@@ -841,6 +853,7 @@ def dashboard_handler(
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             sequence = -1
+            state.add_viewer(1)
             try:
                 while True:
                     sequence, jpeg = state.wait_for_frame(sequence)
@@ -856,6 +869,8 @@ def dashboard_handler(
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            finally:
+                state.add_viewer(-1)
 
         def log_message(self, format: str, *args: Any) -> None:
             return

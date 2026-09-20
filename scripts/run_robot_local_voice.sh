@@ -10,6 +10,9 @@ tts_url="http://${proxy_host}:${tts_port}/tts"
 tts_voice="${BAYMAX_TTS_VOICE:-Samantha}"
 tts_rate="${BAYMAX_TTS_RATE:-172}"
 tts_pitch="${BAYMAX_TTS_PITCH:-0}"
+whisper_port="${BAYMAX_WHISPER_PORT:-8910}"
+whisper_home="${WHISPER_CPP_HOME:-/home/bracketbot/.local/share/whisper.cpp}"
+whisper_model_name="${WHISPER_CPP_MODEL_NAME:-base.en}"
 proxy_pid=""
 tts_pid=""
 
@@ -21,7 +24,8 @@ cleanup() {
     kill "$tts_pid" 2>/dev/null || true
   fi
   ssh -o BatchMode=yes "$robot_host" \
-    "pkill -INT -f '[l]ocal_assistant.py' || true" >/dev/null 2>&1 || true
+    "pkill -INT -f '[l]ocal_assistant.py' || true; \
+     pkill -INT -f '[w]hisper-server' || true" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -79,6 +83,10 @@ scp -q \
   bbapps/greeter/gesture_safety.py \
   bbapps/greeter/gesture_runtime.py \
   "$robot_host:/home/bracketbot/bbapps/greeter/"
+# The prepared answers must land beside the greeter modules: the robot has no
+# repository around them, so this is where the router looks for the seed.
+scp -q assets/response-cache-seed.json \
+  "$robot_host:/home/bracketbot/bbapps/greeter/"
 scp -q bbapps/greeter/movements/*.json \
   "$robot_host:/home/bracketbot/bbapps/greeter/movements/"
 scp -q bbapps/mimic/recordings/dance.json \
@@ -114,6 +122,34 @@ if ! ssh -o BatchMode=yes "$robot_host" \
   "cd /home/bracketbot/bbapps/person && env HTTPS_PROXY='$proxy_url' https_proxy='$proxy_url' /home/bracketbot/.local/bin/uv run --quiet person_tracker.py --check-deps"; then
   echo "Person tracker environment did not install; camera actions will use whatever is in view." >&2
 fi
+# Keep the Whisper model resident. The CLI reloads it from disk on every
+# spoken turn, which is fixed latency in front of every single answer. If the
+# server does not come up the assistant simply falls back to the CLI.
+echo "Starting the resident Whisper server on ${robot_host}..."
+whisper_url=""
+if ssh -o BatchMode=yes "$robot_host" \
+  "pkill -INT -f '[w]hisper-server' || true; \
+   [[ -x '$whisper_home/build/bin/whisper-server' ]] && \
+   nohup '$whisper_home/build/bin/whisper-server' \
+     --model '$whisper_home/models/ggml-$whisper_model_name.bin' \
+     --host 127.0.0.1 --port '$whisper_port' --threads 6 \
+     >/tmp/whisper-server.log 2>&1 & \
+   sleep 0.2" >/dev/null 2>&1; then
+  for _ in {1..60}; do
+    if ssh -o BatchMode=yes "$robot_host" \
+      "curl -sf -o /dev/null http://127.0.0.1:${whisper_port}/" >/dev/null 2>&1; then
+      whisper_url="http://127.0.0.1:${whisper_port}"
+      break
+    fi
+    sleep 0.25
+  done
+fi
+if [[ -n "$whisper_url" ]]; then
+  echo "Whisper model is resident on ${whisper_url}; turns skip the model load."
+else
+  echo "Resident Whisper server unavailable; using the whisper CLI per turn." >&2
+fi
+
 echo "Starting Gemini-free voice assistant on ${robot_host}..."
 ssh -tt "$robot_host" \
-  "cd /home/bracketbot/bbapps/greeter && env HTTPS_PROXY='$proxy_url' https_proxy='$proxy_url' LOCAL_TTS_URL='$tts_url' /home/bracketbot/.local/bin/uv run --offline local_assistant.py"
+  "cd /home/bracketbot/bbapps/greeter && env HTTPS_PROXY='$proxy_url' https_proxy='$proxy_url' LOCAL_TTS_URL='$tts_url' WHISPER_SERVER_URL='$whisper_url' /home/bracketbot/.local/bin/uv run --offline local_assistant.py"

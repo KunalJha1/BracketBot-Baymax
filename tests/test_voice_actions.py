@@ -140,17 +140,21 @@ def test_stop_clears_active_led_effect(tmp_path, monkeypatch):
 class FakeScanner:
     installed = True
 
-    def __init__(self, result=None, error=None, block=False):
+    def __init__(self, result=None, error=None, block=False, ticks=()):
         self.result = result
         self.error = error
         self.block = block
+        self.ticks = list(ticks)
         self.calls = 0
 
-    def scan(self, cancel):
+    def scan(self, cancel, on_tick=None):
         self.calls += 1
         if self.block:
             cancel.wait(2.0)
             return None
+        if on_tick is not None:
+            for index, bpm in enumerate(self.ticks):
+                on_tick(bpm, (index + 1) / (len(self.ticks) or 1))
         if self.error:
             raise self.error
         return self.result
@@ -409,3 +413,46 @@ def test_non_person_gestures_do_not_search(tmp_path):
     assert finder.purposes == []
     controller.stop()
     wait_for_controller(controller)
+
+
+def test_scan_speaks_spaced_ticks_and_caps_how_many(tmp_path, monkeypatch):
+    # Every estimate reaches the controller; only a few become speech.
+    monkeypatch.setattr(voice_actions, "TICK_SPACING_S", 0.0)
+    announced = []
+    scanner = FakeScanner(
+        {"bpm": 74.0, "confident": True},
+        ticks=[None, 70.4, 71.6, 72.0, 73.2, 74.4, 75.0],
+    )
+    controller = voice_actions.VoiceActionController(
+        FakeGestureController(), tmp_path, heart_rate_scanner=scanner
+    )
+    controller.bind(FakeSpeaker(), SimpleNamespace(), FakeLeds(), announce=announced.append)
+    assert controller.start("heart-rate")[0] is True
+    wait_for_controller(controller, timeout=2.0)
+
+    ticks = announced[:-1]
+    assert len(ticks) == voice_actions.SPOKEN_TICKS
+    # The None estimate is skipped, so the first spoken tick is the first lock.
+    assert ticks[0] == "I'm reading about 70 beats per minute."
+    assert ticks[1:] == ["About 72.", "About 72.", "About 73."]
+    assert announced[-1].startswith("Your heart rate looks like about 74")
+
+
+def test_ticks_are_throttled_so_speech_cannot_pile_up(tmp_path):
+    announced = []
+    scanner = FakeScanner(
+        {"bpm": 80.0, "confident": True}, ticks=[80.0, 80.5, 81.0]
+    )
+    controller = voice_actions.VoiceActionController(
+        FakeGestureController(), tmp_path, heart_rate_scanner=scanner
+    )
+    controller.bind(FakeSpeaker(), SimpleNamespace(), FakeLeds(), announce=announced.append)
+    assert controller.start("heart-rate")[0] is True
+    wait_for_controller(controller, timeout=2.0)
+
+    # The ticks arrive back to back, so the spacing gate allows only the first.
+    assert announced == [
+        "I'm reading about 80 beats per minute.",
+        "Your heart rate looks like about 80 beats per minute. "
+        "This is a camera estimate, not a medical measurement.",
+    ]
