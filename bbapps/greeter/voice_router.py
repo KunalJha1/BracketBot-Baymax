@@ -572,6 +572,26 @@ def authorize_gesture_tool(utterance: str, gesture: str) -> tuple[bool, str]:
     return True, "The finalized transcript explicitly requests this gesture."
 
 
+def match_explicit_gesture_request(text: str) -> str | None:
+    """Resolve one safe, explicit gesture request without a model round trip.
+
+    ``match_action`` intentionally covers a small exact-phrase allowlist.  The
+    model tool gate already understands slightly more natural commands while
+    rejecting questions, negation, and ambiguous multi-gesture requests.  Use
+    that same deterministic gate for routing so phrases such as "could you do
+    a friendly wave" start locally instead of paying network latency.
+    """
+    direct = match_action(text)
+    if direct in GESTURE_NAMES:
+        return direct
+    matches = [
+        gesture
+        for gesture in GESTURE_NAMES
+        if authorize_gesture_tool(text, gesture)[0]
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def utterances_match(transcript: str, claimed: str) -> bool:
     """Verify a model tool argument against finalized speech transcription."""
     normalized_transcript = normalize_utterance(transcript)
@@ -1506,7 +1526,11 @@ class VoiceRouter:
                 action_started=started,
             )
 
-        action = match_action(utterance) or match_health_request(utterance)
+        action = (
+            match_action(utterance)
+            or match_explicit_gesture_request(utterance)
+            or match_health_request(utterance)
+        )
         if action:
             started, status = self._execute(action)
             return RouteDecision(

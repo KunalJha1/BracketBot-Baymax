@@ -155,3 +155,9 @@ def test_cancel_stops_the_search():
     cancel.set()
     with pytest.raises(pt.Cancelled):
         pt.Tracker(FakeRobot(person_yaw=None)).acquire("scan", None, cancel)
+
+
+def test_reads_the_raw_head_topic_the_camera_daemon_publishes():
+    # The daemon publishes camera.head.rgb and camera.head.jpeg; a bare
+    # "camera.head" reader never becomes ready, so every search finds nobody.
+    assert pt.CAMERA_TOPIC == "camera.head.rgb"

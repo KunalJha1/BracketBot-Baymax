@@ -647,7 +647,7 @@ def detector_loop():
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
 
-        cam = Reader("camera.head", keeptime=False)
+        cam = Reader("camera.head.rgb", keeptime=False)
         cam.__enter__()
         time.sleep(0.5)
 

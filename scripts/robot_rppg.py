@@ -40,7 +40,7 @@ sys.path.insert(0, str(HERE.parent))  # rppg.py at the repo root when run from a
 
 from rppg import DEFAULT_MODEL, FaceROI, measure_heart_rate  # noqa: E402
 
-RAW_TOPIC = "camera.head"        # raw RGB: no JPEG blocking on a ~0.1-1 % pulse signal
+RAW_TOPIC = "camera.head.rgb"    # raw RGB: no JPEG blocking on a ~0.1-1 % pulse signal
 JPEG_TOPIC = "camera.head.jpeg"
 
 

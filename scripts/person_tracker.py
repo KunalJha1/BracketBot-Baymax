@@ -54,7 +54,7 @@ from camera_geometry import (  # noqa: E402
     fisheye_pixel_to_ray,
 )
 
-CAMERA_TOPIC = "camera.head"      # raw 2560x960 stereo, left eye is the first half
+CAMERA_TOPIC = "camera.head.rgb"    # raw 2560x960 stereo, left eye is the first half
 FACE_MODEL = "face_detection_yunet_2026may.onnx"
 FACE_SCORE = 0.75
 FACE_WIDTH_M = 0.16               # typical adult face width for a rough range
