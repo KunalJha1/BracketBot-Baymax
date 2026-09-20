@@ -35,6 +35,9 @@ class Scenario:
     obstacle: callable = lambda t: None  # t -> (x, y) of a 0.3 m box in the world, or None
     heartbeat_until: float = math.inf
     seed: int = 0
+    appearance: bool = False
+    frame_period: float = FRAME_EVERY
+    latency: float = LATENCY
 
 
 @dataclass
@@ -74,24 +77,25 @@ def run(scenario, cfg=CFG, gap=1.0):
     for i in range(steps):
         t = i * DT
         if t >= next_frame:
-            next_frame += FRAME_EVERY
+            next_frame += scenario.frame_period
             capture_t = t
             people = []
             actors = [(scenario.target, scenario.visible(t))]
             if scenario.bystander is not None:
                 actors.append((scenario.bystander, True))
-            for path, visible in actors:
+            for actor_id, (path, visible) in enumerate(actors):
                 if not visible:
                     continue
                 f, l = robot.to_local(*path(t))
                 r = math.hypot(f, l) + rng.normal(0, 0.025)
                 b = math.atan2(l, f) + rng.normal(0, math.radians(1.0))
-                people.append(PersonObservation(r * math.cos(b), r * math.sin(b)))
+                hist = np.eye(64)[actor_id] if scenario.appearance else None
+                people.append(PersonObservation(r * math.cos(b), r * math.sin(b), hist=hist))
             points = np.empty((0, 3))
             box = scenario.obstacle(t)
             if box is not None:
                 points = box_points(robot.to_local(*box))
-            pending.append((capture_t + LATENCY, Perception(capture_t, tuple(people), points)))
+            pending.append((capture_t + scenario.latency, Perception(capture_t, tuple(people), points)))
         frame = None
         if pending and pending[0][0] <= t + 1e-9:
             frame = pending.pop(0)[1]
@@ -152,16 +156,14 @@ def test_fast_walk_opens_the_gap_then_recovers_when_the_person_stops():
     assert fraction_in_band(result.samples(16.0)) == 1.0
 
 
-def test_side_step_turns_in_place_then_recentres():
+def test_one_metre_position_jump_without_identity_does_not_redirect_the_robot():
     def path(t):
         return (1.0, 0.0) if t < 3.0 else (1.0, 1.0)
 
     result = run(Scenario(path, duration=10.0))
     after = result.samples(3.1, 10.0)
-    wide = [o for _, _, b, o in after if o.bearing is not None and abs(o.bearing) > CFG.turn_in_place_bearing]
-    assert wide, "the side-step should produce a wide bearing"
-    assert all(o.v_cmd == 0.0 for o in wide)
-    assert all(abs(b) < math.radians(5) for _, _, b, _ in result.samples(8.0, 10.0))
+    assert result.out[-1].state == LOST
+    assert all(o.v == o.omega == 0 for *_, o in result.samples(5, 10))
 
 
 def test_person_approaching_never_makes_the_robot_reverse():
@@ -174,7 +176,7 @@ def test_person_approaching_never_makes_the_robot_reverse():
 
 
 def test_occlusion_stops_goes_lost_and_recovers():
-    result = run(Scenario(walking_away(0.15), duration=14.0, visible=lambda t: not 5.0 <= t < 7.0))
+    result = run(Scenario(walking_away(0.15), duration=14.0, visible=lambda t: not 5.0 <= t < 7.0, appearance=True))
     during = result.samples(5.8, 7.0)
     assert any(o.state == LOST for *_, o in during)
     assert all(o.v == 0.0 for *_, o in result.samples(6.2, 7.0))

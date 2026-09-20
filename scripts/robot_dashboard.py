@@ -1470,6 +1470,7 @@ class RobotController:
                     "blocked": False,
                     "age_ms": None if searching else 60,
                     "rule": "no-track" if searching else "ok",
+                    "association": "searching" if searching else "updated",
                 }
                 with self.state.lock:
                     self.state.follow_status = status
@@ -1784,6 +1785,10 @@ function followText(c) {
   const s=c.follow_status;
   if(!s) return `Follow: ${c.follow_phase}`;
   if(s.state==='SEARCHING') return 'Follow: stand in front of the robot';
+  if(s.association==='restart-required'||s.association==='identity-required')
+    return 'Follow: target uncertain — stop and restart Follow with only your person in front';
+  if(s.association==='ambiguous'||s.association==='confirming')
+    return 'Follow: paused — confirming the same person';
   const range=s.range==null?'—':`${s.range.toFixed(2)} m`;
   const err=s.error==null?'':` · ${s.error>=0?'+':''}${Math.round(s.error*100)} cm from target`;
   return `Follow: ${s.state.toLowerCase()} · ${range}${err}`;
