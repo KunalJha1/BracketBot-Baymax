@@ -122,9 +122,10 @@ an operator at the physical e-stop, and no autonomous navigation:
 5. Test the full stop path with wheels lifted or in a cleared test area: inject
    a synthetic confirmed alert, verify `drive.ctrl` becomes zero, verify the
    route is cancelled, and verify clearing does not auto-resume.
-6. Only then run a slow, supervised approach-to-standoff trial. A future
-   approach action must target a collision-checked standoff pose, never the
-   person's map cell.
+6. Only then run a slow, supervised approach-to-standoff trial. The explicit
+   dashboard [ground check-in](ground-check-in.md) uses a local depth corridor
+   and stops outside the observed body envelope. It does not navigate to the
+   person's map cell or bypass the navigator's stop interlock.
 
 Until that dataset and stop-path test pass, this is a working prototype and
 operator aid—not a certified safety system.

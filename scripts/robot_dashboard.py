@@ -48,7 +48,8 @@ REMOTE_DEMO_ARM_RESERVATION = "/tmp/bracketbot-demo-arm-reserved"
 FOLLOW_RUNNER = ROOT / "scripts" / "robot_follow.py"
 FOLLOW_MODULES = tuple(ROOT / "scripts" / name for name in (
     "follow_core.py", "follow_perception.py", "follow_calibration.py",
-))
+    "ground_approach.py", "ground_speech.py",
+)) + (ROOT / "bbapps" / "greeter" / "local_voice.py",)
 REMOTE_FOLLOW_RUNNER = "/tmp/robot_follow.py"
 # Must match follow_core (FollowConfig gap bounds and STATUS_PREFIX); a test checks this.
 FOLLOW_GAP_MIN = 0.6
@@ -373,6 +374,7 @@ class DashboardState:
         self.follow_requested = False
         self.follow_transition = False
         self.follow_phase = "Follow off"
+        self.follow_mode = "follow"
         self.follow_status = None
         self.follow_gap = FOLLOW_GAP_DEFAULT
         self.follow_process = None
@@ -435,6 +437,7 @@ class DashboardState:
                 "follow_enabled": self.follow_enabled,
                 "follow_transition": self.follow_transition,
                 "follow_phase": self.follow_phase,
+                "follow_mode": self.follow_mode,
                 "follow_status": self.follow_status,
                 "follow_gap": self.follow_gap,
                 "follow_gap_min": FOLLOW_GAP_MIN,
@@ -1294,9 +1297,11 @@ class RobotController:
 
         threading.Thread(target=request_stop, name=thread_name, daemon=True).start()
 
-    def set_follow(self, enabled):
+    def set_follow(self, enabled, mode="follow"):
         if not isinstance(enabled, bool):
             return False, "enabled must be true or false"
+        if mode not in ("follow", "ground"):
+            return False, "mode must be follow or ground"
         with self.state.lock:
             state = self.state
             if state.host is None:
@@ -1306,6 +1311,8 @@ class RobotController:
             if enabled == state.follow_enabled:
                 return False, "Follow is already on" if enabled else "Follow is already off"
             if enabled:
+                if state.demo_active:
+                    return False, "Stop the demo before moving the base"
                 if state.running:
                     return False, f"{state.action} is running; stop it first"
                 if state.lean_enabled or state.lean_requested or state.lean_transition:
@@ -1316,8 +1323,9 @@ class RobotController:
                 state.follow_requested = True
                 state.follow_transition = True
                 state.follow_status = None
+                state.follow_mode = mode
                 state.error = None
-                state.follow_phase = "Starting follow…"
+                state.follow_phase = "Starting ground check-in…" if mode == "ground" else "Starting follow…"
                 host = state.host
         if not enabled:
             self._stop_follow()
@@ -1334,6 +1342,8 @@ class RobotController:
         if not FOLLOW_GAP_MIN <= gap <= FOLLOW_GAP_MAX:
             return False, f"gap must be between {FOLLOW_GAP_MIN} and {FOLLOW_GAP_MAX} m"
         with self.state.lock:
+            if self.state.follow_active() and self.state.follow_mode == "ground":
+                return False, "Ground check-in uses a fixed 1.0 m body standoff"
             self.state.follow_gap = round(float(gap), 2)
             gap = self.state.follow_gap
         self._send_follow({"type": "gap", "m": gap})
@@ -1380,6 +1390,7 @@ class RobotController:
 
     def _run_follow(self, host, pid_file):
         return_code = None
+        ground_complete = False
         process = None
         heartbeat_running = threading.Event()
         try:
@@ -1388,8 +1399,10 @@ class RobotController:
                 if not self.state.follow_requested:
                     return
                 gap = self.state.follow_gap
+                ground_mode = self.state.follow_mode == "ground"
+            extra_args = ("--ground-approach",) if ground_mode else ()
             remote_command = remote_python_command(
-                REMOTE_FOLLOW_RUNNER, "--gap", f"{gap:.2f}", "--pid-file", pid_file, *self.follow_args
+                REMOTE_FOLLOW_RUNNER, "--gap", f"{gap:.2f}", "--pid-file", pid_file, *self.follow_args, *extra_args
             )
             process = subprocess.Popen(
                 ["ssh", *SSH_OPTIONS, host, remote_command],
@@ -1415,6 +1428,8 @@ class RobotController:
             assert process.stdout is not None
             for line in process.stdout:
                 self.state.add_follow_log(line)
+                if line.strip() == "[follow] ground approach complete":
+                    ground_complete = True
                 if "follow active" in line:
                     with self.state.lock:
                         if self.state.follow_requested:
@@ -1431,7 +1446,8 @@ class RobotController:
                 process.terminate()
             with self.state.lock:
                 state = self.state
-                unexpected = state.follow_requested
+                completed = state.follow_mode == "ground" and return_code == 0 and ground_complete
+                unexpected = state.follow_requested and not completed
                 if unexpected and state.error is None:
                     state.error = f"Follow stopped (status {return_code}): {state.follow_phase}"
                 state.follow_enabled = False
@@ -1440,10 +1456,11 @@ class RobotController:
                 state.follow_process = None
                 state.follow_pid_file = None
                 state.follow_status = None
-                state.follow_phase = "Follow stopped unexpectedly" if unexpected else "Follow off"
+                state.follow_phase = "Check-in complete" if completed else "Follow stopped unexpectedly" if unexpected else "Follow off"
 
     def _simulate_follow(self, host, pid_file):
         started = time.monotonic()
+        completed = False
         simulated_range = 1.6
         with self.state.lock:
             self.state.follow_enabled = True
@@ -1456,6 +1473,9 @@ class RobotController:
                     if not self.state.follow_requested:
                         return
                     gap = self.state.follow_gap
+                    ground_mode = self.state.follow_mode == "ground"
+                    if ground_mode:
+                        gap = 1.0
                 searching = time.monotonic() - started < 1.0
                 if not searching:
                     simulated_range += (gap - simulated_range) * 0.1
@@ -1471,6 +1491,14 @@ class RobotController:
                     "age_ms": None if searching else 60,
                     "rule": "no-track" if searching else "ok",
                 }
+                if ground_mode:
+                    arrived = time.monotonic() - started >= 3.0
+                    status["state"] = "WAITING" if searching else "ARRIVED" if arrived else "APPROACHING"
+                    if arrived:
+                        from ground_approach import GROUND_LINE
+                        self.state.add_follow_log(f"simulated check-in: {GROUND_LINE}")
+                        completed = True
+                        return
                 with self.state.lock:
                     self.state.follow_status = status
                 time.sleep(0.05)
@@ -1481,7 +1509,7 @@ class RobotController:
                 self.state.follow_transition = False
                 self.state.follow_status = None
                 self.state.follow_pid_file = None
-                self.state.follow_phase = "Follow off"
+                self.state.follow_phase = "Check-in complete" if completed else "Follow off"
                 self.state.log.append("[follow] simulated follow stopped")
 
     def stop(self):
@@ -1760,6 +1788,7 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:560px; overflow:a
   <div class="controls">
     <button id="reconnect" class="secondary">Reconnect</button>
     <button id="follow" class="secondary" aria-pressed="false"><span class="key">F</span>Follow me</button>
+    <button id="ground-check-in" class="secondary" aria-pressed="false" title="Approach slowly, stop 1 m outside the body, and ask if they need help">Check on person</button>
     <button id="stop" class="stop" disabled><span class="key">Esc</span>Stop action</button>
   </div>
   <div class="follow-gap">
@@ -1777,9 +1806,18 @@ const lean=document.getElementById('lean'), baseDetail=document.getElementById('
 const tableRest=document.getElementById('table-rest');
 const latencyDetail=document.getElementById('latency-detail');
 const follow=document.getElementById('follow'), followDetail=document.getElementById('follow-detail');
+const groundCheckIn=document.getElementById('ground-check-in');
 const gap=document.getElementById('gap'), gapValue=document.getElementById('gap-value');
 let gapDragging=false;
 function followText(c) {
+  if(c.follow_mode==='ground') {
+    if(!c.follow_enabled&&!c.follow_transition) return `Check-in: ${c.follow_phase==='Check-in complete'?'complete':'off'}`;
+    const s=c.follow_status;
+    if(!s) return `Check-in: ${c.follow_phase}`;
+    if(s.state==='WAITING') return 'Check-in: waiting for one clearly visible person on the ground';
+    if(s.state==='ARRIVED') return 'Check-in: stopped beside the person';
+    return `Check-in: ${s.state.toLowerCase()} · ${s.range==null?'—':s.range.toFixed(2)+' m from body'} · max 5 cm/s`;
+  }
   if(!c.follow_enabled&&!c.follow_transition) return 'Follow: off';
   const s=c.follow_status;
   if(!s) return `Follow: ${c.follow_phase}`;
@@ -1901,6 +1939,13 @@ async function refresh() {
     follow.className='secondary '+(current.follow_enabled?'lean-active':'');
     follow.setAttribute('aria-pressed',String(current.follow_enabled));
     follow.innerHTML=`<span class="key">F</span>${current.follow_transition?'Changing follow…':current.follow_enabled?'Stop following':'Follow me'}`;
+    const groundOn=followOn&&current.follow_mode==='ground';
+    if(groundOn) { follow.disabled=true; follow.className='secondary'; follow.setAttribute('aria-pressed','false'); follow.innerHTML='<span class="key">F</span>Follow me'; }
+    groundCheckIn.disabled=!current.connected||current.follow_transition||demoOn||current.running||current.lean_enabled||current.lean_transition||(followOn&&!groundOn);
+    groundCheckIn.className='secondary '+(groundOn?'lean-active':'');
+    groundCheckIn.setAttribute('aria-pressed',String(groundOn));
+    groundCheckIn.textContent=groundOn?'Stop check-in':'Check on person';
+    gap.disabled=groundOn;
     followDetail.textContent=followText(current);
     gap.min=current.follow_gap_min; gap.max=current.follow_gap_max;
     if(!gapDragging){ gap.value=current.follow_gap; gapValue.textContent=`${Number(current.follow_gap).toFixed(1)} m`; }
@@ -1952,6 +1997,7 @@ demoComplete.addEventListener('click',()=>post('/api/demo/complete').then(refres
 lean.addEventListener('click',()=>post('/api/lean',{enabled:!current.lean_enabled}).then(refresh));
 tableRest.addEventListener('click',()=>post('/api/run',{action:'table-rest'}).then(refresh));
 follow.addEventListener('click',()=>post('/api/follow',{enabled:!current.follow_enabled}).then(refresh));
+groundCheckIn.addEventListener('click',()=>post('/api/follow',{enabled:!current.follow_enabled,mode:'ground'}).then(refresh));
 gap.addEventListener('input',()=>{ gapDragging=true; gapValue.textContent=`${Number(gap.value).toFixed(1)} m`; });
 gap.addEventListener('change',()=>{ gapDragging=false; post('/api/follow/gap',{gap:Number(gap.value)}).then(refresh); });
 stop.addEventListener('click',()=>{
@@ -2042,7 +2088,8 @@ class Handler(BaseHTTPRequestHandler):
             ok, message = self.controller.confirm_demo_packed()
             self._send({"ok": ok, "message": message}, HTTPStatus.ACCEPTED if ok else HTTPStatus.CONFLICT)
         elif self.path == "/api/follow":
-            ok, message = self.controller.set_follow(self._json_body().get("enabled"))
+            body = self._json_body()
+            ok, message = self.controller.set_follow(body.get("enabled"), body.get("mode", "follow"))
             self._send({"ok": ok, "message": message}, HTTPStatus.ACCEPTED if ok else HTTPStatus.CONFLICT)
         elif self.path == "/api/follow/gap":
             ok, message = self.controller.set_follow_gap(self._json_body().get("gap"))

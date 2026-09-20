@@ -664,6 +664,62 @@ def test_follow_gap_validation():
     assert controller.state.snapshot()["follow_gap"] == 1.25
 
 
+def test_ground_check_in_excludes_other_motion_and_has_fixed_standoff():
+    controller = RobotController(("not-used",), simulate=True)
+    assert controller.set_follow(True, mode="bad")[0] is False
+    assert controller.set_follow(True, mode="ground")[0] is True
+    try:
+        wait_for(lambda: controller.state.snapshot()["follow_enabled"])
+        assert controller.state.snapshot()["follow_mode"] == "ground"
+        assert controller.set_follow_gap(0.6)[0] is False
+        assert controller.set_follow(True)[0] is False
+        assert controller.set_lean(True)[0] is False
+        assert controller.run_action("wave")[0] is False
+    finally:
+        controller.stop()
+        wait_for(lambda: follow_off(controller))
+
+
+def test_ground_check_in_simulates_a_single_spoken_line():
+    controller = RobotController(("not-used",), simulate=True)
+    controller.set_follow(True, mode="ground")
+    wait_for(lambda: follow_off(controller))
+    state = controller.state.snapshot()
+    assert state["follow_phase"] == "Check-in complete"
+    assert sum("hello specimen, are you in trouble" in line for line in state["log"]) == 1
+    assert state["error"] is None
+
+
+def test_ground_completion_is_not_reported_as_a_crash_after_cleanup(monkeypatch):
+    class CompletedProcess:
+        stdin = None
+        stdout = iter(["[follow] follow active (ground approach)\n",
+                       "[follow] ground approach complete\n",
+                       "[follow] stopped; zero twist sent\n"])
+
+        def poll(self):
+            return 0
+
+        def wait(self):
+            return 0
+
+    calls = []
+
+    def popen(command, **_kwargs):
+        calls.append(command)
+        return CompletedProcess()
+
+    controller = RobotController(("bot",), follow_args=("--v-max", "0.3"))
+    controller.state.host = "bot"
+    monkeypatch.setattr(controller, "_deploy", lambda *_args: None)
+    monkeypatch.setattr("scripts.robot_dashboard.subprocess.Popen", popen)
+    controller.set_follow(True, mode="ground")
+    wait_for(lambda: follow_off(controller))
+    assert "--ground-approach" in calls[0][-1]
+    assert controller.state.snapshot()["follow_phase"] == "Check-in complete"
+    assert controller.state.snapshot()["error"] is None
+
+
 def test_action_bundle_ships_the_follow_runner_and_its_modules():
     bundle = action_bundle_paths()
     assert FOLLOW_RUNNER in bundle

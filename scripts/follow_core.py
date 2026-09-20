@@ -405,14 +405,17 @@ class CorridorGuard:
 class OdometryCheck:
     """Trips when wheel feedback keeps moving opposite to what was sent (a sign bug)."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, *, v_sent_min=0.05, v_measured_min=0.03,
+                 omega_sent_min=0.2, omega_measured_min=0.1):
         self.cfg = cfg
         self._since = None
+        self.v_sent_min, self.v_measured_min = v_sent_min, v_measured_min
+        self.omega_sent_min, self.omega_measured_min = omega_sent_min, omega_measured_min
 
     def update(self, t, v_sent, omega_sent, v_meas, omega_meas):
         wrong = (
-            (abs(v_sent) >= 0.05 and abs(v_meas) >= 0.03 and v_meas * v_sent < 0)
-            or (abs(omega_sent) >= 0.2 and abs(omega_meas) >= 0.1 and omega_meas * omega_sent < 0)
+            (abs(v_sent) >= self.v_sent_min and abs(v_meas) >= self.v_measured_min and v_meas * v_sent < 0)
+            or (abs(omega_sent) >= self.omega_sent_min and abs(omega_meas) >= self.omega_measured_min and omega_meas * omega_sent < 0)
         )
         if not wrong:
             self._since = None

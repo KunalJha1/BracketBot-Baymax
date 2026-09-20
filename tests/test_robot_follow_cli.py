@@ -88,3 +88,78 @@ def test_other_drive_writers_ignores_self_and_parent_pids(monkeypatch):
 
     assert len(found) == 1
     assert str(other_pid) in found[0]
+
+
+def test_ground_mode_is_capped_independently_of_follow_speed():
+    args = robot_follow.parse_args(["--ground-approach", "--v-max", "0.3"])
+    assert robot_follow.loop_config(args).v_max == 0.05
+    assert robot_follow.loop_config(robot_follow.parse_args(["--ground-approach", "--rotate-only"])).v_max == 0
+
+
+@pytest.mark.parametrize("age,count,valid", [(0.1, 200, True), (2, 200, False), (-1, 200, False), (0.1, 0, False)])
+def test_ground_depth_checks_capture_time_and_coverage(age, count, valid):
+    data = {"timestamp": np.datetime64(int((100 - age) * 1e9), "ns"), "num_points": count,
+            "points": np.tile([0, 3, 0], (count, 1))}
+    result = robot_follow.ground_perception(data, 10, 100, robot_follow.Calibration())
+    assert (result is not None) == valid
+    if valid:
+        assert result.t == pytest.approx(9.9)
+
+
+def test_old_vision_service_refused_before_motion(tmp_path):
+    path = tmp_path / "ground.json"
+    path.write_text('{"schema_version":1,"status":"alert"}')
+    with pytest.raises(RuntimeError, match="deploy the updated emotion_greeter"):
+        robot_follow.check_ground_service(path)
+
+
+@pytest.mark.parametrize("arrive", [True, False])
+def test_ground_runner_holds_zero_while_speaking_and_stops_on_signal(tmp_path, monkeypatch, arrive):
+    import threading
+    from ground_approach import GroundTarget
+
+    clock = [0.0]
+    monkeypatch.setattr(robot_follow.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(robot_follow.time, "time", lambda: 100 + clock[0])
+
+    def sleep(seconds):
+        clock[0] += max(0.02, seconds)
+        if not arrive and clock[0] > 1:
+            robot_follow.STOP_REQUESTED = True
+        assert clock[0] < 3, "runner did not terminate"
+
+    monkeypatch.setattr(robot_follow.time, "sleep", sleep)
+    monkeypatch.setattr(robot_follow, "STOP_REQUESTED", False)
+    monkeypatch.setattr(robot_follow, "read_ground_target", lambda *_: GroundTarget(
+        "test", 1, 100 + clock[0], 1.8 if arrive else 3, 0, 0.8))
+    writes = []
+    monkeypatch.setattr(robot_follow, "write_twist", lambda _writer, v, w: writes.append((v, w)))
+    monkeypatch.setattr(robot_follow, "write_led", lambda *_: None)
+
+    class Reader:
+        data = {"rpy": np.zeros(3), "vel": np.zeros(2), "num_points": 200,
+                "points": np.tile([0, 3, 0], (200, 1))}
+
+        def ready(self):
+            self.data["timestamp"] = np.datetime64(int((100 + clock[0]) * 1e9), "ns")
+            return True
+
+    class Speech:
+        done = threading.Event()
+        error = None
+        calls = 0
+
+        def start(self):
+            assert writes[-1] == (0, 0)
+            assert clock[0] >= 0.6
+            self.calls += 1
+            self.done.set()
+
+    args = robot_follow.parse_args(["--ground-approach", "--dry-run", "--no-heartbeat", "--log-dir", str(tmp_path)])
+    speech = Speech()
+    robot_follow.control_loop(args, robot_follow.loop_config(args), [Reader(), Reader(), Reader()],
+                              object(), object(), 0.2, 0.3, speech=speech)
+    assert speech.calls == int(arrive)
+    assert writes[-1] == (0, 0)
+    if not arrive:
+        assert any(v > 0 for v, _ in writes)

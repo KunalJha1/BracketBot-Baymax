@@ -36,6 +36,7 @@ from follow_core import (
 )
 from follow_calibration import Calibration, DEFAULT_PATH, load_calibration
 from follow_perception import ClusterConfig, base_to_local, find_people, without_self
+from ground_approach import GroundApproachLoop, GROUND_LINE, approach_config, target_from_payload
 
 PERIOD = 0.02  # 50 Hz control loop; drive.ctrl times out after 0.1 s
 STATUS_PERIOD = 0.2
@@ -64,6 +65,10 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Follow one person at a held distance")
     parser.add_argument("--gap", type=float, default=cfg.gap_default)
     parser.add_argument("--v-max", type=float, default=cfg.v_max)
+    parser.add_argument("--ground-approach", action="store_true",
+                        help="approach one confirmed ground pose at <=0.05 m/s and speak once")
+    parser.add_argument("--ground-alert-file", type=Path,
+                        default=Path("/tmp/bracketbot_ground_alert.json"))
     parser.add_argument("--pid-file", type=Path)
     parser.add_argument("--log-dir", type=Path, default=Path("/tmp"))
     mode = parser.add_mutually_exclusive_group()
@@ -91,7 +96,29 @@ def parse_args(argv=None):
 
 
 def loop_config(args):
+    if args.ground_approach:
+        return approach_config(0.0 if args.rotate_only else args.v_max)
     return replace(FollowConfig(), v_max=0.0 if args.rotate_only else args.v_max)
+
+
+def read_ground_target(path, wall_now, calibration):
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return target_from_payload(payload, wall_now, calibration.left_sign)
+
+
+def check_ground_service(path):
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (payload.get("approach_schema_version") == 1
+                and 0 <= time.time() - payload["published_at"] <= 2.0):
+            return
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        pass
+    raise RuntimeError("Ground observations unavailable: deploy the updated emotion_greeter main.py "
+                       "and ground_safety.py, then start vision before the ground check-in")
 
 
 def wait_fresh(reader, timeout, topic):
@@ -134,6 +161,21 @@ def cloud(data):
     if not np.isfinite(points).all():
         raise RuntimeError("non-finite camera.points; check the depth daemon")
     return points
+
+
+def ground_perception(data, t, wall_now, calibration):
+    """Use capture time, not read time, to reject frozen or delayed depth."""
+    try:
+        captured = int(np.datetime64(data["timestamp"], "ns").astype(np.int64)) / 1e9
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    age = wall_now - captured
+    if not 0 <= age <= approach_config().points_stale:
+        return None
+    local = without_self(base_to_local(cloud(data), calibration.left_sign), calibration.self_mask)
+    if len(local) < 100:
+        return None
+    return Perception(t - age, (), local)
 
 
 def state_vector(data, field, size, topic):
@@ -187,10 +229,10 @@ def run_check(reader_cls, seconds=3.0, calibration=None):
             time.sleep(0.05)
 
 
-def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width, calibration=None):
+def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width, calibration=None, speech=None):
     points, imu, drive_state = readers
     calibration = calibration or Calibration()
-    loop = FollowLoop(cfg, args.gap)
+    loop = GroundApproachLoop(cfg) if args.ground_approach else FollowLoop(cfg, args.gap)
     commands = queue.Queue()
     if not args.no_heartbeat:
         start_command_reader(commands)
@@ -240,7 +282,10 @@ def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width, calibr
             perception = perception_ms = None
             if points.ready():
                 perception_started = time.monotonic()
-                perception = perceive(cloud(points.data), t, calibration=calibration)
+                if args.ground_approach:
+                    perception = ground_perception(points.data, t, time.time(), calibration)
+                else:
+                    perception = perceive(cloud(points.data), t, calibration=calibration)
                 perception_ms = (time.monotonic() - perception_started) * 1000.0
 
             # Include perception work in freshness and heartbeat checks.
@@ -248,18 +293,36 @@ def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width, calibr
             if t - last_imu > STATE_TIMEOUT or t - last_drive > STATE_TIMEOUT:
                 raise RuntimeError("stale imu.orientation or drive.state; stopping follow")
 
-            out = loop.tick(TickInputs(
+            inputs = TickInputs(
                 t=t, heartbeat_age=t - last_heartbeat,
                 stop_requested=STOP_REQUESTED or command_stop,
                 roll_deg=float(rpy[0]), pitch_deg=float(rpy[1]),
                 measured_v=measured[0], measured_omega=measured[1], perception=perception,
-            ))
+            )
+            if args.ground_approach:
+                wall_now = time.time()
+                loop.observe(read_ground_target(args.ground_alert_file, wall_now, calibration))
+                out = loop.tick(inputs, wall_now)
+            else:
+                out = loop.tick(inputs)
             if drive is not None:
                 write_twist(drive, *clamped_twist(out, cfg))
             if out.state != state:
                 print(f"[follow] state {out.state}", flush=True)
                 state, state_since = out.state, t
-            write_led(led, led_color(out.state, t - state_since))
+            led_state = {"WAITING": "SEARCHING", "APPROACHING": "FOLLOWING", "ARRIVED": "FOLLOWING"}.get(out.state, out.state)
+            write_led(led, led_color(led_state, t - state_since))
+            if args.ground_approach and loop.arrived and not out.exit:
+                if speech is None:
+                    print(f"[follow] dry run would say: {GROUND_LINE}", flush=True)
+                    return
+                if out.rule in ("ok", "settling"):
+                    speech.start()
+                if speech.done.is_set():
+                    if speech.error:
+                        raise RuntimeError(f"ground check-in speech failed: {speech.error}")
+                    print("[follow] ground approach complete", flush=True)
+                    return
             if t - last_status >= STATUS_PERIOD:
                 print(status_line(out), flush=True)
                 last_status = t
@@ -288,7 +351,7 @@ def run(args):
     calibration = load_calibration(args.calibration, required=args.preflight or not (args.check or args.dry_run))
     if calibration is None:
         print("[follow] UNCALIBRATED diagnostic: assumed left sign, no self mask; not motion-ready", flush=True)
-    elif args.v_max > calibration.motion_speed_limit:
+    elif loop_config(args).v_max > calibration.motion_speed_limit:
         raise RuntimeError(f"requested speed exceeds calibrated limit {calibration.motion_speed_limit:.2f} m/s")
 
     from bbos import Config, Reader, Type, Writer
@@ -306,6 +369,11 @@ def run(args):
         raise RuntimeError("invalid drive wheel diameter or robot width")
     low_battery_v = getattr(Config("base"), "low_battery_v", None)
     with ExitStack() as stack:
+        speech = None
+        if args.ground_approach and not (args.dry_run or args.preflight):
+            from ground_speech import prepare_speech
+            speech = prepare_speech(Config, Writer, Type)
+            stack.callback(speech.close)
         points = stack.enter_context(Reader("camera.points", keeptime=False))
         imu = stack.enter_context(Reader("imu.orientation", keeptime=False))
         drive_state = stack.enter_context(Reader("drive.state", keeptime=False))
@@ -342,17 +410,24 @@ def run(args):
         if max(abs(rpy[0]), abs(rpy[1])) > cfg.upright_deg:
             raise RuntimeError("refusing to start: robot is not upright")
         if args.preflight:
+            if args.ground_approach:
+                check_ground_service(args.ground_alert_file)
             print("[follow] PREFLIGHT OK: calibration and live inputs checked; no writers opened. Physical gates still required.", flush=True)
             return
 
         drive = None
+        if args.ground_approach:
+            check_ground_service(args.ground_alert_file)
         if not args.dry_run:
             drive = stack.enter_context(Writer("drive.ctrl", Type("drive_ctrl"), keeptime=False))
         led = stack.enter_context(Writer("led.ctrl", Type("led_ctrl"), keeptime=False))
         mode = "dry run" if args.dry_run else "rotate only" if args.rotate_only else f"v_max {cfg.v_max:.2f} m/s"
-        print(f"[follow] follow active ({mode}, gap {args.gap:.2f} m) - stand in front of the robot", flush=True)
+        if args.ground_approach:
+            print(f"[follow] follow active (ground approach, {mode}, 1.0 m body standoff)", flush=True)
+        else:
+            print(f"[follow] follow active ({mode}, gap {args.gap:.2f} m) - stand in front of the robot", flush=True)
         try:
-            control_loop(args, cfg, (points, imu, drive_state), drive, led, wheel_diam, robot_width, calibration)
+            control_loop(args, cfg, (points, imu, drive_state), drive, led, wheel_diam, robot_width, calibration, speech)
         finally:
             if drive is not None:
                 for _ in range(6):

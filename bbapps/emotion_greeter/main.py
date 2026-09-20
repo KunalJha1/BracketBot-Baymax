@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import wave
 from typing import Any
 
@@ -40,6 +41,7 @@ from ground_safety import (
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+VISION_SESSION_ID = uuid.uuid4().hex
 PROJECT_ROOT = SCRIPT_DIR.parents[1]
 EMOTION_LABELS = (
     "anger",
@@ -909,17 +911,23 @@ def publish_ground_safety_file(
     *,
     camera_timestamp_ns: int,
     map_epoch: int | None,
+    observations: list[dict[str, Any]] | None = None,
+    depth_aligned: bool = False,
 ) -> None:
     """Atomically publish a small interlock state for the navigation owner."""
 
     payload = {
         "schema_version": 1,
+        "approach_schema_version": 1,
         "status": status,
         "possible_person_on_ground": status == "alert",
         "alerts": alerts,
         "camera_timestamp_ns": camera_timestamp_ns,
         "map_epoch": map_epoch,
         "published_at": time.time(),
+        "session_id": VISION_SESSION_ID,
+        "depth_aligned": depth_aligned,
+        "observations": observations or [],
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
@@ -1283,6 +1291,7 @@ def run(args: argparse.Namespace) -> int:
                             "depth_keypoints": assessment.depth_keypoints,
                             "torso_height_m": assessment.torso_height_m,
                             "body_extent_m": assessment.body_extent_m,
+                            "body_radius_m": assessment.body_radius_m,
                             "base_position": assessment.base_position,
                             "map_position": assessment.map_position,
                         }
@@ -1313,7 +1322,7 @@ def run(args: argparse.Namespace) -> int:
 
                 if (
                     ground_status != last_safety_status
-                    or now - last_safety_publish >= 0.5
+                    or now - last_safety_publish >= 0.1
                 ):
                     publish_ground_safety_file(
                         args.ground_alert_file,
@@ -1321,6 +1330,8 @@ def run(args: argparse.Namespace) -> int:
                         ground_alerts,
                         camera_timestamp_ns=camera_timestamp_ns,
                         map_epoch=map_epoch,
+                        observations=ground_observations,
+                        depth_aligned=depth_aligned,
                     )
                     last_safety_status = ground_status
                     last_safety_publish = now
