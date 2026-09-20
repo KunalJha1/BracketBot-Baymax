@@ -56,6 +56,12 @@ replace the physical follow tests.
   check and explicitly **not** a medical measurement.
 - An existing Gemini-powered greeter and provider-ready inference code with
   OpenAI and Google client dependencies.
+- **Persistent spoken reminders and timers.** “Remind me in 3 minutes to take
+  my medication” is parsed locally, never reaches an LLM, and is stored in a
+  SQLite database with a UTC due time and an IANA timezone. The countdown runs
+  on its own thread, so it lands even while a gesture, a routine, or the
+  packing policy owns the robot, and it survives an assistant restart.
+  Delivery is a chime, an amber blink, and the spoken reminder.
 - Deterministic greeter voice commands for **wave**, **salute**, **handshake**,
   **fist bump**, **hug**, **namaste**, pointing, dance, and safe **stop**, with
   non-action speech routed to OpenRouter when configured. The lightweight local
@@ -114,6 +120,19 @@ Simulation uses the real allowlist, API, sequencing state machine, progress,
 and stop path, but never opens SSH or writes to BBOS.
 
 ### Run the orchestrated judge demo
+
+**The demo opens with a reminder and is paid off by that reminder.** At 0:00
+the presenter says “BracketBot, remind me in 3 minutes to take my medication”
+and waits for the spoken confirmation. Nothing is staged: the dashboard shows
+the cue card but never creates, times, or fakes the reminder — the robot hears
+the line, parses it locally, and the SQLite scheduler owns the countdown.
+The demo then moves on and the reminder is not mentioned again. Roughly three
+minutes later, while the arms are mid-packing and nobody has touched the
+dashboard, BracketBot interrupts itself with a chime, blinks amber, and says
+“Reminder: take my medication.” That interruption is the point: it shows a
+background care task surviving a foreground robot task, which is what a home
+assistant actually has to do. Because the reminder is persisted rather than
+held in memory, it also lands after an assistant restart mid-demo.
 
 The dashboard includes a guided **first-minute demo** with a shared clock and
 presenter cue cards, followed by the existing three-part robot sequence:
@@ -274,8 +293,12 @@ export plus the same YuNet and expression models, and sends its local voice
 prompt to `speaker.audio`. It does not need Gemini or another cloud service.
 Its port 8018 dashboard shows the annotated robot view, temporary person
 tracking IDs, expression confidence, processing time, camera-frame age, and
-scan rate. See the app README for model export, deployment, smoke-test, and
-autostart instructions.
+scan rate. The robot path answers a frown in about a second and a quarter
+rather than the several seconds the laptop prototype takes: rising expression
+evidence is smoothed faster than falling evidence, an unmistakable reading
+skips the hold, and the opening lines are synthesized at startup so the
+trigger is not waiting on text-to-speech. See the app README for the latency
+breakdown, model export, deployment, smoke-test, and autostart instructions.
 
 The repository includes the small model files needed for deterministic offline
 startup. Their sources and checksums are documented in
@@ -539,10 +562,13 @@ and speaks the routed answer with eSpeak. For microphone debugging only,
 word and starts on any speech; do not use that mode in a noisy public space.
 
 The lightweight local assistant also supports deterministic, persistent timers
-and reminders. For the demo, say “Hey BracketBot, remind me in 4 minutes to
+and reminders. For the demo, say “Hey BracketBot, remind me in 3 minutes to
 take my meds.” BracketBot confirms immediately, keeps the countdown running
-independently while other robot actions are demonstrated, then flashes amber
-and speaks “Reminder: take my meds.” “Set a timer for four minutes” uses the
+independently while other robot actions are demonstrated, then plays a short
+chime, flashes amber for eight seconds, and speaks “Reminder: take my meds.”
+The chime is best-effort: a missing or unplayable asset is skipped rather than
+failing delivery, because a failed delivery would retry the whole reminder and
+swallow the spoken text. “Set a timer for three minutes” uses the
 same path, “what reminders do I have?” lists pending entries, and “cancel my
 reminder” cancels them. Pending reminders survive assistant restarts in a local
 SQLite database. Due times are stored in UTC with their IANA timezone, and a

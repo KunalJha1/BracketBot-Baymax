@@ -1178,6 +1178,7 @@ class OpenRouterClient:
         timeout: float = 20.0,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         max_history_messages: int = 8,
+        max_tokens: int = 180,
         opener: Callable[..., object] = request.urlopen,
         web_search: BrowserbaseSearchClient | None = None,
         max_tool_rounds: int = 2,
@@ -1193,6 +1194,7 @@ class OpenRouterClient:
         self.timeout = timeout
         self.system_prompt = system_prompt
         self.max_history_messages = max(0, max_history_messages)
+        self.max_tokens = max(1, max_tokens)
         self._opener = opener
         self.web_search = web_search or BrowserbaseSearchClient()
         self.max_tool_rounds = max(1, max_tool_rounds)
@@ -1223,7 +1225,7 @@ class OpenRouterClient:
         payload_body: dict[str, object] = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": 180,
+            "max_tokens": self.max_tokens,
             "temperature": 0.4,
             # The reply is spoken, so time to first word matters more than
             # picking the cheapest host for the same model.

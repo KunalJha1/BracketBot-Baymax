@@ -170,16 +170,39 @@ class PersonTracker:
         return tracked
 
 
+SAD_LABELS = frozenset({"sad", "sadness"})
+
+
+def leans_sad(expression: Expression | None) -> bool:
+    """True when sadness is the leading reading, at any confidence."""
+    return expression is not None and expression.label in SAD_LABELS
+
+
 @dataclass
 class SadVoiceTrigger:
-    hold_seconds: float = 1.5
+    """Decide when a visible frown is worth speaking about.
+
+    A borderline cue still has to persist for ``hold_seconds`` so a passing
+    grimace does not start a conversation, but an unmistakable one
+    (``instant_confidence`` or higher) fires on the first reading: waiting a
+    further second and a half on a face the models are already sure about is
+    the difference between the robot feeling attentive and feeling laggy.
+    """
+
+    hold_seconds: float = 0.6
     cooldown_seconds: float = 30.0
-    reset_seconds: float = 2.0
+    reset_seconds: float = 1.5
     confidence: float = 0.6
+    instant_confidence: float = 0.85
     first_sad_at: float | None = None
     first_clear_at: float | None = None
     last_triggered_at: float | None = None
     armed: bool = True
+
+    @property
+    def warming(self) -> bool:
+        """True while sad evidence is building toward a trigger."""
+        return self.armed and self.first_sad_at is not None
 
     def update(
         self,
@@ -200,11 +223,9 @@ class SadVoiceTrigger:
                 self.last_triggered_at is None
                 or now - self.last_triggered_at >= self.cooldown_seconds
             )
-            if (
-                self.armed
-                and cooldown_over
-                and now - self.first_sad_at >= self.hold_seconds
-            ):
+            held = now - self.first_sad_at >= self.hold_seconds
+            certain = expression.distress >= self.instant_confidence
+            if self.armed and cooldown_over and (held or certain):
                 self.armed = False
                 self.last_triggered_at = now
                 return True
@@ -432,6 +453,7 @@ class ExpressionAnalyzer:
         face_model: Path,
         expression_models: Path | list[Path],
         smoothing: float = 0.25,
+        attack: float = 0.55,
         face_confidence: float = 0.75,
         min_face_size: int = 32,
     ) -> None:
@@ -458,6 +480,12 @@ class ExpressionAnalyzer:
                 flush=True,
             )
         self.smoothing = smoothing
+        # A symmetric filter is the single biggest source of lag in the frown
+        # path: at 0.25 it takes four classifications to cross 0.6 from a cold
+        # start. Rising evidence is followed quickly and falling evidence
+        # slowly, so a frown registers in a reading or two while one noisy
+        # frame cannot cancel it.
+        self.attack = max(smoothing, attack)
         self.min_face_size = min_face_size
         self.scores: np.ndarray | None = None
         self.missing_frames = 0
@@ -508,12 +536,14 @@ class ExpressionAnalyzer:
 
         if classify or self.scores is None:
             probabilities = self.classify(frame[y1:y2, x1:x2])
-            self.scores = (
-                probabilities
-                if self.scores is None
-                else (1 - self.smoothing) * self.scores
-                + self.smoothing * probabilities
-            )
+            if self.scores is None:
+                self.scores = probabilities
+            else:
+                rate = np.where(probabilities > self.scores, self.attack, self.smoothing)
+                blended = (1 - rate) * self.scores + rate * probabilities
+                # Per-class rates break the unit sum; renormalise so the
+                # reported confidence stays a probability.
+                self.scores = blended / blended.sum()
 
         best_index = int(np.argmax(self.scores))
         distress = float(
@@ -1177,6 +1207,9 @@ def start_check_in(args: argparse.Namespace):
             flush=True,
         )
         return None
+    # Render the openers now, off the hot path, so the cue-to-voice gap at
+    # trigger time is just the speaker buffer rather than a TTS round trip.
+    check_in.prewarm_async()
     print("[check-in] Ready: sadness cues start a spoken check-in", flush=True)
     return check_in
 
@@ -1198,6 +1231,7 @@ def run(args: argparse.Namespace) -> int:
         model_path(args.models_dir, "face_detection_yunet_2026may.onnx"),
         expression_models,
         smoothing=args.expression_smoothing,
+        attack=args.expression_attack,
         face_confidence=args.face_confidence,
         min_face_size=args.min_face_size,
     )
@@ -1213,6 +1247,7 @@ def run(args: argparse.Namespace) -> int:
         cooldown_seconds=args.sad_cooldown,
         reset_seconds=args.sad_reset_seconds,
         confidence=args.sad_confidence,
+        instant_confidence=args.sad_instant_confidence,
     )
     tracker = PersonTracker()
     ground_tracker = GroundAlertTracker(
@@ -1245,6 +1280,7 @@ def run(args: argparse.Namespace) -> int:
     frame_count = 0
     last_frame = None
     last_log_at = 0.0
+    sad_leaning = False
     previous_started = None
     try:
         with Reader("camera.rect", keeptime=False) as camera, \
@@ -1427,9 +1463,18 @@ def run(args: argparse.Namespace) -> int:
                         primary.x1 : primary.x2,
                     ]
                     if person_crop.size:
+                        # Skipping frames saves CPU while nothing is happening,
+                        # but from the first sad-leaning reading onward every
+                        # frame is classified, so the evidence needed to speak
+                        # accumulates at the full scan rate instead of a third
+                        # of it. This is what the interval used to cost.
                         expression = analyzer.analyze(
                             person_crop,
-                            classify=frame_count % args.expression_interval == 0,
+                            classify=(
+                                trigger.warming
+                                or sad_leaning
+                                or frame_count % args.expression_interval == 0
+                            ),
                             offset_x=primary.x1,
                             offset_y=primary.y1,
                         )
@@ -1438,13 +1483,20 @@ def run(args: argparse.Namespace) -> int:
                 else:
                     analyzer.missing()
                 expression_finished = time.monotonic()
+                # A frown usually leads with disgust, not sadness, so building
+                # distress counts as sad-leaning too.
+                sad_leaning = leans_sad(expression) or (
+                    expression is not None
+                    and expression.distress >= args.sad_confidence / 2
+                )
                 associated = face_belongs_to_person(expression, detections)
                 if trigger.update(expression, associated, time.monotonic()):
+                    cue = f"sadness cue ({expression.confidence:.0%})"
                     if check_in is None:
-                        print("[emotion] Sustained sadness cue; playing prompt", flush=True)
+                        print(f"[emotion] {cue}; playing prompt", flush=True)
                         speaker.play_async()
                     elif check_in.start_async():
-                        print("[emotion] Sustained sadness cue; starting check-in", flush=True)
+                        print(f"[emotion] {cue}; starting check-in", flush=True)
 
                 elapsed = time.monotonic() - started
                 age_ms = camera_age_ms(timestamp)
@@ -1534,6 +1586,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--yolo-confidence", type=float, default=0.4)
     parser.add_argument("--face-confidence", type=float, default=0.75)
     parser.add_argument("--expression-smoothing", type=float, default=0.25)
+    parser.add_argument(
+        "--expression-attack",
+        type=float,
+        default=0.55,
+        help="faster smoothing applied to rising expression evidence",
+    )
     parser.add_argument("--expression-interval", type=int, default=3)
     parser.add_argument(
         "--min-face-size",
@@ -1577,9 +1635,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.6,
         help="summed sadness+anger+disgust+fear needed to start a check-in",
     )
-    parser.add_argument("--sad-hold-seconds", type=float, default=1.5)
+    parser.add_argument(
+        "--sad-instant-confidence",
+        type=float,
+        default=0.85,
+        help="summed distress that starts the check-in without waiting out the hold",
+    )
+    parser.add_argument("--sad-hold-seconds", type=float, default=0.6)
     parser.add_argument("--sad-cooldown", type=float, default=30.0)
-    parser.add_argument("--sad-reset-seconds", type=float, default=2.0)
+    parser.add_argument("--sad-reset-seconds", type=float, default=1.5)
     parser.add_argument("--speak-on-start", action="store_true")
     parser.add_argument(
         "--no-check-in",
@@ -1592,6 +1656,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=8.0,
         help="seconds to wait for the person to start answering",
+    )
+    parser.add_argument(
+        "--check-in-trailing-silence",
+        type=float,
+        default=0.7,
+        help="silence that ends an answer and starts Baymax's reply",
     )
     parser.add_argument("--env", type=Path, default=SCRIPT_DIR.parent / ".env")
     parser.add_argument("--mic-gain", type=float, default=3.0)
@@ -1635,6 +1705,7 @@ def main() -> int:
         "yolo_confidence",
         "face_confidence",
         "sad_confidence",
+        "sad_instant_confidence",
         "pose_confidence",
     ):
         if not 0 <= getattr(args, name) <= 1:
@@ -1649,6 +1720,14 @@ def main() -> int:
         raise SystemExit("--check-in-answer-timeout must be greater than zero")
     if not 0 < args.expression_smoothing <= 1:
         raise SystemExit("--expression-smoothing must be greater than 0 and at most 1")
+    if not 0 < args.expression_attack <= 1:
+        raise SystemExit("--expression-attack must be greater than 0 and at most 1")
+    if args.sad_instant_confidence < args.sad_confidence:
+        raise SystemExit(
+            "--sad-instant-confidence cannot be below --sad-confidence"
+        )
+    if args.check_in_trailing_silence <= 0:
+        raise SystemExit("--check-in-trailing-silence must be greater than zero")
     for name in ("sad_hold_seconds", "sad_cooldown", "sad_reset_seconds"):
         if getattr(args, name) < 0:
             raise SystemExit(f"--{name.replace('_', '-')} cannot be negative")

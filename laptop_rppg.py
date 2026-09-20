@@ -1,8 +1,8 @@
 """
 laptop_rppg.py - concept check for rPPG on a laptop webcam, with a live debug view.
 
-Uses the same signal chain as rppg.py (analyze / FaceROI) that scripts/robot_rppg.py runs
-on the robot's head camera, so what you tune here is what the robot measures.
+Uses the same signal chain and the same HeartRateTracker as rppg.py that scripts/robot_rppg.py
+runs on the robot's head camera, so what you tune here is what the robot measures.
 
 NOT a medical device: a demo-grade estimate from a camera. See docs/rppg-robot-port.md.
 
@@ -35,7 +35,7 @@ from collections import deque
 import cv2
 import numpy as np
 
-from rppg import analyze, FaceROI, DEFAULT_MODEL, HR_LO_HZ, HR_HI_HZ
+from rppg import FaceROI, HeartRateTracker, MIN_SECONDS, DEFAULT_MODEL, HR_LO_HZ, HR_HI_HZ
 
 PANEL_W = 440
 COL = {"g": (80, 220, 80), "c": (230, 200, 60), "y": (60, 220, 240), "r": (70, 70, 240),
@@ -159,6 +159,9 @@ def build_panel(h, st):
                   res["psd"] if res is not None else None, st["bpm_raw"], st["snr_ok"])
 
     y = 440
+    spread = st.get("spread")
+    txt(p, f"agree +-{spread:.1f} BPM" if spread is not None else "agree --", (260, 102), 0.5,
+        COL["g"] if st["confident"] else COL["d"])
     txt(p, st["status"], (10, y), 0.55, st["status_col"]); y += 20
     txt(p, f"lum drift (2s): {st['lum_drift']:.2f}%   face {st['face_w']:.0f}px", (10, y), 0.45); y += 18
     txt(p, st["lock_msg"], (10, y), 0.42, COL["d"]); y += 18
@@ -177,21 +180,24 @@ def run_live(a):
     lock_msg = lock_exposure(cap) if not a.no_lock else "AE lock disabled"
     roi = FaceROI(a.model)
 
-    buf_t, buf_rgb = deque(), deque()
     lum_hist = deque()
-    est = deque(maxlen=5)
-    prev, last_nose, bad_run, low_run = None, None, 0, 0
     method = a.method
-    res, bpm_raw, snr = None, None, None
+    last_nose, bad_run = None, 0
     next_an = 0.0
     fps, t_last = 0.0, time.monotonic()
     writer, rec_file = None, None
     status, status_col, face_w = "starting", COL["w"], 0.0
 
+    def new_tracker():
+        """The robot's tracker, same settings: buffer, SNR gate, tracking, aggregation."""
+        return HeartRateTracker(fs=a.fs, window_s=a.window, snr_min_db=a.snr_min, method=method)
+
+    tracker = new_tracker()
+
     def reset():
-        nonlocal prev, last_nose, bad_run, low_run, res, bpm_raw, snr
-        buf_t.clear(); buf_rgb.clear(); est.clear()
-        prev, last_nose, bad_run, low_run, res, bpm_raw, snr = None, None, 0, 0, None, None, None
+        nonlocal tracker, last_nose, bad_run
+        tracker = new_tracker()
+        last_nose, bad_run = None, 0
 
     while True:
         ok, frame = cap.read()
@@ -204,7 +210,7 @@ def run_live(a):
 
         r = roi(frame, now * 1000)
         if r is None:
-            if buf_t:
+            if tracker.t:
                 reset()
             status, status_col = "NO FACE / too far", COL["r"]
         else:
@@ -215,15 +221,13 @@ def run_live(a):
                 bad_run += 1
                 status, status_col = "MOTION - hold still", COL["r"]
                 if bad_run > int(0.5 * a.fs):
-                    buf_t.clear(); buf_rgb.clear(); prev = None
+                    tracker.clear(unlock=True)
             else:
                 bad_run = 0
-                buf_t.append(now); buf_rgb.append(rgb)
-                while buf_t and now - buf_t[0] > a.window:
-                    buf_t.popleft(); buf_rgb.popleft()
-                span = now - buf_t[0]
-                status, status_col = (f"buffering {span:.1f}/6.0 s", COL["y"]) if span < 6 else \
-                                     ("measuring", COL["g"])
+                tracker.add(now, rgb)
+                span = now - tracker.t[0]
+                status, status_col = ("measuring", COL["g"]) if span >= MIN_SECONDS else \
+                                     (f"buffering {span:.1f}/{MIN_SECONDS:.0f} s", COL["y"])
                 if writer:
                     writer.writerow([f"{now:.4f}", *(f"{v:.4f}" for v in rgb)])
 
@@ -239,24 +243,18 @@ def run_live(a):
         lv = np.array([v for _, v in lum_hist]) if lum_hist else np.array([1.0])
         lum_drift = 100 * np.ptp(lv) / (lv.mean() + 1e-9)
 
-        if now >= next_an and len(buf_t) > 2:
+        if now >= next_an and len(tracker.t) > 2:
             next_an = now + 0.5
-            res = analyze(np.array(buf_t), np.array(buf_rgb), a.fs, method, prev_bpm=prev)
-            if res is not None:
-                bpm_raw, snr = res["bpm"], res["snr_db"]
-                if snr >= a.snr_min:
-                    est.append(bpm_raw); prev = bpm_raw; low_run = 0
-                else:
-                    low_run += 1
-                    if low_run >= 6:                       # 3 s of junk: unlock tracker
-                        prev = None
+            tracker.update(now)                            # gate, tracking and unlock live here
 
-        bpm_disp = float(np.median(est)) if est else None
-        confident = len(est) >= 3 and np.ptp(est) < 8
-        st = dict(bpm_disp=bpm_disp, bpm_raw=bpm_raw, snr=snr,
-                  snr_ok=snr is not None and snr >= a.snr_min, confident=confident,
-                  method=method, fps=fps, res=res,
-                  raw_g=[c[1] for c in buf_rgb], status=status, status_col=status_col,
+        agg = tracker.result()
+        snr = tracker.last_snr
+        st = dict(bpm_disp=None if agg is None else agg["bpm"], bpm_raw=tracker.last_bpm, snr=snr,
+                  snr_ok=snr is not None and snr >= a.snr_min,
+                  confident=bool(agg and agg["confident"]),
+                  spread=None if agg is None else agg["spread_bpm"],
+                  method=method, fps=fps, res=tracker.last,
+                  raw_g=[c[1] for c in tracker.rgb], status=status, status_col=status_col,
                   lum_drift=lum_drift, face_w=face_w, lock_msg=lock_msg, rec=writer is not None)
         canvas = np.hstack([frame, build_panel(frame.shape[0], st)]) \
             if frame.shape[0] >= 500 else \
@@ -297,23 +295,28 @@ def run_replay(a):
     rgb = np.column_stack([d["R"], d["G"], d["B"]])
     print(f"{a.replay}: {len(t)} frames, {t[-1]:.1f} s, mean fps {len(t)/t[-1]:.1f}")
     print(f"{'t(s)':>6} {'POS':>7} {'snr':>6}   {'GREEN':>7} {'snr':>6}")
-    prev = {"pos": None, "green": None}
-    out = {"pos": [], "green": []}
-    for te in np.arange(6.0, t[-1] + 1e-9, 1.0):
-        m = (t > te - a.window) & (t <= te)
+    trackers = {m: HeartRateTracker(fs=a.fs, window_s=a.window, snr_min_db=a.snr_min, method=m)
+                for m in ("pos", "green")}
+    i = 0
+    for te in np.arange(MIN_SECONDS, t[-1] + 1e-9, 1.0):
+        while i < len(t) and t[i] <= te:
+            for tr in trackers.values():
+                tr.add(t[i], rgb[i])
+            i += 1
         row = [f"{te:6.1f}"]
         for meth in ("pos", "green"):
-            r = analyze(t[m], rgb[m], a.fs, meth, prev_bpm=prev[meth])
+            r = trackers[meth].update(te)
             if r is None:
                 row += [f"{'--':>7}", f"{'':>6}"]; continue
             ok = r["snr_db"] >= a.snr_min
-            if ok:
-                prev[meth] = r["bpm"]; out[meth].append(r["bpm"])
             row += [f"{r['bpm']:7.1f}", f"{r['snr_db']:+6.1f}" + ("" if ok else "*")]
         print(" ".join(row[:3]), "  ", " ".join(row[3:]))
-    for meth, v in out.items():
-        if v:
-            print(f"{meth.upper():>5}: median {np.median(v):.1f} BPM over {len(v)} accepted windows")
+    for meth, tr in trackers.items():
+        r = tr.result()
+        if r:
+            print(f"{meth.upper():>5}: {r['bpm']:.1f} BPM over {r['n_estimates']} accepted windows"
+                  f"  spread {r['spread_bpm']} BPM  SNR {r['snr_db']:+.1f} dB"
+                  f"  {'confident' if r['confident'] else 'NOT confident'}")
     print("* = rejected by SNR gate")
 
 

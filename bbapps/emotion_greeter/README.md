@@ -10,22 +10,61 @@ This app runs the complete vision-to-voice path on the robot:
 5. locate the primary face with YuNet;
 6. estimate its visible expression by averaging two EmotiEffLib ONNX models;
    and
-7. after a sustained, confidently sad-looking expression, say "Hey, why are
-   you sad? What's up?", listen for the answer (whisper.cpp), and reply with
-   the OpenRouter LLM for up to three turns (`check_in.py`).
+7. after a confidently sad-looking expression, open with one of a handful of
+   short lines ("Hey, you okay? What's going on?"), listen for the answer
+   (whisper.cpp), and reply with the OpenRouter LLM for up to three turns
+   (`check_in.py`).
 
 If whisper.cpp, espeak-ng, or the greeter voice modules are missing, the app
 falls back to playing `sad_prompt.wav`. If the LLM cannot be reached it gives
 a short fixed, supportive reply. Use `--no-check-in` to keep the recorded
 prompt only.
 
-The default trigger requires 60% smoothed confidence for 1.5 seconds, clears
-for 2 seconds before re-arming, and has a 30-second cooldown. A face must be
-inside a YOLO person box. Face detection runs only inside the primary person
-box, and expression classification runs every third scan. The app targets four
-scans per second by default as a balance between viewer responsiveness and CPU
-use. These estimates are fallible conversation cues, not claims about a
+The default trigger requires 60% smoothed confidence for 0.6 seconds, clears
+for 1.5 seconds before re-arming, and has a 30-second cooldown. A reading at
+or above `--sad-instant-confidence` (85%) skips the hold and speaks on the
+first frame, because waiting out a hold on a face the models are already sure
+about is what made the robot feel slow. A face must be inside a YOLO person
+box. Face detection runs only inside the primary person box, and expression
+classification runs every third scan until a reading leans sad, after which
+every scan is classified so the evidence builds at the full four-per-second
+rate. These estimates are fallible conversation cues, not claims about a
 person's internal emotional state.
+
+## Response latency
+
+The cue-to-voice path is tuned to answer a frown in about a second and a
+quarter, measured by simulating the filter, trigger and speech path at the
+default four scans per second:
+
+| Frown strength (raw model sadness) | Before | Now |
+| --- | --- | --- |
+| 0.55 | never triggers | never triggers |
+| 0.65 | 7.6 s | 1.5 s |
+| 0.75 | 6.2 s | 1.3 s |
+| 0.90 | 4.7 s | 1.3 s |
+
+Three changes account for it, and none of them lowers the confidence bar — a
+weak frown that never spoke before still never speaks:
+
+- **Asymmetric smoothing.** `--expression-smoothing` (0.25) still governs
+  falling evidence, but rising evidence follows `--expression-attack` (0.55).
+  A symmetric 0.25 filter needs four classifications to cross 0.6 from a cold
+  start; this needs two.
+- **Full-rate classification once a reading leans sad.** The every-third-scan
+  interval saves CPU while nothing is happening and now gets out of the way
+  the moment it matters.
+- **Pre-rendered openers.** Every opening line is synthesized at startup, so
+  the gap between the trigger and the first word is the speaker buffer rather
+  than a TTS round trip. Replies are then synthesized sentence by sentence,
+  so the first sentence plays while the rest is still rendering.
+
+The check-in also runs with web-search tools off and a 110-token reply budget,
+so the LLM returns the couple of short sentences the prompt asks for without
+an extra tool round trip. `--check-in-trailing-silence` (0.7 s, was 1.2 s)
+decides when an answer has ended; raise it if the robot starts replying over
+people who pause mid-sentence. The pause after Baymax speaks is deliberately
+not shortened, because the mic must not pick up the tail of his own voice.
 
 Ground-safety evidence must persist for two seconds before it becomes an alert
 and must positively clear for two seconds before the alert releases. Missing

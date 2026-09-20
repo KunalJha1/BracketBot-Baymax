@@ -27,6 +27,36 @@ def synthetic_skin(bpm, seconds=12.0, fps=30.0, amplitude=0.004, jitter=0.004, s
     return t, rgb
 
 
+def synthetic_ppg(bpm, seconds=14.0, fps=30.0, amplitude=0.004, harmonic=1.6, seed=0):
+    """Skin trace shaped like a real pulse waveform rather than a sine.
+
+    A camera sees the dicrotic notch, and its second harmonic is often the taller
+    line in the spectrum - which is exactly when a plain peak search reports 2x
+    the real rate.
+    """
+    rng = np.random.default_rng(seed)
+    t = np.arange(0, seconds, 1 / fps) + rng.uniform(-0.004, 0.004, int(seconds * fps))
+    t = np.sort(t)
+    phase = 2 * np.pi * bpm / 60 * t
+    pulse = np.sin(phase) + harmonic * np.sin(2 * phase + 0.7)
+    pulse /= np.abs(pulse).max()
+    base = np.array([180.0, 130.0, 110.0])
+    weights = np.array([0.3, 1.0, 0.5])
+    return t, base * (1 + amplitude * pulse[:, None] * weights) + rng.normal(0, 0.05, (len(t), 3))
+
+
+def run_tracker(t, rgb, period=1.0, **kw):
+    """Feed a trace through HeartRateTracker the way a scan does, one estimate a second."""
+    tracker = rppg.HeartRateTracker(**kw)
+    next_est = t[0] + rppg.MIN_SECONDS
+    for now, sample in zip(t, rgb):
+        tracker.add(now, sample)
+        if now >= next_est:
+            next_est = now + period
+            tracker.update(now)
+    return tracker
+
+
 @pytest.mark.parametrize("bpm", [55, 72, 96, 130])
 def test_pos_recovers_synthetic_pulse(bpm):
     t, rgb = synthetic_skin(bpm)
@@ -101,6 +131,137 @@ def test_robot_cli_self_test_loads_model_without_camera():
     assert report["ok"] is True
     assert report["model"] == rppg.DEFAULT_MODEL.name
     assert report["model_bytes"] == rppg.DEFAULT_MODEL.stat().st_size
+
+
+@pytest.mark.parametrize("bpm", [54, 68, 82])
+def test_a_taller_second_harmonic_does_not_double_the_reported_rate(bpm):
+    t, rgb = synthetic_ppg(bpm)
+    result = rppg.analyze(t, rgb, fs=30.0)
+    assert abs(result["bpm"] - bpm) < 3.0, "locked onto the harmonic"
+
+
+def test_fundamental_keeps_the_peak_when_half_of_it_is_only_noise():
+    freqs = np.linspace(0.0, 5.0, 2001)
+    psd = np.full_like(freqs, 1.0)                            # flat noise floor
+    peak = int(np.argmin(np.abs(freqs - 2.0)))                # 120 BPM
+    psd[peak] = 500.0
+    psd[int(np.argmin(np.abs(freqs - 1.0)))] = 3.0            # a nothing bump at half
+    assert rppg.fundamental(freqs, psd, peak) == peak
+
+
+def test_fundamental_steps_down_to_a_real_peak_at_half_the_frequency():
+    freqs = np.linspace(0.0, 5.0, 2001)
+    psd = np.full_like(freqs, 1.0)
+    peak = int(np.argmin(np.abs(freqs - 2.4)))                # 144 BPM: the harmonic
+    half = int(np.argmin(np.abs(freqs - 1.2)))                # 72 BPM: the real rate
+    psd[peak] = 500.0
+    psd[half] = 200.0
+    assert rppg.fundamental(freqs, psd, peak) == half
+
+
+def test_tracking_can_climb_out_of_a_locked_harmonic():
+    t, rgb = synthetic_ppg(70)
+    result = rppg.analyze(t, rgb, prev_bpm=140.0, track_bpm=15.0)
+    assert abs(result["bpm"] - 70) < 3.0
+
+
+def test_longest_clean_span_picks_the_side_of_a_gap_worth_analysing():
+    t = np.r_[np.arange(0, 3, 1 / 30), np.arange(5, 13, 1 / 30)]
+    span = rppg.longest_clean_span(t)
+    assert t[span][0] == pytest.approx(5.0)
+    assert t[span][-1] == pytest.approx(t[-1])
+
+
+def test_longest_clean_span_keeps_everything_when_no_stretch_is_long_enough():
+    t = np.r_[np.arange(0, 4, 1 / 30), np.arange(6, 10, 1 / 30)]
+    assert rppg.longest_clean_span(t) == slice(0, len(t))
+
+
+def test_analyze_reads_the_clean_stretch_instead_of_interpolating_over_a_gap():
+    rng = np.random.default_rng(3)
+    t_junk = np.arange(0, 4.0, 1 / 30)
+    junk = rng.normal(150, 1.5, (len(t_junk), 3))
+    t_good, good = synthetic_ppg(66, seconds=9.0, harmonic=0.0, seed=4)
+    t = np.r_[t_junk, t_good + 5.0]                           # 1 s hole between them
+    result = rppg.analyze(t, np.vstack([junk, good]), fs=30.0)
+    assert abs(result["bpm"] - 66) < 3.0
+
+
+def test_tracker_aggregates_a_clean_scan_and_calls_it_confident():
+    t, rgb = synthetic_ppg(75, seconds=20.0, seed=5)
+    result = run_tracker(t, rgb).result()
+    assert abs(result["bpm"] - 75) < 3.0
+    assert result["confident"] and result["n_estimates"] >= 3
+    assert result["spread_bpm"] <= 6.0 and result["span_s"] >= 6.0
+
+
+def test_tracker_returns_nothing_from_a_scan_with_no_pulse_in_it():
+    t = np.arange(0, 20.0, 1 / 30)
+    noise = np.random.default_rng(7).normal(150, 1.0, (len(t), 3))
+    assert run_tracker(t, noise, snr_min_db=6.0).result() is None
+
+
+def test_tracker_unlocks_its_search_after_a_run_of_rejected_estimates():
+    t, rgb = synthetic_ppg(75, seconds=20.0, seed=6)
+    tracker = run_tracker(t, rgb, snr_min_db=-1.0)
+    assert tracker.prev is not None
+    tracker.snr_min_db = 99.0                                 # nothing can pass from here on
+    for _ in range(tracker.unlock_after):
+        tracker.update(t[-1])
+    assert tracker.prev is None
+
+
+def test_tracker_distrusts_a_rate_that_only_showed_up_at_the_end_of_the_scan():
+    late = rppg.HeartRateTracker()
+    late.estimates = [(18.0, 58.0, 4.0), (19.0, 58.4, 4.2), (20.0, 58.2, 4.1)]
+    assert late.result()["confident"] is False
+    steady = rppg.HeartRateTracker()
+    steady.estimates = [(8.0, 58.0, 4.0), (14.0, 58.4, 4.2), (20.0, 58.2, 4.1)]
+    assert steady.result()["confident"] is True
+
+
+def test_tracker_clear_keeps_the_estimates_and_only_unlocks_on_request():
+    tracker = rppg.HeartRateTracker()
+    tracker.add(0.0, [180.0, 130.0, 110.0])
+    tracker.estimates = [(1.0, 70.0, 3.0)]
+    tracker.prev = 70.0
+    tracker.clear()
+    assert not tracker.t and tracker.estimates and tracker.prev == 70.0
+    tracker.clear(unlock=True)
+    assert tracker.prev is None
+
+
+def test_weighted_median_follows_the_estimates_the_chain_was_sure_about():
+    bpms = [70.0, 71.0, 120.0]
+    sure = rppg.weighted_median(bpms, [10.0, 10.0, 0.01])
+    assert sure in (70.0, 71.0)
+    assert rppg.weighted_median(bpms, [0.0, 0.0, 0.0]) == 71.0
+
+
+def test_measure_heart_rate_scans_from_frames_and_reports_an_aggregate(monkeypatch):
+    """The camera loop itself: frames in, aggregate out, with the motion gate in the
+    path. No camera and no landmarker, and a fake clock so a 20 s scan takes no time."""
+    t, rgb = synthetic_ppg(69, seconds=22.0, seed=8)
+    clock = iter(np.r_[t, t[-1] + np.arange(1, 60) / 30.0])
+    nose = np.array([10.0, 20.0])                             # never moves: nothing dropped
+
+    class FakeROI:
+        def __init__(self, model_path):
+            self.i = 0
+
+        def __call__(self, frame, t_ms):
+            self.i += 1
+            return (rgb[self.i - 1], nose, 100.0, None) if self.i <= len(rgb) else None
+
+    monkeypatch.setattr(rppg, "FaceROI", FakeROI)
+    monkeypatch.setattr(rppg.time, "monotonic", lambda: next(clock))
+    seen = []
+    result = rppg.measure_heart_rate(duration_s=20.0, model_path=None,
+                                     grab=lambda: "frame",
+                                     on_update=lambda b, s, p: seen.append(p))
+    assert abs(result["bpm"] - 69) < 3.0
+    assert result["confident"] and result["n_estimates"] >= 3
+    assert seen and 0.0 < seen[-1] <= 1.0                     # progress reached the caller
 
 
 class FakeReader:
@@ -206,7 +367,7 @@ def test_measurement_tolerates_brief_face_detector_misses(monkeypatch):
 def test_measurement_does_not_publish_rejected_peak(monkeypatch):
     monkeypatch.setattr(rppg, "FaceROI", lambda _model: SyntheticFaceROI(miss_every=0))
     monkeypatch.setattr(rppg.time, "monotonic", SteppingClock())
-    monkeypatch.setattr(rppg, "estimate_hr", lambda *_args, **_kwargs: (72.0, -10.0))
+    monkeypatch.setattr(rppg, "analyze", lambda *_args, **_kwargs: {"bpm": 72.0, "snr_db": -10.0})
     updates = []
 
     result = rppg.measure_heart_rate(

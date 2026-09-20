@@ -9,7 +9,7 @@ Choose **Start first minute + robot demo** to start the shared presenter clock
 and the safe robot sequence. The dashboard advances an operator-only cue card;
 it does not synthesize the presenter's lines or fake a reminder.
 
-- **0:00 — You to BracketBot:** “BracketBot, remind me in 4 minutes to take my
+- **0:00 — You to BracketBot:** “BracketBot, remind me in 3 minutes to take my
   medication.” Pause for the real spoken confirmation.
 - **0:12 — Presenter to audience:** “Hi everyone! Meet BracketBot. BracketBot
   is an at-home care assistant that can answer questions, converse with you,
@@ -18,8 +18,14 @@ it does not synthesize the presenter's lines or fake a reminder.
   else BracketBot can do.” Continue into questions or safe light and sound
   features while the manipulation task runs.
 
-The four-minute reminder deliberately outlives the opening so it can land later
+The three-minute reminder deliberately outlives the opening so it can land later
 as proof that BracketBot keeps a background care task running during other work.
+Three minutes places delivery in the middle of the packing phase, while the arms
+are visibly busy and nobody has touched the dashboard — the strongest moment for
+it to interrupt. Nothing in the dashboard creates or fakes the reminder: the
+presenter speaks the line, the robot parses it locally, and the SQLite scheduler
+owns the countdown from there. When it lands, BracketBot plays a short chime,
+blinks amber for eight seconds, and speaks “Reminder: take my medication.”
 Use the reminder only as a demo coordination aid, not as a medical schedule.
 
 The physical sequence remains event-driven:
