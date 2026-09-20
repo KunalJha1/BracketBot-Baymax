@@ -11,6 +11,10 @@ or replace qualified care.
 
 ## What works today
 
+For person-follow setup after pulling, start with [Follow readiness](docs/follow-readiness.md).
+Motion requires a calibration file on the specific robot; laptop tests do not
+replace the physical follow tests.
+
 - An accessible local dashboard with a typed allowlist of 23 primitive actions:
   eight gestures, adaptive two-arm table positioning, five light expressions,
   three sound cues, two original instrumental music cues, and four

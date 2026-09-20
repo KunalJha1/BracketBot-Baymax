@@ -49,7 +49,9 @@ REMOTE_GREETER_ACTION_RUNNER = "/tmp/greeter_action.py"
 REMOTE_TABLE_REST_RUNNER = "/tmp/table_rest.py"
 REMOTE_DEMO_ARM_RESERVATION = "/tmp/bracketbot-demo-arm-reserved"
 FOLLOW_RUNNER = ROOT / "scripts" / "robot_follow.py"
-FOLLOW_MODULES = (ROOT / "scripts" / "follow_core.py", ROOT / "scripts" / "follow_perception.py")
+FOLLOW_MODULES = tuple(ROOT / "scripts" / name for name in (
+    "follow_core.py", "follow_perception.py", "follow_calibration.py",
+))
 REMOTE_FOLLOW_RUNNER = "/tmp/robot_follow.py"
 # Must match follow_core (FollowConfig gap bounds and STATUS_PREFIX); a test checks this.
 FOLLOW_GAP_MIN = 0.6
@@ -2147,11 +2149,13 @@ def start_source_reloader(server, controller, source, reload_requested, stop_eve
                 or state["lean_enabled"]
                 or state["lean_transition"]
                 or state["demo"]["active"]
+                or state["follow_enabled"]
+                or state["follow_transition"]
             )
             if busy:
                 if not announced_wait:
                     print(
-                        "[reload] source changed; waiting for actions, demo, and lean mode to stop",
+                        "[reload] source changed; waiting for actions, demo, lean, and follow to stop",
                         flush=True,
                     )
                     announced_wait = True

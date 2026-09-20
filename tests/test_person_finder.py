@@ -19,17 +19,14 @@ for line in sys.stdin:
 """
 
 
-def make_client(tmp_path):
+def make_client(tmp_path, uv_bin):
     script = tmp_path / "person_tracker.py"
     script.write_text(FAKE_TRACKER)
-    uv = tmp_path / "uv"
-    uv.write_text(f'#!/bin/sh\nexec {sys.executable} "$3"\n')
-    uv.chmod(0o755)
-    return PersonTrackerClient(script, uv_bin=str(uv), timeout_s=5.0)
+    return PersonTrackerClient(script, uv_bin=uv_bin, timeout_s=5.0)
 
 
-def test_client_round_trips_acquire(tmp_path):
-    client = make_client(tmp_path)
+def test_client_round_trips_acquire(tmp_path, python_instead_of_uv):
+    client = make_client(tmp_path, python_instead_of_uv)
     try:
         result = client.acquire("scan", threading.Event())
         assert result == {"id": 1, "found": True, "purpose": "scan"}
@@ -38,8 +35,8 @@ def test_client_round_trips_acquire(tmp_path):
     assert not client.running()
 
 
-def test_client_cancel_sends_cancel_and_reports_it(tmp_path):
-    client = make_client(tmp_path)
+def test_client_cancel_sends_cancel_and_reports_it(tmp_path, python_instead_of_uv):
+    client = make_client(tmp_path, python_instead_of_uv)
     cancel = threading.Event()
     try:
         client.acquire("scan", threading.Event())

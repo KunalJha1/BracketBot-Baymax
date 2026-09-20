@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 
 # camera.points uses base +y forward, +x lateral. -1 means +x points to the robot's
-# right (right-handed, z up). Verified at gate G0; flip here if G0 shows otherwise.
+# right (right-handed, z up). Unverified diagnostic default; motion uses the robot's calibration.
 BASE_LEFT_SIGN = -1.0
 
 
@@ -47,6 +47,17 @@ def base_to_local(points_base, left_sign=BASE_LEFT_SIGN):
     """camera.points base frame (x lateral, y forward, z up) -> (forward, left, up)."""
     p = np.asarray(points_base, dtype=np.float64)
     return np.column_stack([p[:, 1], left_sign * p[:, 0], p[:, 2]])
+
+
+def without_self(points_local, boxes):
+    """Remove only physically reviewed robot-body boxes, before detection and obstacle checks."""
+    p = np.asarray(points_local, dtype=np.float64).reshape(-1, 3)
+    keep = np.ones(len(p), dtype=bool)
+    for f0, f1, l0, l1, z0, z1 in boxes:
+        keep &= ~((p[:, 0] >= f0) & (p[:, 0] <= f1)
+                  & (p[:, 1] >= l0) & (p[:, 1] <= l1)
+                  & (p[:, 2] >= z0) & (p[:, 2] <= z1))
+    return p[keep]
 
 
 def _label(occupied):
