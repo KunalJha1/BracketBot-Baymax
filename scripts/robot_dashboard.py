@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -28,9 +29,11 @@ import time
 import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote
 
 
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_SSH_IDENTITY = Path.home() / ".ssh" / "id_ed25519"
 RUNNER = ROOT / "scripts" / "gesture_test.py"
 EFFECT_RUNNER = ROOT / "scripts" / "robot_effect.py"
 BASE_RUNNER = ROOT / "scripts" / "robot_base_mode.py"
@@ -42,21 +45,39 @@ REMOTE_EFFECT_RUNNER = "/tmp/robot_effect.py"
 REMOTE_BASE_RUNNER = "/tmp/robot_base_mode.py"
 REMOTE_GREETER_ACTION_RUNNER = "/tmp/greeter_action.py"
 REMOTE_TABLE_REST_RUNNER = "/tmp/table_rest.py"
-SSH_OPTIONS = (
+VOICE_UPLOAD_DIR = ROOT / "artifacts" / "dashboard_voice"
+MAX_VOICE_UPLOAD_BYTES = 50 * 1024 * 1024
+SSH_COMMON_OPTIONS = (
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=3",
     "-o", "ConnectionAttempts=1",
-    "-o", "ControlMaster=auto",
-    "-o", "ControlPersist=90",
-    "-o", "ControlPath=/tmp/bracketbot-dashboard-%C",
     "-o", "ServerAliveInterval=2",
     "-o", "ServerAliveCountMax=2",
+)
+SSH_IDENTITY_OPTIONS = ()
+if DEFAULT_SSH_IDENTITY.is_file():
+    SSH_IDENTITY_OPTIONS = (
+        "-i", str(DEFAULT_SSH_IDENTITY),
+        "-o", "IdentitiesOnly=yes",
+    )
+SSH_MULTIPLEX_OPTIONS = ()
+if os.name != "nt":
+    SSH_MULTIPLEX_OPTIONS = (
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPersist=90",
+        "-o", "ControlPath=/tmp/bracketbot-dashboard-%C",
+    )
+SSH_OPTIONS = (
+    *SSH_COMMON_OPTIONS,
+    *SSH_MULTIPLEX_OPTIONS,
+    *SSH_IDENTITY_OPTIONS,
 )
 # Discovery commands must not create a persistent multiplexing master. A new
 # master inherits subprocess.run's capture pipes and keeps them open for the
 # ControlPersist window, making a successful probe look like a timeout.
 SSH_PROBE_OPTIONS = (
-    *SSH_OPTIONS,
+    *SSH_COMMON_OPTIONS,
+    *SSH_IDENTITY_OPTIONS,
     "-o", "ControlMaster=no",
     "-o", "ControlPath=none",
 )
@@ -69,6 +90,30 @@ DEFAULT_SSH_HOSTS = (
     "bracketbot@bracketbot-184.local",
     "bot",
 )
+NETWORK_INTERFACE = "wlan_usb"
+NETWORK_PROFILES = {
+    "hotspot": {
+        "id": "hotspot",
+        "label": "LG-SmartRug",
+        "description": "Personal hotspot",
+        "connection": "LG-SmartRug",
+    },
+    "bib-wifi": {
+        "id": "bib-wifi",
+        "label": "bib-wifi",
+        "description": "BIB Wi-Fi (saved as bb-wifi)",
+        "connection": "bb-wifi",
+    },
+}
+
+
+def ssh_options_for_host(host, *, probe=False):
+    """Return SSH options that keep mDNS live despite stale user config."""
+    options = SSH_PROBE_OPTIONS if probe else SSH_OPTIONS
+    hostname = host.rsplit("@", 1)[-1]
+    if hostname.endswith(".local"):
+        return (*options, "-o", f"HostName={hostname}")
+    return options
 
 
 class RobotConnectionError(RuntimeError):
@@ -238,6 +283,60 @@ def action_bundle_paths():
     return tuple(dict.fromkeys(paths))
 
 
+def voice_uploads():
+    """Return persistent browser-playable MP4 clips without exposing disk paths."""
+    def sort_key(path):
+        match = re.fullmatch(r"(.*?)(?:-(\d+))?", path.stem)
+        return match.group(1), int(match.group(2) or 1), path.name
+
+    try:
+        paths = sorted(VOICE_UPLOAD_DIR.glob("*.mp4"), key=sort_key)
+    except OSError:
+        return []
+    return [
+        {
+            "id": path.stem,
+            "label": path.stem.replace("-", " ").title(),
+            "description": "Uploaded voice clip",
+            "preview_url": f"/api/voice/{path.stem}",
+        }
+        for path in paths
+        if path.is_file()
+    ]
+
+
+def save_voice_upload(filename, payload):
+    """Validate and persist one MP4, returning its public dashboard metadata."""
+    filename = Path(filename).name
+    if not filename.lower().endswith(".mp4"):
+        raise ValueError("Choose an MP4 file")
+    if not payload:
+        raise ValueError("The uploaded file is empty")
+    if len(payload) > MAX_VOICE_UPLOAD_BYTES:
+        raise ValueError("MP4 files must be 50 MB or smaller")
+    if len(payload) < 12 or payload[4:8] != b"ftyp":
+        raise ValueError("The uploaded file is not a valid MP4 container")
+
+    slug = re.sub(r"[^a-z0-9]+", "-", Path(filename).stem.lower()).strip("-")[:48]
+    slug = slug or "voice-clip"
+    VOICE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    for suffix in range(1000):
+        clip_id = slug if suffix == 0 else f"{slug}-{suffix + 1}"
+        target = VOICE_UPLOAD_DIR / f"{clip_id}.mp4"
+        try:
+            with target.open("xb") as output:
+                output.write(payload)
+        except FileExistsError:
+            continue
+        return {
+            "id": clip_id,
+            "label": clip_id.replace("-", " ").title(),
+            "description": "Uploaded voice clip",
+            "preview_url": f"/api/voice/{clip_id}",
+        }
+    raise ValueError("Too many clips use that filename")
+
+
 def remote_python_command(script, *args):
     """Prefer the already-created BBOS venv, with uv as a portable fallback."""
     payload = " ".join(shlex.quote(str(value)) for value in (script, *args))
@@ -277,6 +376,9 @@ class DashboardState:
         self.lean_process = None
         self.lean_pid_file = None
         self.stop_lean_after_action = False
+        self.network_transition = False
+        self.network_profile = "hotspot" if simulate else None
+        self.network_target = None
         self.server_id = uuid.uuid4().hex
 
     def snapshot(self):
@@ -298,9 +400,21 @@ class DashboardState:
                 "server_id": self.server_id,
                 "actions": [action.public() for action in ACTION_LIST],
                 "routines": [routine.public() for routine in ROUTINE_LIST],
+                "voice_uploads": voice_uploads(),
                 "lean_enabled": self.lean_enabled,
                 "lean_transition": self.lean_transition,
                 "lean_phase": self.lean_phase,
+                "network_transition": self.network_transition,
+                "network_profile": self.network_profile,
+                "network_target": self.network_target,
+                "networks": [
+                    {
+                        key: value
+                        for key, value in profile.items()
+                        if key != "connection"
+                    }
+                    for profile in NETWORK_PROFILES.values()
+                ],
             }
 
     def add_log(self, line):
@@ -335,7 +449,7 @@ class RobotController:
     @staticmethod
     def _probe(host):
         command = [
-            "ssh", *SSH_PROBE_OPTIONS, host,
+            "ssh", *ssh_options_for_host(host, probe=True), host,
             'test -x "$HOME/.local/bin/uv" && '
             'test -d "$HOME/bbos"',
         ]
@@ -362,10 +476,10 @@ class RobotController:
             "sleep 0.25; done; exit 1; fi"
         )
         result = subprocess.run(
-            ["ssh", *SSH_OPTIONS, host, remote],
+            ["ssh", *ssh_options_for_host(host), host, remote],
             capture_output=True,
             text=True,
-            timeout=6,
+            timeout=SSH_PROBE_TIMEOUT,
         )
         if result.returncode != 0:
             error_type = RobotConnectionError if result.returncode == 255 else RuntimeError
@@ -392,13 +506,21 @@ class RobotController:
 
         try:
             reachable = set()
-            with ThreadPoolExecutor(max_workers=len(self.state.ssh_hosts)) as pool:
-                futures = {
-                    pool.submit(self._probe, host): host for host in self.state.ssh_hosts
+            if os.name == "nt":
+                # Windows OpenSSH can time out when a subprocess is started by
+                # a ThreadPoolExecutor worker. There are only a few candidate
+                # routes, so probe them sequentially there.
+                reachable = {
+                    host for host in self.state.ssh_hosts if self._probe(host)
                 }
-                for future in as_completed(futures):
-                    if future.result():
-                        reachable.add(futures[future])
+            else:
+                with ThreadPoolExecutor(max_workers=len(self.state.ssh_hosts)) as pool:
+                    futures = {
+                        pool.submit(self._probe, host): host for host in self.state.ssh_hosts
+                    }
+                    for future in as_completed(futures):
+                        if future.result():
+                            reachable.add(futures[future])
 
             # Preserve the configured order when more than one interface works.
             selected = next(
@@ -420,7 +542,9 @@ class RobotController:
                         self.state.error = str(exc)
                 else:
                     elapsed = time.monotonic() - started
+                    active_network = self._active_network(selected)
                     with self.state.lock:
+                        self.state.network_profile = active_network
                         self.state.phase = (
                             f"Ready — {len(action_bundle_paths())} action files cached "
                             f"in {elapsed:.1f}s"
@@ -438,11 +562,121 @@ class RobotController:
                 self.state.checking = False
             self._discover_lock.release()
 
+    def _active_network(self, host):
+        if self.state.simulate:
+            return self.state.network_profile
+        try:
+            result = subprocess.run(
+                [
+                    "ssh", *ssh_options_for_host(host), host,
+                    f"nmcli -g GENERAL.CONNECTION device show {NETWORK_INTERFACE}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=SSH_PROBE_TIMEOUT,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        connection = result.stdout.strip()
+        return next(
+            (
+                profile_id
+                for profile_id, profile in NETWORK_PROFILES.items()
+                if profile["connection"] == connection
+            ),
+            None,
+        )
+
+    def switch_network(self, profile_id):
+        profile = NETWORK_PROFILES.get(profile_id)
+        if profile is None:
+            return False, "Unknown Wi-Fi profile"
+        with self.state.lock:
+            if self.state.running:
+                return False, "Wait for the current robot action to finish"
+            if self.state.lean_enabled or self.state.lean_transition:
+                return False, "Return the robot to balance mode before changing Wi-Fi"
+            if self.state.checking or self.state.network_transition:
+                return False, "A connection change is already in progress"
+            host = self.state.host
+            if host is None:
+                return False, "Robot is not connected; choose Reconnect"
+            if self.state.network_profile == profile_id:
+                return True, f"Robot is already connected to {profile['label']}"
+            self.state.network_transition = True
+            self.state.network_target = profile_id
+            self.state.phase = f"Switching robot Wi-Fi to {profile['label']}..."
+            self.state.error = None
+
+        if self.state.simulate:
+            with self.state.lock:
+                self.state.network_profile = profile_id
+                self.state.network_target = None
+                self.state.network_transition = False
+                self.state.phase = f"Simulation connected to {profile['label']}"
+            return True, f"Switched to {profile['label']}"
+
+        threading.Thread(
+            target=self._switch_network,
+            args=(host, profile_id, profile),
+            name="network-switch",
+            daemon=True,
+        ).start()
+        return True, f"Switching robot to {profile['label']}"
+
+    def _switch_network(self, host, profile_id, profile):
+        inner = (
+            f"sleep 1; nmcli connection up {shlex.quote(profile['connection'])} "
+            f"ifname {shlex.quote(NETWORK_INTERFACE)}"
+        )
+        remote = (
+            f"nohup sh -c {shlex.quote(inner)} "
+            ">/tmp/bracketbot-network-switch.log 2>&1 </dev/null & "
+            "echo network-switch-started"
+        )
+        try:
+            result = subprocess.run(
+                ["ssh", *ssh_options_for_host(host), host, remote],
+                capture_output=True,
+                text=True,
+                timeout=SSH_PROBE_TIMEOUT,
+            )
+            if result.returncode != 0 or "network-switch-started" not in result.stdout:
+                raise RobotConnectionError("The robot did not accept the Wi-Fi switch")
+        except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+            with self.state.lock:
+                self.state.network_transition = False
+                self.state.network_target = None
+                self.state.phase = "Wi-Fi switch failed"
+                self.state.error = str(exc)
+            return
+
+        self._invalidate_deploy_cache(host)
+        with self.state.lock:
+            self.state.host = None
+            self.state.network_profile = profile_id
+            self.state.network_transition = False
+            self.state.network_target = None
+            self.state.phase = (
+                f"Robot is changing to {profile['label']}. Connect this computer "
+                "to the same network, then choose Reconnect."
+            )
+            self.state.log.append(f"[network] switch requested: {profile['label']}")
+
     def discover_async(self):
         threading.Thread(target=self.discover, name="robot-discovery", daemon=True).start()
 
     def start_monitor(self):
         if self.state.simulate:
+            return
+        if os.name == "nt":
+            # Windows OpenSSH cannot reliably open its network socket when
+            # launched from a Python worker thread. Connect during startup on
+            # the main thread; action execution still reports disconnects and
+            # the dashboard can be restarted to reconnect.
+            self.discover()
             return
         self.discover_async()
 
@@ -589,7 +823,7 @@ class RobotController:
             if self.state.cancel_requested:
                 return
         process = subprocess.Popen(
-            ["ssh", *SSH_OPTIONS, host, remote_command],
+            ["ssh", *ssh_options_for_host(host), host, remote_command],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -659,7 +893,7 @@ class RobotController:
                 return False
 
             deploy = subprocess.run(
-                ["scp", "-q", *SSH_OPTIONS, *(str(path) for path in missing), f"{host}:/tmp/"],
+                ["scp", "-q", *ssh_options_for_host(host), *(str(path) for path in missing), f"{host}:/tmp/"],
                 capture_output=True,
                 text=True,
                 timeout=20,
@@ -820,7 +1054,7 @@ class RobotController:
                 "--pid-file", pid_file,
             )
             process = subprocess.Popen(
-                ["ssh", *SSH_OPTIONS, host, remote_command],
+                ["ssh", *ssh_options_for_host(host), host, remote_command],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -860,7 +1094,7 @@ class RobotController:
         def request_stop():
             subprocess.run(
                 [
-                    "ssh", *SSH_OPTIONS, host,
+                    "ssh", *ssh_options_for_host(host), host,
                     "for attempt in 1 2 3 4 5 6 7 8 9 10; do "
                     f"if test -s {pid_file}; then "
                     f"xargs kill -INT < {pid_file}; exit 0; fi; "
@@ -973,6 +1207,15 @@ h1 { margin:0; font-size:clamp(2.1rem,6vw,4rem); line-height:1; letter-spacing:-
 .group-icon { width:28px; height:28px; display:grid; place-items:center; border-radius:9px;
   background:var(--red-soft); color:var(--red); font-size:.9rem; font-weight:900; }
 .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+.voice-upload { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:9px; align-items:center;
+  margin-top:12px; padding-top:12px; border-top:1px solid var(--line); }
+.voice-upload input { min-width:0; width:100%; color:var(--muted); font:inherit;
+  font-size:.78rem; font-weight:700; }
+.voice-upload input::file-selector-button { margin-right:9px; border:1px solid var(--line);
+  border-radius:10px; padding:8px 10px; background:var(--surface); color:var(--text); cursor:pointer; }
+.voice-upload button { min-height:42px; border-radius:12px; padding:8px 13px; text-align:center;
+  font-size:.78rem; font-weight:850; }
+.voice-upload-status { grid-column:1/-1; min-height:1.2em; margin:0; color:var(--muted); font-size:.75rem; }
 button { min-height:104px; border:1px solid var(--line); border-radius:20px; padding:15px;
   text-align:left; background:var(--surface); color:var(--text); font:inherit; cursor:pointer;
   box-shadow:0 5px 14px rgba(61,37,38,.05); transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease; }
@@ -990,6 +1233,14 @@ button:disabled { opacity:.48; cursor:not-allowed; filter:saturate(.4); }
 .key { float:right; border:1px solid #e8d9d9; border-radius:7px; padding:1px 7px;
   background:#faf5f4; color:#8b7b7c; font:800 .68rem/1.45 ui-monospace,SFMono-Regular,monospace; }
 .controls { display:grid; grid-template-columns:repeat(2,1fr); gap:12px; margin-top:18px; }
+.network { margin-top:24px; padding:20px; border:1px solid var(--line); border-radius:28px;
+  background:rgba(255,255,255,.78); }
+.network h2 { display:flex; align-items:center; gap:10px; margin:0 0 5px; color:#4d484c;
+  font-size:.78rem; letter-spacing:.12em; text-transform:uppercase; }
+.network-copy { margin:0 0 14px; color:var(--muted); font-size:.86rem; }
+.network-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+.network-card.active { border-color:var(--good); box-shadow:0 0 0 3px rgba(45,143,87,.12); }
+.network-card.active .desc { color:var(--good); font-weight:800; }
 .positioning { margin-top:24px; padding:20px; border:1px solid var(--line); border-radius:28px;
   background:linear-gradient(145deg,rgba(255,255,255,.88),rgba(255,240,241,.72)); }
 .positioning h2 { display:flex; align-items:center; gap:10px; margin:0 0 5px; color:#4d484c;
@@ -1019,7 +1270,8 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:560px; overflow:a
   .status-tag { width:max-content; margin-left:24px; }
   .group { padding:15px; border-radius:22px; }
   .grid { grid-template-columns:1fr; }
-  .controls,.positioning-grid { grid-template-columns:1fr; }
+  .voice-upload { grid-template-columns:1fr; }
+  .controls,.positioning-grid,.network-grid { grid-template-columns:1fr; }
   button { min-height:92px; }
 }
 @media (prefers-reduced-motion:reduce) { * { transition:none!important; scroll-behavior:auto!important; }
@@ -1049,6 +1301,11 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:560px; overflow:a
     <span class="status-tag">System status</span>
   </section>
   <div id="catalog" aria-live="polite"></div>
+  <section class="network" aria-labelledby="network-title">
+    <h2 id="network-title"><span class="group-icon" aria-hidden="true">Wi-Fi</span>Robot network</h2>
+    <p id="network-detail" class="network-copy">Switches the robot only. Put this computer on the same network, then reconnect.</p>
+    <div id="network-grid" class="network-grid"></div>
+  </section>
   <section class="positioning" aria-labelledby="positioning-title">
     <h2 id="positioning-title"><span class="group-icon" aria-hidden="true">↗</span>Positioning</h2>
     <p class="positioning-copy">Set the base first, then place the arms using the live depth view.</p>
@@ -1071,8 +1328,9 @@ const lean=document.getElementById('lean'), baseDetail=document.getElementById('
 const tableRest=document.getElementById('table-rest');
 const latencyDetail=document.getElementById('latency-detail');
 const log=document.getElementById('log'), catalog=document.getElementById('catalog');
+const networkGrid=document.getElementById('network-grid'), networkDetail=document.getElementById('network-detail');
 // A changed server ID means the Python process hot-reloaded; fetch the new page bundle.
-let current={}, buttons=[], rendered=false, previewAudio=null, loadedServerId=null;
+let current={}, buttons=[], rendered=false, voiceSignature='', previewAudio=null, loadedServerId=null;
 async function post(path, body={}) {
   const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   return response.json();
@@ -1100,8 +1358,46 @@ function makeButton(item, type) {
   });
   return button;
 }
+function playVoiceClip(item) {
+  if(previewAudio) previewAudio.pause();
+  previewAudio=new Audio(item.preview_url);
+  previewAudio.play().catch(()=>{});
+}
+function makeVoiceButton(item) {
+  const button=document.createElement('button'); button.className='action-card'; button.dataset.voice=item.id;
+  const label=document.createElement('span'); label.className='label'; label.textContent=item.label; button.append(label);
+  const desc=document.createElement('span'); desc.className='desc'; desc.textContent=item.description; button.append(desc);
+  button.addEventListener('click',()=>playVoiceClip(item));
+  return button;
+}
+function makeVoiceUpload() {
+  const form=document.createElement('form'); form.className='voice-upload';
+  const input=document.createElement('input'); input.type='file'; input.accept='video/mp4,.mp4'; input.required=true;
+  input.setAttribute('aria-label','Choose an MP4 voice clip');
+  const submit=document.createElement('button'); submit.type='submit'; submit.textContent='Upload MP4';
+  const status=document.createElement('p'); status.className='voice-upload-status'; status.setAttribute('aria-live','polite');
+  form.append(input,submit,status);
+  form.addEventListener('submit',async event=>{
+    event.preventDefault(); const file=input.files?.[0]; if(!file) return;
+    submit.disabled=true; status.textContent='Uploading...';
+    try {
+      const response=await fetch('/api/voice/upload',{method:'POST',headers:{
+        'Content-Type':'video/mp4','X-File-Name':encodeURIComponent(file.name)},body:file});
+      const result=await response.json();
+      if(!response.ok) throw new Error(result.error||'Upload failed');
+      current.voice_uploads=result.voice_uploads||[]; input.value='';
+      rendered=false; renderCatalog();
+      const nextStatus=catalog.querySelector('.voice-upload-status');
+      if(nextStatus) nextStatus.textContent='Saved. Your new button is ready.';
+    } catch(uploadError) { status.textContent=uploadError.message; }
+    finally { submit.disabled=false; }
+  });
+  return form;
+}
 function renderCatalog() {
-  if(rendered) return;
+  const nextVoiceSignature=JSON.stringify((current.voice_uploads||[]).map(item=>item.id));
+  if(rendered&&voiceSignature===nextVoiceSignature) return;
+  catalog.replaceChildren(); voiceSignature=nextVoiceSignature;
   const groupIcons={Gestures:'✦',Lights:'◉',Sounds:'♫',Music:'♪',Routines:'＋'};
   const groups=new Map();
   for(const action of current.actions) {
@@ -1115,7 +1411,9 @@ function renderCatalog() {
     const icon=document.createElement('span'); icon.className='group-icon'; icon.setAttribute('aria-hidden','true'); icon.textContent=groupIcons[name]||'•';
     title.append(icon,document.createTextNode(name)); section.append(title);
     const grid=document.createElement('div'); grid.className='grid';
-    items.forEach(item=>grid.append(makeButton(item,'action'))); section.append(grid); catalog.append(section);
+    items.forEach(item=>grid.append(makeButton(item,'action')));
+    if(name==='Sounds') (current.voice_uploads||[]).forEach(item=>grid.append(makeVoiceButton(item)));
+    section.append(grid); if(name==='Sounds') section.append(makeVoiceUpload()); catalog.append(section);
   }
   const section=document.createElement('section'); section.className='group'; section.setAttribute('aria-label','Routines');
   const title=document.createElement('h2');
@@ -1123,7 +1421,31 @@ function renderCatalog() {
   title.append(icon,document.createTextNode('Routines')); section.append(title);
   const grid=document.createElement('div'); grid.className='grid';
   current.routines.forEach(item=>grid.append(makeButton(item,'routine'))); section.append(grid); catalog.append(section);
-  buttons=[...catalog.querySelectorAll('button'),tableRest]; rendered=true;
+  buttons=[...catalog.querySelectorAll('[data-action],[data-routine]'),tableRest]; rendered=true;
+}
+function renderNetworks() {
+  networkGrid.replaceChildren();
+  for(const item of current.networks||[]) {
+    const button=document.createElement('button');
+    button.className='network-card'+(current.network_profile===item.id?' active':'');
+    button.dataset.network=item.id;
+    const label=document.createElement('span'); label.className='label'; label.textContent=item.label;
+    const desc=document.createElement('span'); desc.className='desc';
+    desc.textContent=current.network_profile===item.id?'Robot connected here':item.description;
+    button.append(label,desc);
+    button.disabled=!current.connected||current.running||current.checking||current.lean_enabled||current.lean_transition||current.network_transition||current.network_profile===item.id;
+    button.addEventListener('click',async()=>{
+      const result=await post('/api/network',{profile:item.id});
+      if(!result.ok) networkDetail.textContent=result.message;
+      await refresh();
+    });
+    networkGrid.append(button);
+  }
+  if(current.network_transition) networkDetail.textContent='Sending the network change to the robot...';
+  else if(current.network_profile) {
+    const active=(current.networks||[]).find(item=>item.id===current.network_profile);
+    networkDetail.textContent=`Robot Wi-Fi: ${active?.label||current.network_profile}. Switching drops SSH; connect this computer to the same network, then reconnect.`;
+  }
 }
 async function refresh() {
   try {
@@ -1133,7 +1455,8 @@ async function refresh() {
     }
     current=next; loadedServerId=next.server_id||loadedServerId;
     renderCatalog();
-    const ready=current.connected&&!current.running&&!current.checking;
+    renderNetworks();
+    const ready=current.connected&&!current.running&&!current.checking&&!current.network_transition;
     buttons.forEach(b=>b.disabled=!ready); stop.disabled=!(current.running||current.lean_enabled||current.lean_transition);
     reconnect.disabled=current.running||current.checking||current.lean_enabled||current.lean_transition;
     lean.disabled=!current.connected||current.lean_transition||current.running;
@@ -1190,7 +1513,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; media-src 'self'")
         self.end_headers()
         self.wfile.write(body)
 
@@ -1218,6 +1541,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._send({"error": "Audio unavailable"}, HTTPStatus.NOT_FOUND)
                 return
             self._send(audio, content_type="audio/wav")
+        elif self.path.startswith("/api/voice/"):
+            clip_id = unquote(self.path.removeprefix("/api/voice/"))
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", clip_id):
+                self._send({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+                return
+            try:
+                audio = (VOICE_UPLOAD_DIR / f"{clip_id}.mp4").read_bytes()
+            except OSError:
+                self._send({"error": "Voice clip unavailable"}, HTTPStatus.NOT_FOUND)
+                return
+            self._send(audio, content_type="video/mp4")
         else:
             self._send({"error": "Not found"}, HTTPStatus.NOT_FOUND)
 
@@ -1234,6 +1568,31 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/lean":
             ok, message = self.controller.set_lean(self._json_body().get("enabled"))
             self._send({"ok": ok, "message": message}, HTTPStatus.ACCEPTED if ok else HTTPStatus.CONFLICT)
+        elif self.path == "/api/network":
+            ok, message = self.controller.switch_network(self._json_body().get("profile"))
+            self._send({"ok": ok, "message": message}, HTTPStatus.ACCEPTED if ok else HTTPStatus.CONFLICT)
+        elif self.path == "/api/voice/upload":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if length > MAX_VOICE_UPLOAD_BYTES:
+                self._send(
+                    {"error": "MP4 files must be 50 MB or smaller"},
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                )
+                return
+            filename = unquote(self.headers.get("X-File-Name", ""))
+            payload = self.rfile.read(max(length, 0))
+            try:
+                clip = save_voice_upload(filename, payload)
+            except (OSError, ValueError) as exc:
+                self._send({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            self._send(
+                {"ok": True, "clip": clip, "voice_uploads": voice_uploads()},
+                HTTPStatus.CREATED,
+            )
         elif self.path == "/api/stop":
             ok, message = self.controller.stop()
             self._send({"ok": ok, "message": message}, HTTPStatus.ACCEPTED if ok else HTTPStatus.CONFLICT)
@@ -1284,6 +1643,7 @@ def start_source_reloader(server, controller, source, reload_requested, stop_eve
                 or state["checking"]
                 or state["lean_enabled"]
                 or state["lean_transition"]
+                or state["network_transition"]
             )
             if busy:
                 if not announced_wait:
