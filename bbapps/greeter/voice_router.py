@@ -26,7 +26,7 @@ from urllib import error, request
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 BROWSERBASE_SEARCH_URL = "https://api.browserbase.com/v1/search"
-DEFAULT_MODEL = "openai/gpt-oss-20b"
+DEFAULT_MODEL = "openai/gpt-oss-120b"
 DEFAULT_SYSTEM_PROMPT = (
     "You are BracketBot, a warm embodied home robot assistant with a cheerful, "
     "gentle bedside manner inspired by Baymax. Sound genuinely happy to help, "
@@ -453,6 +453,15 @@ _QUESTION_OPENERS = frozenset(
 
 def normalize_utterance(text: str) -> str:
     """Normalize speech-to-text output without fuzzy action matching."""
+    # Whisper often writes a short command twice ("Follow me. Follow me.",
+    # "Stop. BracketBot, stop."). Identical sentences are one command.
+    sentences = {_normalize_sentence(part) for part in re.split(r"[.!?\n]+", text)} - {""}
+    if len(sentences) == 1:
+        return sentences.pop()
+    return _normalize_sentence(text)
+
+
+def _normalize_sentence(text: str) -> str:
     normalized = text.lower().replace("’", "'")
     normalized = re.sub(r"[^a-z0-9'\s-]", " ", normalized)
     normalized = normalized.replace("-", " ")
@@ -461,6 +470,26 @@ def normalize_utterance(text: str) -> str:
     normalized = _LEADING_POLITE.sub("", normalized, count=1)
     normalized = _TRAILING_POLITE.sub("", normalized, count=1)
     return normalized.strip()
+
+
+_STOP_WORDS = frozenset({"stop", "halt", "freeze"})
+_NAMED_STOP = re.compile(r"\b(?:baymax|bamax|(?:bracket|racket)\s*bot)\s+(?:stop|halt|freeze)\b")
+
+
+def sounds_like_stop(text: str) -> bool:
+    """A stop buried in a messy transcript: "Stop. Maybe. Do you know what...".
+
+    Deliberately loose, and only acted on while something is running (see
+    ``VoiceRouter.route``): a moving robot that misses "stop" is worse than one
+    that stops for a sentence which merely began with the word.
+    """
+    words = re.sub(r"[^a-z0-9'\s]", " ", text.lower()).split()
+    if not words:
+        return False
+    if words[0] in _STOP_WORDS or words[-1] in _STOP_WORDS:
+        return True
+    joined = " ".join(words)
+    return bool(_NAMED_STOP.search(joined)) or "stop following" in joined or "stop moving" in joined
 
 
 def match_action(text: str) -> str | None:
@@ -1227,9 +1256,12 @@ class OpenRouterClient:
             "messages": messages,
             "max_tokens": self.max_tokens,
             "temperature": 0.4,
-            # The reply is spoken, so time to first word matters more than
-            # picking the cheapest host for the same model.
-            "provider": {"sort": "throughput"},
+            # The reply is spoken and about thirty tokens long, so the host's
+            # time to first token decides the wait, not its tokens per second.
+            # Measured from the robot (scripts/bench_voice_llm.py): latency
+            # sort with low reasoning effort cut a turn from 0.55 s to 0.34 s.
+            "provider": {"sort": "latency"},
+            "reasoning": {"effort": "low"},
         }
         if tools:
             payload_body["tools"] = tools
@@ -1540,6 +1572,15 @@ class VoiceRouter:
                 reply=status,
                 action_started=stopped,
             )
+
+        if self.stop_executor is not None and sounds_like_stop(utterance):
+            # Not an exact stop phrase. Stop if something is running; if nothing
+            # is, this was ordinary speech and is routed as usual.
+            stopped, status = self.stop_executor()
+            if stopped:
+                return RouteDecision(
+                    RouteKind.ACTION, utterance, action="stop", reply=status, action_started=True
+                )
 
         if normalize_utterance(utterance) in REMINDER_CANCEL_ALIASES:
             if self.reminder_cancel_executor is None:

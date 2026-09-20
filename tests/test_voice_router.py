@@ -3,7 +3,10 @@ import sqlite3
 from http.client import RemoteDisconnected
 from pathlib import Path
 
+import pytest
+
 from bbapps.greeter.voice_router import (
+    DEFAULT_MODEL,
     DEFAULT_SEED_PATH,
     SEED_FILENAME,
     BrowserbaseSearchClient,
@@ -133,6 +136,46 @@ def test_stop_is_deterministic_and_never_reaches_the_llm_or_action_executor():
     assert decision.reply == "Okay. Stopping safely."
     assert actions == []
     assert stops == ["stop"]
+
+
+@pytest.mark.parametrize("heard", [
+    "Stop. BracketBot, stop.",
+    "Stop. Maybe. Do you know what the folks are?",
+    "Okay BracketBot stop following me now",
+    "Hey, hey, BracketBot stop!",
+    "please just stop",
+])
+def test_a_messy_transcript_containing_stop_still_stops_a_running_action(heard):
+    class ForbiddenClient:
+        def complete(self, _messages, *, tools=None):
+            raise AssertionError("stop must not reach the LLM")
+
+    stops = []
+    decision = VoiceRouter(
+        ForbiddenClient(),
+        stop_executor=lambda: (stops.append("stop") is None, "Okay. Stopping safely."),
+    ).route(heard)
+    assert (decision.action, decision.action_started, stops) == ("stop", True, ["stop"])
+
+
+def test_a_sentence_starting_with_stop_is_ordinary_speech_when_nothing_is_running():
+    asked = []
+
+    class Client:
+        def complete(self, *args, **_kwargs):
+            asked.append(args[0])
+            raise RuntimeError("no network in tests")
+
+    router = VoiceRouter(Client(), stop_executor=lambda: (False, "No voice action is running."))
+    with pytest.raises(RuntimeError, match="no network"):   # it went on to the LLM, not to stop
+        router.route("Stop signs, what colour are they?")
+    assert asked == ["Stop signs, what colour are they?"]
+
+
+def test_a_command_whisper_wrote_twice_is_one_command():
+    assert normalize_utterance("Follow me. Follow me.") == "follow me"
+    assert normalize_utterance("Stop. BracketBot, stop.") == "stop"
+    assert match_action("Follow me. Follow me.") == "follow-me"
 
 
 def test_stop_reports_when_no_movement_is_running():
@@ -380,7 +423,7 @@ def test_cache_hit_is_kept_in_history_for_follow_up(tmp_path):
     cache.put(
         "What is the capital of Canada?",
         "Ottawa is Canada's capital.",
-        "openai/gpt-oss-20b",
+        DEFAULT_MODEL,
         "test prompt",
     )
     requests = []
@@ -1250,7 +1293,8 @@ def test_spoken_turns_ask_for_the_fastest_provider():
         return FakeResponse({"choices": [{"message": {"content": "Sure."}}]})
 
     OpenRouterClient(api_key="test-key", opener=opener).ask("Why is the sky blue?")
-    assert seen[-1]["provider"] == {"sort": "throughput"}
+    assert seen[-1]["provider"] == {"sort": "latency"}
+    assert seen[-1]["reasoning"] == {"effort": "low"}
 
 
 def test_seed_is_found_in_the_flat_robot_deployment(tmp_path, monkeypatch):

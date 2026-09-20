@@ -117,6 +117,20 @@ class PersonTrackerClient:
             return {"found": False, "reason": "cancelled"}
         return reply or {"found": False, "reason": "timed out looking for a person"}
 
+    def turn(self, delta_deg: float, cancel: threading.Event) -> dict:
+        """Turn in place by ``delta_deg`` (positive left). ``ok`` says whether it happened."""
+        if not self.running() or not self._ready.is_set():
+            return {"ok": False, "reason": "person tracker is not running"}
+        request_id = next(self._ids)
+        if not self._send({"id": request_id, "cmd": "turn", "delta_deg": float(delta_deg)}):
+            return {"ok": False, "reason": "person tracker is not running"}
+        reply = self._wait_reply(request_id, time.monotonic() + 15.0, cancel)
+        if reply is not None:
+            return reply
+        self._send({"cmd": "cancel"})
+        self._wait_reply(request_id, time.monotonic() + 3.0)
+        return {"ok": False, "reason": "cancelled" if cancel.is_set() else "timed out turning"}
+
     def close(self, timeout: float = 3.0) -> None:
         process = self._process
         if process is None:

@@ -63,7 +63,7 @@ def test_goodbye_plays_wave_before_making_both_arms_limp(monkeypatch):
     monkeypatch.setattr(
         runtime,
         "prepare_recorded_movement",
-        lambda frames: SimpleNamespace(sides=("left",)),
+        lambda frames, name=None, turn_body=None: SimpleNamespace(sides=("left",)),
     )
     monkeypatch.setattr(
         runtime,

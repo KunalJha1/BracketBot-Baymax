@@ -8,7 +8,46 @@ stops outside its body envelope, waits for stationary wheels, and says exactly:
 > hello specimen, are you in trouble
 
 It completes after speaking once. Another button press is required to repeat.
-The action never starts on boot or as a side effect of a navigation alert.
+
+## Automatic check-in
+
+The voice assistant (`bbapps/greeter/local_assistant.py`) also starts the same
+approach by itself. `GroundAlertWatcher` polls `/tmp/bracketbot_ground_alert.json`
+twice a second, and when it holds one fresh, confirmed alert it starts the
+`check-on-person` action: the assistant says it is coming over, runs
+`robot_follow.py --ground-approach --no-speech` with the same heartbeat as
+"follow me", and speaks the check-in line itself on arrival (it owns the only
+`speaker.audio` writer). Every limit below still applies, and the neck flashes
+red/blue for as long as the alert holds.
+
+- One attempt per alert episode. Arriving, a refused start, and a spoken
+  "stop" all end the episode; nothing restarts until the alert has been clear
+  for 10 seconds.
+- It waits while another voice action or a wake-word turn is in progress, and
+  does nothing for two simultaneous alerts or a vision file older than 1 second.
+- "Hey BracketBot, stop" cancels it like any other action.
+- `--no-auto-ground-check` on the assistant turns it off; the dashboard button
+  is unaffected.
+
+## What counts as lying down
+
+`ground_safety.assess_ground_pose` needs a low torso, most joints near the
+floor and a long footprint, and additionally a lying posture: the highest
+shoulder at most 0.45 m up, shoulders within 0.30 m of hip height (a
+near-horizontal trunk), and, when the head has depth, a head at most 0.55 m up.
+Someone sitting on the floor with their legs out passes the first three tests
+but not these, and reads as `clear` with the reason
+`low but trunk upright: sitting or crouching, not lying`.
+
+The depth cloud ends about 1.7 m out, so most people on the floor have no depth
+on their joints. For those, `assess_ground_pose_monocular` slides every joint
+down its camera ray onto the floor (camera model fitted from `camera.points`,
+0.02 px error) and checks bone lengths: a body really lying there keeps human
+proportions, while a standing, seated or crouching one comes out metres long
+and reads `clear`. Reasons from this path start with `mono:`. Detection gaps
+under 0.7 s no longer restart the 2 s hold, tracks survive 8 missed frames, and
+a confirmed alert nobody has seen for 15 s is dropped instead of latching
+forever.
 
 ## Setup
 
@@ -59,20 +98,21 @@ integral near the target (0.3 m range error, 20° bearing error). Integral outpu
 contributions are bounded at 0.2 m/s and ±0.15 rad/s; the final creep-speed caps
 still apply, with anti-windup at saturation. Ground mode resets both PIDs when
 motion is inhibited or the control clock has a long gap. The desired distance
-to the body centre is `body_radius + 1.0 m`; angular target-velocity feedforward
+to the body centre is `body_radius + 0.6 m`; angular target-velocity feedforward
 is zero because this is a ground-pose approach. It also inherits the runner's
 background depth processing and calibrated output turning sign (`omega_sign`).
 
 The envelope is the furthest depth-associated joint from the median body
 position plus 0.25 m. Its radius can grow but cannot shrink during an attempt.
-The robot stops 1.0 m outside it, with a 5 cm arrival tolerance, then requires
+The robot stops 0.6 m outside it (above the 0.45 m range at which the supervisor
+blocks forward motion), with a 5 cm arrival tolerance, then requires
 wheel speed below 0.015 m/s and yaw speed below 0.04 rad/s for 0.6 seconds.
 This margin is based on visible joints; occluded limbs and depth errors still
 require physical evaluation.
 
 Only one alert with a current matching pose is eligible. A latched alert with
 unknown/missing depth, stale/future camera time, malformed data, or multiple
-alerts commands zero. Vision older than 0.65 s or depth older than 0.30 s also
+alerts commands zero. Vision older than 1.0 s or depth older than 0.30 s also
 commands zero, including rotation. A changed vision session/track ID or a
 position jump over 0.4 m terminates the attempt. Total duration is bounded to
 120 seconds. Safety stops bypass acceleration smoothing.

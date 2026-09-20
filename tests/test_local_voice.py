@@ -47,6 +47,7 @@ def test_segmenter_keeps_preroll_and_stops_after_trailing_silence():
         min_utterance_s=0.2,
         trailing_silence_s=0.2,
         max_utterance_s=2.0,
+        wake_tail_s=0.0,
     )
     quiet = np.zeros(10, dtype=np.int16)
     speech = np.full(10, 10000, dtype=np.int16)
@@ -73,6 +74,7 @@ def test_segmenter_does_not_close_during_post_wake_grace():
         trailing_silence_s=0.2,
         start_grace_s=0.6,
         max_utterance_s=2.0,
+        wake_tail_s=0.0,
     )
     speech = np.full(10, 10000, dtype=np.int16)
     quiet = np.zeros(10, dtype=np.int16)
@@ -383,6 +385,124 @@ def test_clarify_speech_passes_silence_through():
 def test_whisper_audio_context_tracks_utterance_length():
     from bbapps.greeter.local_voice import whisper_audio_context
 
-    assert whisper_audio_context(16_000 * 2, 16_000) == 384
-    assert whisper_audio_context(16_000 * 8, 16_000) == 576
+    # The floor is 768: large-v3-turbo hallucinates on a tighter window.
+    assert whisper_audio_context(16_000 * 2, 16_000) == 768
+    assert whisper_audio_context(16_000 * 8, 16_000) == 768
+    assert whisper_audio_context(16_000 * 20, 16_000) == 1152
     assert whisper_audio_context(16_000 * 40, 16_000) == 1500
+
+
+def test_segmenter_offers_speculation_mid_pause_and_tracks_resumed_speech():
+    rate = 16000
+    segmenter = SpeechSegmenter(
+        rate, threshold_db=-38.0, pre_roll_s=0.0, min_utterance_s=0.2,
+        trailing_silence_s=0.6, wake_tail_s=0.0,
+    )
+    loud = (np.ones(1600) * 8000).astype(np.int16)
+    quiet = np.zeros(1600, dtype=np.int16)
+    segmenter.push(loud, triggered=True)
+    for _ in range(3):
+        assert segmenter.push(loud) is None
+    assert not segmenter.speculation_ready(0.25)
+    for _ in range(3):
+        assert segmenter.push(quiet) is None
+    assert segmenter.speculation_ready(0.25)
+    heard = segmenter.loud_chunks
+    assert len(segmenter.snapshot()) == 1600 * 6
+
+    # Talking again must invalidate a guess made during the pause.
+    segmenter.push(loud)
+    assert segmenter.loud_chunks == heard + 1
+    assert not segmenter.speculation_ready(0.25)
+
+
+def test_segmenter_ends_turn_in_a_room_louder_than_the_fixed_threshold():
+    rate = 16000
+    rng = np.random.default_rng(0)
+    segmenter = SpeechSegmenter(
+        rate, threshold_db=-38.0, pre_roll_s=0.5, min_utterance_s=0.2,
+        trailing_silence_s=0.6, max_utterance_s=8.0,
+    )
+    noise = lambda: (rng.standard_normal(1600) * 1000).astype(np.int16)  # ~-30 dB
+    speech = lambda: (rng.standard_normal(1600) * 9000).astype(np.int16)  # ~-11 dB
+    for _ in range(30):
+        assert segmenter.push(noise()) is None
+    segmenter.push(speech(), triggered=True)
+    for _ in range(10):
+        assert segmenter.push(speech()) is None
+    result = None
+    pushed = 0
+    while result is None and pushed < 60:
+        result = segmenter.push(noise())
+        pushed += 1
+    # Ends on the 0.6 s pause, not at the 8 s cap.
+    assert result is not None and pushed <= 7
+
+
+def test_trimming_follows_a_noisy_room_floor():
+    rng = np.random.default_rng(0)
+    rate = 16_000
+    # Room noise at about -39 dBFS, above the fixed -45 dB threshold.
+    audio = rng.normal(0, 370, rate * 4)
+    audio[rate : rate * 2] += np.sin(np.arange(rate) * 0.3) * 8000
+    trimmed = trim_silence(audio.astype(np.int16), rate)
+    assert rate <= len(trimmed) <= rate * 1.6
+
+
+def test_repeated_sentences_collapse_to_one():
+    assert clean_transcript("Follow me. Follow me. Follow me.") == "Follow me."
+    assert clean_transcript("Stop. Follow me.") == "Stop. Follow me."
+
+
+def test_fallback_voice_is_held_instead_of_flipping_mid_reply():
+    now = [0.0]
+    calls = []
+
+    class Broken:
+        def synthesize(self, text, rate):
+            calls.append(text)
+            raise LocalVoiceError("down")
+
+    class Working:
+        def synthesize(self, text, rate):
+            return np.zeros(4, dtype=np.int16)
+
+    voice = FallbackSynthesizer(Broken(), Working(), retry_after_s=60, clock=lambda: now[0])
+    voice.synthesize("one", 16_000)
+    voice.synthesize("two", 16_000)
+    assert calls == ["one"]
+    now[0] = 61.0
+    voice.synthesize("three", 16_000)
+    assert calls == ["one", "three"]
+
+
+def _wake_segmenter():
+    return SpeechSegmenter(
+        16_000, pre_roll_s=1.0, trailing_silence_s=0.6, start_grace_s=0.9
+    )
+
+
+def test_wake_phrase_tail_and_a_pause_do_not_end_the_turn_before_the_question():
+    segmenter = _wake_segmenter()
+    loud = (np.ones(1600) * 8000).astype(np.int16)
+    quiet = np.zeros(1600, dtype=np.int16)
+    segmenter.push(loud, triggered=True)
+    segmenter.push(loud)  # the end of "Hey BracketBot"
+    for _ in range(14):  # 1.4 s waiting for the listening light
+        assert segmenter.push(quiet) is None
+    for _ in range(10):
+        assert segmenter.push(loud) is None
+    result = None
+    for _ in range(6):
+        result = segmenter.push(quiet)
+    assert result is not None
+    assert segmenter.last_had_speech
+
+
+def test_a_wake_with_nothing_after_it_gives_up_without_speech():
+    segmenter = _wake_segmenter()
+    quiet = np.zeros(1600, dtype=np.int16)
+    segmenter.push(quiet, triggered=True)
+    results = [segmenter.push(quiet) for _ in range(50)]
+    assert results[-1] is not None and all(r is None for r in results[:-1])
+    assert not segmenter.last_had_speech

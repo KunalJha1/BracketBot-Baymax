@@ -39,7 +39,7 @@ from follow_calibration import Calibration, DEFAULT_PATH, load_calibration
 from follow_perception import (
     ClusterConfig, base_to_local, find_people, floor_line, level_floor, outside_self_mask, without_self,
 )
-from ground_approach import GroundApproachLoop, GROUND_LINE, approach_config, target_from_payload
+from ground_approach import GroundApproachLoop, GROUND_LINE, STANDOFF, approach_config, target_from_payload
 
 PERIOD = 0.02  # 50 Hz control loop; drive.ctrl times out after 0.1 s
 STATUS_PERIOD = 0.2
@@ -73,6 +73,9 @@ def build_parser():
                         help="approach one confirmed ground pose at <=0.05 m/s and speak once")
     parser.add_argument("--ground-alert-file", type=Path,
                         default=Path("/tmp/bracketbot_ground_alert.json"))
+    parser.add_argument("--no-speech", action="store_true",
+                        help="with --ground-approach: print the check-in line on arrival instead of "
+                             "playing it (the voice assistant holds BBOS's only speaker.audio writer)")
     parser.add_argument("--pid-file", type=Path)
     parser.add_argument("--log-dir", type=Path, default=Path("/tmp"))
     mode = parser.add_mutually_exclusive_group()
@@ -503,6 +506,10 @@ def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width, calibr
             if led is not None:
                 write_led(led, led_color(led_state, t - state_since))
             if args.ground_approach and loop.arrived and not out.exit:
+                if speech is None and args.no_speech and not args.dry_run:
+                    print(f"[follow] say {GROUND_LINE}", flush=True)
+                    print("[follow] ground approach complete", flush=True)
+                    return
                 if speech is None:
                     print(f"[follow] dry run would say: {GROUND_LINE}", flush=True)
                     return
@@ -561,7 +568,7 @@ def run(args):
     low_battery_v = getattr(Config("base"), "low_battery_v", None)
     with ExitStack() as stack:
         speech = None
-        if args.ground_approach and not (args.dry_run or args.preflight):
+        if args.ground_approach and not (args.dry_run or args.preflight or args.no_speech):
             from ground_speech import prepare_speech
             speech = prepare_speech(Config, Writer, Type)
             stack.callback(speech.close)
@@ -614,7 +621,7 @@ def run(args):
         led = None if args.no_led else stack.enter_context(Writer("led.ctrl", Type("led_ctrl"), keeptime=False))
         mode = "dry run" if args.dry_run else "rotate only" if args.rotate_only else f"v_max {cfg.v_max:.2f} m/s"
         if args.ground_approach:
-            print(f"[follow] follow active (ground approach, {mode}, 1.0 m body standoff)", flush=True)
+            print(f"[follow] follow active (ground approach, {mode}, {STANDOFF:.1f} m body standoff)", flush=True)
         else:
             print(f"[follow] follow active ({mode}, gap {args.gap:.2f} m) - stand in front of the robot", flush=True)
             if not cfg.odom_check:

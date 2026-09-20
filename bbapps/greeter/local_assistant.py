@@ -54,7 +54,9 @@ try:
         default_question_response_cache,
         default_seed_pairs,
     )
-    from .voice_actions import SILENT_ACTIONS, FollowRunner, RppgScanner, VoiceActionController
+    from .voice_actions import (
+        SILENT_ACTIONS, FollowRunner, GroundAlertWatcher, RppgScanner, VoiceActionController,
+    )
     from .reminders import default_reminder_db_path, default_timezone_name
     from .person_finder import PersonTrackerClient
 except ImportError:
@@ -81,7 +83,9 @@ except ImportError:
         default_question_response_cache,
         default_seed_pairs,
     )
-    from voice_actions import SILENT_ACTIONS, FollowRunner, RppgScanner, VoiceActionController
+    from voice_actions import (
+        SILENT_ACTIONS, FollowRunner, GroundAlertWatcher, RppgScanner, VoiceActionController,
+    )
     from reminders import default_reminder_db_path, default_timezone_name
     from person_finder import PersonTrackerClient
 
@@ -203,6 +207,11 @@ class LedStatus:
         "error": (255, 0, 0),
     }
 
+    # A fall alert alternates these like a beacon, faster than the normal
+    # refresh so each color is actually seen.
+    EMERGENCY_COLORS = ((255, 0, 0), (0, 0, 255))
+    EMERGENCY_FLASH_S = 0.15
+
     def __init__(self, refresh_s: float = 0.35):
         self.refresh_s = refresh_s
         self._status = "idle"
@@ -235,6 +244,11 @@ class LedStatus:
             return 1.0 if int(elapsed * 3) % 2 == 0 else 0.08
         return 0.2 + 0.8 * (0.5 - 0.5 * math.cos(2 * math.pi * elapsed / 1.6))
 
+    @classmethod
+    def _emergency_color(cls, now: float) -> tuple[int, int, int]:
+        phase = int(now / cls.EMERGENCY_FLASH_S) % len(cls.EMERGENCY_COLORS)
+        return cls.EMERGENCY_COLORS[phase]
+
     def _run(self) -> None:
         try:
             with Writer("led.ctrl", Type("led_ctrl"), keeptime=False) as led:
@@ -257,7 +271,12 @@ class LedStatus:
                         status = speech_relay.read_led_status() or "idle"
                         if status not in self.COLORS:
                             status = "idle"
-                    if status != "idle":
+                    # A possible person on the ground outranks everything,
+                    # including this assistant's own conversation colors.
+                    emergency = speech_relay.read_led_emergency()
+                    if emergency:
+                        color = self._emergency_color(now)
+                    elif status != "idle":
                         color = self.COLORS[status]
                     elif effect is not None:
                         rgb, pattern, started, _duration = effect
@@ -272,7 +291,9 @@ class LedStatus:
                             )
                             frame["brightness"] = np.int16(-1)
                             frame["period_ms"] = np.uint16(0)
-                    self._stop.wait(self.refresh_s)
+                    self._stop.wait(
+                        self.EMERGENCY_FLASH_S if emergency else self.refresh_s
+                    )
         except Exception as exc:
             # Voice should remain usable even if the optional LED daemon is
             # unavailable or another application currently owns the writer.
@@ -299,6 +320,35 @@ def answer_text(router: VoiceRouter, utterance: str) -> str:
 
 
 WHISPER_SERVER_PORT = 8910
+WHISPER_ROOT = Path("/home/bracketbot/.local/share/whisper.cpp")
+
+
+def default_whisper_bin() -> str:
+    """Prefer the CUDA build: on the Orin a short command takes 0.4 s on the
+    GPU against 2-4 s on the CPU build, which also fights every other app for
+    the six cores."""
+    for build in ("build-cuda", "build"):
+        candidate = WHISPER_ROOT / build / "bin" / "whisper-cli"
+        if candidate.is_file():
+            return str(candidate)
+    return str(WHISPER_ROOT / "build" / "bin" / "whisper-cli")
+
+
+def default_whisper_model() -> str:
+    """small.en on the GPU, base.en on the CPU build.
+
+    Measured on the robot over real room noise with the assistant's prompt:
+    small.en is right in 0.35-0.41 s; base.en mishears; large-v3-turbo is no
+    more accurate, takes 0.8 s, and with the shortened audio context falls
+    into repeat loops that hold a turn for 5-8 s."""
+    names = ["ggml-base.en.bin"]
+    if (WHISPER_ROOT / "build-cuda" / "bin" / "whisper-cli").is_file():
+        names = ["ggml-small.en.bin", *names]
+    for name in names:
+        candidate = WHISPER_ROOT / "models" / name
+        if candidate.is_file():
+            return str(candidate)
+    return str(WHISPER_ROOT / "models" / "ggml-base.en.bin")
 
 
 def start_whisper_server(whisper_bin: str, model: str, threads: int):
@@ -317,16 +367,46 @@ def start_whisper_server(whisper_bin: str, model: str, threads: int):
         return "", None
     process = subprocess.Popen(
         [str(binary), "--model", model, "--host", "127.0.0.1",
-         "--port", str(WHISPER_SERVER_PORT), "--threads", str(threads)],
+         "--port", str(WHISPER_SERVER_PORT), "--threads", str(threads),
+         "--flash-attn",
+         # Beam search costs ~0.15 s on the GPU and is noticeably steadier on
+         # quiet, distant and accented speech than greedy decoding.
+         "--beam-size", "5", "--best-of", "5"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    print(f"[local-assistant] Whisper model resident on {url}", flush=True)
+    print(
+        f"[local-assistant] Whisper {Path(model).name} resident on {url} "
+        f"via {binary.parent.parent.name}",
+        flush=True,
+    )
     return url, process
+
+
+def warm_transcriber(transcriber, sample_rate: int) -> None:
+    """Pay the recognizer's first-call cost before anyone is waiting on it.
+
+    The first request after the server starts builds its CUDA kernels and
+    graph, which made the first real turn about a second slower."""
+    # Warm the resident server itself; the fallback would answer for it.
+    transcriber = getattr(transcriber, "primary", transcriber)
+
+    def run():
+        tone = (np.sin(np.arange(sample_rate) * 0.05) * 3000).astype(np.int16)
+        for _ in range(40):
+            try:
+                transcriber.transcribe(tone, sample_rate)
+                print("[local-assistant] Recognizer warmed up", flush=True)
+                return
+            except Exception:
+                time.sleep(0.5)  # the server is still loading the model
+
+    threading.Thread(target=run, name="whisper-warmup", daemon=True).start()
 
 
 def run_voice(args, router, transcriber, synthesizer, action_controller) -> None:
     mic_cfg = Config("mic")
+    warm_transcriber(transcriber, mic_cfg.sample_rate)
     speaker_cfg = Config("speaker")
     segmenter = SpeechSegmenter(
         mic_cfg.sample_rate,
@@ -339,6 +419,21 @@ def run_voice(args, router, transcriber, synthesizer, action_controller) -> None
     )
     last_wake_active = False
     pending_wake = False
+    guess = None  # (loud chunk count, transcript future) for the current pause
+    loud_chunks = 0
+    endpoint_db = args.vad_threshold_db
+    guess_pool = ThreadPoolExecutor(max_workers=1)
+
+    def prepare_utterance(raw: np.ndarray) -> np.ndarray:
+        # Normalize instead of clipping, and do not hand whisper seconds of
+        # room silence it can invent words for.
+        return condition_utterance(
+            trim_silence(raw, mic_cfg.sample_rate),
+            max_gain=max(1.0, args.mic_gain),
+        )
+
+    def transcribe_utterance(raw: np.ndarray) -> str:
+        return transcriber.transcribe(prepare_utterance(raw), mic_cfg.sample_rate)
     mic_last_update = time.monotonic()
     mic_reconnect_after_s = 1.0
     mic_shape_logged = False
@@ -361,6 +456,11 @@ def run_voice(args, router, transcriber, synthesizer, action_controller) -> None
             )
 
         action_controller.bind(speaker, speaker_cfg, leds, announce=announce)
+        ground_watch = None
+        if not args.no_auto_ground_check:
+            # Needs the speaker bound above: the check-in announces itself.
+            ground_watch = GroundAlertWatcher(action_controller)
+            ground_watch.start()
         microphone = Reader("mic.audio", keeptime=False).__enter__()
         try:
             print("[local-assistant] Ready. Say: Hey BracketBot, then your question.")
@@ -396,6 +496,7 @@ def run_voice(args, router, transcriber, synthesizer, action_controller) -> None
                         ).__enter__()
                         mic_last_update = time.monotonic()
                         segmenter.reset()
+                        guess = None
                         pending_wake = True
                         action_controller.listening.set()
                         leds.set("listening")
@@ -433,21 +534,56 @@ def run_voice(args, router, transcriber, synthesizer, action_controller) -> None
                         segmenter.level_dbfs(audio) >= args.vad_threshold_db
                     )
 
+                if segmenter.recording:
+                    endpoint_db = segmenter.active_threshold_db
                 utterance_audio = segmenter.push(audio, triggered=triggered)
                 if utterance_audio is None:
+                    # Start recognizing during the pause that will most likely
+                    # end the turn. If the person keeps talking the guess is
+                    # dropped; otherwise the transcript is ready by the time
+                    # the trailing silence has run out.
+                    if segmenter.recording:
+                        if guess is not None and guess[0] != segmenter.loud_chunks:
+                            guess = None
+                        if guess is None and segmenter.speculation_ready(
+                            args.speculate_after
+                        ):
+                            guess = (
+                                segmenter.loud_chunks,
+                                guess_pool.submit(
+                                    transcribe_utterance, segmenter.snapshot()
+                                ),
+                            )
+                        loud_chunks = segmenter.loud_chunks
                     continue
+                turn_guess, guess = guess, None
                 action_controller.listening.clear()
+                if not segmenter.last_had_speech:
+                    # Nothing was said after the wake phrase; whisper would
+                    # only invent a question from its prompt.
+                    print("[local-assistant] No speech after the wake phrase", flush=True)
+                    leds.set("idle")
+                    continue
                 leds.set("processing")
                 try:
-                    # Normalize instead of clipping, and do not hand whisper
-                    # seconds of room silence it can invent words for.
-                    prepared = condition_utterance(
-                        trim_silence(utterance_audio, mic_cfg.sample_rate),
-                        max_gain=max(1.0, args.mic_gain),
-                    )
-                    transcript = transcriber.transcribe(
-                        prepared, mic_cfg.sample_rate
-                    )
+                    prepared = prepare_utterance(utterance_audio)
+                    turn_start = time.monotonic()
+                    transcript = None
+                    if (
+                        turn_guess is not None
+                        and turn_guess[0] == loud_chunks
+                        and len(utterance_audio) < segmenter.max_samples
+                    ):
+                        try:
+                            transcript = turn_guess[1].result()
+                        except Exception:
+                            transcript = None
+                    speculated = transcript is not None
+                    if transcript is None:
+                        transcript = transcriber.transcribe(
+                            prepared, mic_cfg.sample_rate
+                        )
+                    heard_at = time.monotonic()
                     if not transcript:
                         print("[local-assistant] No speech recognized")
                         continue
@@ -455,6 +591,15 @@ def run_voice(args, router, transcriber, synthesizer, action_controller) -> None
                     decision = router.route(transcript)
                     reply = decision.reply or "I did not understand that."
                     print(f"[local-assistant] Reply: {reply}")
+                    print(
+                        f"[local-assistant] Timing: "
+                        f"{len(utterance_audio) / mic_cfg.sample_rate:.1f}s recorded "
+                        f"(endpoint {endpoint_db:.0f} dB), "
+                        f"transcribe {heard_at - turn_start:.2f}s"
+                        f"{' (speculated)' if speculated else ''}, "
+                        f"route {time.monotonic() - heard_at:.2f}s",
+                        flush=True,
+                    )
                     leds.set("speaking")
                     if decision.action in SILENT_ACTIONS and decision.action_started:
                         pass
@@ -484,6 +629,8 @@ def run_voice(args, router, transcriber, synthesizer, action_controller) -> None
                     leds.set("idle")
                     segmenter.reset()
         finally:
+            if ground_watch is not None:
+                ground_watch.close()
             action_controller.unbind()
             microphone.__exit__(None, None, None)
 
@@ -511,6 +658,12 @@ def main() -> None:
         help="seconds of silence after speech before submitting the turn",
     )
     parser.add_argument(
+        "--speculate-after",
+        type=float,
+        default=0.25,
+        help="seconds into a pause at which transcription starts early",
+    )
+    parser.add_argument(
         "--wake-grace",
         type=float,
         default=0.9,
@@ -529,11 +682,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--whisper-bin",
-        default="/home/bracketbot/.local/share/whisper.cpp/build/bin/whisper-cli",
+        default=os.environ.get("WHISPER_BIN", "") or default_whisper_bin(),
     )
     parser.add_argument(
         "--whisper-model",
-        default="/home/bracketbot/.local/share/whisper.cpp/models/ggml-base.en.bin",
+        default=os.environ.get("WHISPER_MODEL", "") or default_whisper_model(),
     )
     parser.add_argument("--whisper-threads", type=int, default=6)
     parser.add_argument(
@@ -570,6 +723,11 @@ def main() -> None:
         type=Path,
         default=Path(__file__).parent.parent / "follow" / "robot_follow.py",
         help="depth person-follow runner started by 'follow me'",
+    )
+    parser.add_argument(
+        "--no-auto-ground-check",
+        action="store_true",
+        help="never drive over by itself when the vision app confirms a person lying on the ground",
     )
     parser.add_argument(
         "--no-person-finder",

@@ -41,6 +41,10 @@ from rppg import DEFAULT_MODEL, FaceROI, measure_heart_rate  # noqa: E402
 
 RAW_TOPIC = "camera.head.rgb"    # raw RGB: no JPEG blocking on a ~0.1-1 % pulse signal
 JPEG_TOPIC = "camera.head.jpeg"
+MIN_CAMERA_FPS = 15.0
+MIN_FACE_FRACTION = 0.8
+MIN_FACE_WIDTH_PX = 50.0
+MAX_LUM_DRIFT_PCT = 3.0
 
 
 class HeadCamera:
@@ -86,6 +90,22 @@ class HeadCamera:
         return self.frames / (self.last - self.first) if self.frames > 1 and self.last > self.first else 0.0
 
 
+def camera_check_failures(seen, fps, faces, face_width, lum_drift):
+    """Human-readable reasons a camera sample is not suitable for rPPG."""
+    failures = []
+    if not seen:
+        failures.append("no camera frames")
+    elif fps < MIN_CAMERA_FPS:
+        failures.append(f"camera processing below {MIN_CAMERA_FPS:g} FPS")
+    if seen and faces < MIN_FACE_FRACTION * seen:
+        failures.append(f"face found in less than {MIN_FACE_FRACTION:.0%} of frames")
+    if face_width is None or face_width < MIN_FACE_WIDTH_PX:
+        failures.append(f"face is smaller than {MIN_FACE_WIDTH_PX:g} px; move closer")
+    if lum_drift is None or lum_drift > MAX_LUM_DRIFT_PCT:
+        failures.append(f"skin luminance drift exceeds {MAX_LUM_DRIFT_PCT:g}%")
+    return failures
+
+
 def check(cam, model, seconds):
     """Camera + face gate: is the eye split right, is the frame rate usable, is a face big enough?"""
     roi = FaceROI(model)
@@ -105,12 +125,15 @@ def check(cam, model, seconds):
             widths.append(r[2])
             lums.append(float(np.dot(r[0], [0.299, 0.587, 0.114])))
     lum_drift = 100 * float(np.ptp(lums)) / (float(np.mean(lums)) + 1e-9) if lums else None
+    face_width = float(np.median(widths)) if widths else None
+    failures = camera_check_failures(seen, cam.fps, faces, face_width, lum_drift)
     return {"frames": seen, "fps": round(cam.fps, 1),
             "eye_shape": None if shape is None else list(shape),
             "face_frames": faces,
-            "face_width_px": round(float(np.median(widths)), 0) if widths else None,
+            "face_width_px": None if face_width is None else round(face_width, 0),
             "lum_drift_pct": None if lum_drift is None else round(lum_drift, 2),
-            "ok": bool(seen and cam.fps >= 15 and faces >= 0.8 * seen)}
+            "failures": failures,
+            "ok": not failures}
 
 
 def main():
@@ -172,14 +195,21 @@ def main():
             print(f"{done * 100:5.1f}%  bpm={'--' if bpm is None else round(bpm, 1)}  "
                   f"snr={'--' if snr is None else round(snr, 1)} dB", file=sys.stderr, flush=True)
 
+        def guidance(kind):
+            if a.progress_json:
+                print(json.dumps({"guidance": kind}), flush=True)
+                return
+            print(f"guidance: {kind}", file=sys.stderr, flush=True)
+
         result = measure_heart_rate(duration_s=a.duration, window_s=a.window, fs=a.fs,
-                                    model_path=model, on_update=progress, grab=cam.grab)
+                                    model_path=model, on_update=progress,
+                                    on_guidance=guidance, grab=cam.grab)
         report = {"result": result, "fps": round(cam.fps, 1), "frames": cam.frames,
                   "note": "camera-based demo estimate, not a medical measurement"}
         # The streaming form must stay one object per line; the human form stays indented.
         print(json.dumps(report) if a.progress_json else json.dumps(report, indent=2), flush=True)
-        sys.exit(0 if result else 1)
+        return 0 if result else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main() or 0)

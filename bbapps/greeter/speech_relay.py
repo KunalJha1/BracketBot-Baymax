@@ -41,6 +41,11 @@ DEFAULT_TIMEOUT_S = 30.0
 # hint expires on its own in case the requester dies mid-conversation.
 LED_STATUS_FILE = "led_status"
 LED_STATUS_TTL_S = 30.0
+# A fall alert outranks every conversation color, so it has its own file: a
+# check-in posting "listening" must not erase the emergency. The short TTL
+# means the flashing stops by itself if the posting app dies.
+LED_EMERGENCY_FILE = "led_emergency"
+LED_EMERGENCY_TTL_S = 3.0
 
 
 def _write_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -129,6 +134,35 @@ def read_led_status(
     return None
 
 
+def post_led_emergency(
+    active: bool,
+    ttl: float = LED_EMERGENCY_TTL_S,
+    spool: Path = SPOOL_DIR,
+) -> None:
+    """Ask the LED owner to flash the emergency pattern; False releases it."""
+
+    path = spool / LED_EMERGENCY_FILE
+    try:
+        if active:
+            _write_atomic(path, {"expires": time.time() + ttl})
+        else:
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def read_led_emergency(
+    spool: Path = SPOOL_DIR, now: Callable[[], float] = time.time
+) -> bool:
+    """Return whether another app's emergency request is still fresh."""
+
+    try:
+        payload = json.loads((spool / LED_EMERGENCY_FILE).read_text())
+        return now() < float(payload["expires"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def _pending_requests(spool: Path) -> list[Path]:
     if not spool.is_dir():
         return []
@@ -190,7 +224,9 @@ def serve_pending(
 __all__ = [
     "REQUEST_TTL_S",
     "SPOOL_DIR",
+    "post_led_emergency",
     "post_led_status",
+    "read_led_emergency",
     "read_led_status",
     "request",
     "serve_pending",

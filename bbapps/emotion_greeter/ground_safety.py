@@ -15,7 +15,7 @@ The deployed BracketBot depth topics use these frames:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Iterable
 
@@ -24,7 +24,51 @@ import numpy as np
 
 # COCO pose indices emitted by YOLO11-pose.
 TORSO_KEYPOINTS = (5, 6, 11, 12)  # shoulders and hips
+SHOULDER_KEYPOINTS = (5, 6)
+HIP_KEYPOINTS = (11, 12)
+HEAD_KEYPOINTS = (0, 1, 2, 3, 4)  # nose, eyes, ears
 BODY_KEYPOINTS = tuple(range(5, 17))
+
+# Lying down means the trunk itself is horizontal and at floor level. Somebody
+# sitting on the floor with their legs out also has low hips, low legs and a
+# long footprint, so those cues alone cannot tell the two apart; the shoulders
+# and head can. A seated adult's shoulders are ~0.55-0.65 m up and ~0.45 m
+# above their hips, and their head is ~0.8 m up.
+LYING_SHOULDER_MAX_M = 0.45
+LYING_TORSO_RISE_MAX_M = 0.30
+LYING_HEAD_MAX_M = 0.55
+
+
+# Base-frame [right, forward, up, 1] -> camera.rect pixel, fitted on the robot
+# from 128k camera.points samples (0.02 px median reprojection error). It puts
+# the camera 1.55 m above the wheels, pitched 57 degrees below the horizon.
+RECT_SIZE = (512, 384)
+RECT_PROJECTION = np.array(
+    [
+        [132.277289, 199.880301, -127.052585, 196.931253],
+        [2.308924, 92.878442, -218.04224, 337.96241],
+        [0.0, 0.838664, -0.544649, 0.844193],
+    ],
+    dtype=np.float64,
+)
+_RECT_RAY = np.linalg.inv(RECT_PROJECTION[:, :3])
+CAMERA_CENTRE = -_RECT_RAY @ RECT_PROJECTION[:, 3]
+
+# The depth cloud ends ~1.7 m out, so most people on the floor have no depth on
+# their joints. Bone lengths give a depth-free test instead: slide every joint
+# down its camera ray onto the floor. A body that really is lying there keeps
+# human proportions; any raised joint lands far behind where it is, so a
+# standing, sitting or crouching body comes out metres long.
+MONOCULAR_FLOOR_HEIGHT_M = 0.10
+MONOCULAR_MAX_FORWARD_M = 6.0
+MONOCULAR_SEGMENT_MAX_M = {
+    (5, 11): 0.72, (6, 12): 0.72,    # shoulder-hip
+    (11, 13): 0.63, (12, 14): 0.63,  # hip-knee
+    (13, 15): 0.60, (14, 16): 0.60,  # knee-ankle
+    (5, 7): 0.52, (6, 8): 0.52,      # shoulder-elbow
+    (5, 6): 0.60, (11, 12): 0.50,    # across shoulders, across hips
+}
+MONOCULAR_TORSO_MIN_M = 0.22
 
 
 @dataclass(frozen=True)
@@ -181,6 +225,107 @@ def keypoints_in_base_frame(
     return associated
 
 
+def floor_points_from_pixels(
+    pixels: np.ndarray, floor_height_m: float = MONOCULAR_FLOOR_HEIGHT_M
+) -> np.ndarray:
+    """Where each camera.rect pixel's ray meets the floor; NaN above the horizon."""
+
+    pixels = np.asarray(pixels, dtype=np.float64).reshape(-1, 2)
+    rays = np.column_stack([pixels, np.ones(len(pixels))]) @ _RECT_RAY.T
+    points = np.full((len(pixels), 3), np.nan)
+    down = rays[:, 2] < -1e-6
+    travel = (floor_height_m - CAMERA_CENTRE[2]) / rays[down, 2]
+    points[down] = CAMERA_CENTRE + travel[:, None] * rays[down]
+    return points
+
+
+def monocular_floor_pose(
+    keypoints: Iterable[Keypoint],
+    image_width: int,
+    image_height: int,
+    *,
+    keypoint_confidence: float = 0.35,
+) -> tuple[dict[int, np.ndarray] | None, str]:
+    """Return the pose laid on the floor if it has human proportions there.
+
+    ``(pose, reason)``: a pose means the skeleton is consistent with a body
+    lying on the floor. ``(None, reason)`` means it is not, or cannot be told.
+    """
+
+    if (image_width, image_height) != RECT_SIZE:
+        return None, f"no camera model for {image_width}x{image_height}"
+    usable = [
+        kp for kp in keypoints
+        if kp.confidence >= keypoint_confidence
+        # Joints mapped in from the raw-resolution floor crop can fall just past
+        # the rect border; the pinhole model still holds there.
+        and -0.5 * image_width <= kp.x < 1.5 * image_width
+        and -0.5 * image_height <= kp.y < 1.5 * image_height
+    ]
+    body = [kp for kp in usable if kp.index in BODY_KEYPOINTS]
+    torso = [kp for kp in usable if kp.index in TORSO_KEYPOINTS]
+    if len(torso) < 3 or len(body) < 6:
+        return None, "need three torso and six body keypoints"
+    floor = floor_points_from_pixels([(kp.x, kp.y) for kp in usable])
+    return floor_pose_if_human({kp.index: point for kp, point in zip(usable, floor)})
+
+
+def floor_pose_if_human(
+    pose: dict[int, np.ndarray],
+) -> tuple[dict[int, np.ndarray] | None, str]:
+    """Keep a pose already laid on the floor plane only if its bones are human-sized.
+
+    Shared by every camera model: the caller intersects its own pixel rays with
+    the floor (NaN for rays above the horizon) and this judges the result.
+    """
+
+    body = [i for i in pose if i in BODY_KEYPOINTS]
+    torso = [i for i in pose if i in TORSO_KEYPOINTS]
+    if len(torso) < 3 or len(body) < 6:
+        return None, "need three torso and six body keypoints"
+    for index in body:
+        point = pose[index]
+        if not np.isfinite(point).all() or not 0.2 < point[1] <= MONOCULAR_MAX_FORWARD_M:
+            return None, f"joint {index} is not on floor within {MONOCULAR_MAX_FORWARD_M:.0f} m"
+    torso_lengths = []
+    for (first, second), limit in MONOCULAR_SEGMENT_MAX_M.items():
+        if first in pose and second in pose:
+            length = float(np.linalg.norm(pose[first] - pose[second]))
+            if length > limit:
+                return None, (
+                    f"joints {first}-{second} would span {length:.2f}m on the floor "
+                    f"(max {limit:.2f}m): body is raised, not lying"
+                )
+            if (first, second) in ((5, 11), (6, 12)):
+                torso_lengths.append(length)
+    if not torso_lengths or max(torso_lengths) < MONOCULAR_TORSO_MIN_M:
+        return None, "torso too short to be a person on the floor"
+    # Head joints only matter when they are finite; an unseen head is not evidence.
+    return {i: pt for i, pt in pose.items() if np.isfinite(pt).all()}, "floor-consistent"
+
+
+def assess_ground_pose_monocular(
+    keypoints: Iterable[Keypoint],
+    image_width: int,
+    image_height: int,
+    *,
+    keypoint_confidence: float = 0.35,
+    robot_position: np.ndarray | None = None,
+    robot_yaw: float | None = None,
+) -> GroundAssessment:
+    """Depth-free fallback for people beyond the depth cloud."""
+
+    keypoints = list(keypoints)
+    pose, reason = monocular_floor_pose(
+        keypoints, image_width, image_height, keypoint_confidence=keypoint_confidence
+    )
+    if pose is None:
+        raised = "not lying" in reason
+        return GroundAssessment("clear" if raised else "unknown", 0.0, f"mono: {reason}", 0)
+    assessment = assess_ground_pose(pose, robot_position=robot_position, robot_yaw=robot_yaw)
+    return replace(assessment, reason=f"mono: {assessment.reason}")
+
+
 def base_to_map(
     base_position: np.ndarray,
     robot_position: np.ndarray,
@@ -205,8 +350,10 @@ def assess_ground_pose(
     """Assess whether depth-grounded pose evidence is consistent with floor level.
 
     Three torso joints are required.  The conservative decision requires a low
-    torso, most visible body joints near the floor, and meaningful horizontal
-    body extent.  Sitting, crouching, missing depth, and upper-body-only views
+    torso, most visible body joints near the floor, meaningful horizontal body
+    extent, and a lying posture: shoulders at floor level, a near-horizontal
+    trunk, and a low head when one is visible.  Sitting (on a chair or on the
+    floor), crouching, kneeling, missing depth, and upper-body-only views
     therefore remain clear/unknown instead of becoming emergency alerts.
     """
 
@@ -239,12 +386,25 @@ def assess_ground_pose(
         + 0.20 * extent_score
         + 0.10 * flat_score
     )
-    suspected = (
+    # Three torso joints guarantee at least one shoulder and one hip.
+    shoulders = [keypoints_3d[i][2] for i in SHOULDER_KEYPOINTS if i in keypoints_3d]
+    hips = [keypoints_3d[i][2] for i in HIP_KEYPOINTS if i in keypoints_3d]
+    heads = [keypoints_3d[i][2] for i in HEAD_KEYPOINTS if i in keypoints_3d]
+    shoulder_height = float(max(shoulders))
+    torso_rise = abs(float(np.mean(shoulders)) - float(np.mean(hips)))
+    head_height = float(np.median(heads)) if heads else None
+    lying = (
+        shoulder_height <= LYING_SHOULDER_MAX_M
+        and torso_rise <= LYING_TORSO_RISE_MAX_M
+        and (head_height is None or head_height <= LYING_HEAD_MAX_M)
+    )
+    low = (
         torso_height <= 0.55
         and low_fraction >= 0.60
         and body_extent >= 0.45
         and score >= 0.62
     )
+    suspected = low and lying
 
     base_position_array = np.median(body_array, axis=0)
     base_position = tuple(float(value) for value in base_position_array)
@@ -259,8 +419,13 @@ def assess_ground_pose(
     state = "possible_person_on_ground" if suspected else "clear"
     reason = (
         f"torso={torso_height:.2f}m low={low_fraction:.0%} "
-        f"extent={body_extent:.2f}m height_span={height_span:.2f}m"
+        f"extent={body_extent:.2f}m height_span={height_span:.2f}m "
+        f"shoulders={shoulder_height:.2f}m rise={torso_rise:.2f}m"
     )
+    if head_height is not None:
+        reason += f" head={head_height:.2f}m"
+    if low and not lying:
+        reason += " | low but trunk upright: sitting or crouching, not lying"
     return GroundAssessment(
         state,
         round(score, 4),
@@ -277,6 +442,7 @@ def assess_ground_pose(
 @dataclass
 class _TrackState:
     first_suspected_at: float | None = None
+    last_suspected_at: float = 0.0
     first_clear_at: float | None = None
     confirmed: bool = False
     last_seen_at: float = 0.0
@@ -285,9 +451,22 @@ class _TrackState:
 class GroundAlertTracker:
     """Require sustained evidence and sustained clearing for each visual track."""
 
-    def __init__(self, hold_seconds: float = 2.0, clear_seconds: float = 2.0) -> None:
+    def __init__(
+        self,
+        hold_seconds: float = 2.0,
+        clear_seconds: float = 2.0,
+        gap_seconds: float = 0.7,
+        lost_seconds: float = 15.0,
+    ) -> None:
         self.hold_seconds = hold_seconds
         self.clear_seconds = clear_seconds
+        # A body on the floor is a hard pose: the detector drops it for a frame
+        # or two. Gaps this short do not restart the confirmation hold.
+        self.gap_seconds = gap_seconds
+        # A confirmed person nobody has seen for this long is gone (or the
+        # tracker renamed them); holding the alert forever would flash the
+        # emergency lights and block every later check-in.
+        self.lost_seconds = lost_seconds
         self.tracks: dict[int, _TrackState] = {}
 
     def update(
@@ -303,6 +482,7 @@ class GroundAlertTracker:
                 state.first_clear_at = None
                 if state.first_suspected_at is None:
                     state.first_suspected_at = now
+                state.last_suspected_at = now
                 if now - state.first_suspected_at >= self.hold_seconds:
                     state.confirmed = True
                 statuses[track_id] = "alert" if state.confirmed else "checking"
@@ -319,17 +499,22 @@ class GroundAlertTracker:
                 # Missing depth is not evidence that a previously confirmed
                 # person got up. Keep the alert latched until positive clearing.
                 statuses[track_id] = "alert" if state.confirmed else "unknown"
-                state.first_suspected_at = None
+                if now - state.last_suspected_at > self.gap_seconds:
+                    state.first_suspected_at = None
                 state.first_clear_at = None
 
         for track_id, state in list(self.tracks.items()):
             if track_id in assessments:
                 continue
             if state.confirmed:
+                if now - state.last_seen_at > self.lost_seconds:
+                    del self.tracks[track_id]
+                    continue
                 state.first_clear_at = None
                 statuses[track_id] = "alert"
             else:
-                state.first_suspected_at = None
+                if now - state.last_suspected_at > self.gap_seconds:
+                    state.first_suspected_at = None
                 if now - state.last_seen_at > max(2.0, self.clear_seconds):
                     del self.tracks[track_id]
         return statuses

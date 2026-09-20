@@ -160,6 +160,8 @@ def test_people_payload_is_used_only_while_fresh_and_depth_aligned():
     assert people_from_payload(payload, 102.0, 1.0) is None
     assert people_from_payload({**payload, "depth_aligned": False}, 100.2, 1.0) is None
     assert people_from_payload({**payload, "observations": []}, 100.2, 1.0) == ()
+    turned = {**payload, "observations": [{"track_id": 4, "base_position": None, "box_position": [0.1, 1.6, 1.0]}]}
+    assert people_from_payload(turned, 100.2, 1.0) == ((1.6, 0.1),)
 
 
 def test_human_gate_opens_only_after_the_vision_app_stays_quiet(tmp_path):

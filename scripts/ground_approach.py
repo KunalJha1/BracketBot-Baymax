@@ -14,8 +14,15 @@ from follow_core import (
 )
 
 GROUND_LINE = "hello specimen, are you in trouble"
-TARGET_MAX_AGE = 0.65
-STANDOFF = 1.0
+# The vision app's frames are 0.3-0.7 s old when published and are re-read until
+# the next one lands. At 0.65 s the target kept expiring, and every expiry resets
+# the 0.04 m/s^2 ramp, so the base never got moving. A motionless person seen
+# 1 s ago is at most 5 cm off at creep speed; obstacles use 0.3 s depth instead.
+TARGET_MAX_AGE = 1.0
+# Gap kept outside the body envelope (furthest joint + 0.25 m), so the wheels stay
+# about 0.85 m from the nearest limb. 1.0 m left the robot too far away to check on
+# anyone. It must stay above FollowConfig.min_range (0.45 m), which stops forward motion.
+STANDOFF = 0.6
 
 
 def approach_config(v_max=0.05):

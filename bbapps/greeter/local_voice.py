@@ -48,9 +48,35 @@ class SpeechSegmenter:
         start_grace_s: float = 0.0,
         max_utterance_s: float = 8.0,
         level_gain: float = 1.0,
+        noise_margin_db: float = 8.0,
+        peak_drop_db: float = 15.0,
+        wake_tail_s: float = 0.3,
+        no_speech_timeout_s: float = 5.0,
+        tail_only_wait_s: float = 2.5,
     ):
         self.sample_rate = sample_rate
+        # The end of the wake phrase lands in the first chunks of the turn.
+        # Counted as speech, it let the pause people leave while waiting for
+        # the listening light end the turn 1.0 s in, before the question, and
+        # whisper then invented one from its prompt. Only sound after this
+        # window opens the utterance; an empty turn gives up on its own.
+        self.wake_tail_samples = max(0, int(wake_tail_s * sample_rate))
+        self.no_speech_samples = max(1, int(no_speech_timeout_s * sample_rate))
+        self.tail_only_samples = max(1, int(tail_only_wait_s * sample_rate))
+        self.last_had_speech = False
+        self._tail_speech = False
         self.threshold_db = threshold_db
+        # A fixed threshold only works in a quiet room. With fans, motors and
+        # other people talking the quietest chunk measured on the robot was
+        # -34 dB against a -38 dB threshold, so no pause ever counted as
+        # silence and every turn ran to the max-utterance cap. The threshold
+        # therefore rises to sit above the room's idle noise floor and within
+        # ``peak_drop_db`` of the loudest speech heard this turn.
+        self.noise_margin_db = noise_margin_db
+        self.peak_drop_db = peak_drop_db
+        self._idle_levels: deque[float] = deque(maxlen=50)
+        self._floor_db: float | None = None
+        self._peak_db: float | None = None
         # Voice detection needs the boosted level, but the stored samples stay
         # unboosted: multiplying the audio itself clipped every close-up
         # utterance before whisper ever saw it, and clipping costs far more
@@ -68,6 +94,7 @@ class SpeechSegmenter:
         self._speech_seen = False
         self._silence_samples = 0
         self._after_trigger_samples = 0
+        self._loud_chunks = 0
 
     @property
     def recording(self) -> bool:
@@ -77,12 +104,48 @@ class SpeechSegmenter:
     def speech_seen(self) -> bool:
         return self._speech_seen
 
+    @property
+    def loud_chunks(self) -> int:
+        """Speech chunks so far; unchanged means nothing new was said."""
+        return self._loud_chunks
+
+    def speculation_ready(self, after_s: float) -> bool:
+        """True once the turn would end if the current pause simply continues.
+
+        Transcribing at this point overlaps the recognizer with the rest of
+        the trailing-silence wait instead of starting it afterwards.
+        """
+        return (
+            self._recording is not None
+            and self._speech_seen
+            and self._recording_size >= self.min_samples
+            and self._after_trigger_samples >= self.start_grace_samples
+            and self._silence_samples >= int(after_s * self.sample_rate)
+        )
+
+    def snapshot(self) -> np.ndarray:
+        assert self._recording is not None
+        return np.concatenate(self._recording).astype(np.int16, copy=False)
+
+    @property
+    def active_threshold_db(self) -> float:
+        threshold = self.threshold_db
+        if self._floor_db is not None:
+            threshold = max(threshold, self._floor_db + self.noise_margin_db)
+        if self._peak_db is not None:
+            threshold = max(threshold, self._peak_db - self.peak_drop_db)
+        return threshold
+
     def reset(self) -> None:
+        self._floor_db = None
+        self._peak_db = None
+        self._loud_chunks = 0
         self._pre_roll.clear()
         self._pre_roll_size = 0
         self._recording = None
         self._recording_size = 0
         self._speech_seen = False
+        self._tail_speech = False
         self._silence_samples = 0
         self._after_trigger_samples = 0
 
@@ -102,6 +165,7 @@ class SpeechSegmenter:
     def _finish(self) -> np.ndarray:
         assert self._recording is not None
         utterance = np.concatenate(self._recording).astype(np.int16, copy=False)
+        self.last_had_speech = self._speech_seen or self._tail_speech
         self.reset()
         return utterance
 
@@ -110,28 +174,41 @@ class SpeechSegmenter:
         if not len(chunk):
             return None
 
+        level = self.level_dbfs(chunk)
         if self._recording is None:
             self._remember(chunk)
             if not triggered:
+                self._idle_levels.append(level)
                 return None
             self._recording = list(self._pre_roll)
             self._recording_size = sum(len(part) for part in self._recording)
-            self._speech_seen = any(
-                self.level_dbfs(part) >= self.threshold_db
-                for part in self._recording
-            )
+            if len(self._idle_levels) >= 10:
+                # A low percentile, so the wake phrase and passing chatter in
+                # the window do not read as the room's floor.
+                self._floor_db = float(np.percentile(self._idle_levels, 10))
             return None
 
         self._recording.append(chunk)
         self._recording_size += len(chunk)
         self._after_trigger_samples += len(chunk)
-        if self.level_dbfs(chunk) >= self.threshold_db:
+        if self._after_trigger_samples <= self.wake_tail_samples:
+            # Probably the wake phrase, possibly a very quick command: keep
+            # it, but let it close the turn only after the longer wait below.
+            if level >= self.active_threshold_db:
+                self._tail_speech = True
+        elif level >= self.active_threshold_db:
+            self._peak_db = level if self._peak_db is None else max(self._peak_db, level)
             self._speech_seen = True
             self._silence_samples = 0
+            self._loud_chunks += 1
         elif self._speech_seen:
             self._silence_samples += len(chunk)
 
         if self._recording_size >= self.max_samples:
+            return self._finish()
+        if not self._speech_seen and self._after_trigger_samples >= (
+            self.tail_only_samples if self._tail_speech else self.no_speech_samples
+        ):
             return self._finish()
         if (
             self._speech_seen
@@ -158,7 +235,22 @@ def clean_transcript(text: str) -> str:
     # An annotation-only result means nothing was said.
     if not re.search(r"[a-zA-Z0-9]", stripped):
         return ""
-    return stripped
+    return _collapse_repeats(stripped)
+
+
+def _collapse_repeats(text: str) -> str:
+    """Keep one copy of a sentence whisper repeated back to back.
+
+    Trailing room noise makes it loop on the last phrase, so one "Follow me"
+    arrived as "Follow me. Follow me. Follow me."
+    """
+    kept: list[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        key = re.sub(r"[^a-z0-9]+", " ", sentence.lower()).strip()
+        if kept and key and key == re.sub(r"[^a-z0-9]+", " ", kept[-1].lower()).strip():
+            continue
+        kept.append(sentence)
+    return " ".join(kept)
 
 
 def condition_utterance(
@@ -193,6 +285,7 @@ def trim_silence(
     threshold_db: float = -45.0,
     keep_s: float = 0.2,
     window_s: float = 0.02,
+    noise_margin_db: float = 6.0,
 ) -> np.ndarray:
     """Cut leading and trailing silence, keeping a short pad on each side.
 
@@ -207,7 +300,13 @@ def trim_silence(
     usable = samples.size - samples.size % window
     frames = samples[:usable].reshape(-1, window)
     rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
-    loud = np.flatnonzero(20.0 * np.log10(np.maximum(rms, 1e-9) / 32768.0) >= threshold_db)
+    levels = 20.0 * np.log10(np.maximum(rms, 1e-9) / 32768.0)
+    # The room floor on the robot (-39 dB) sits above any fixed threshold that
+    # is safe in a quiet room, so nothing was ever trimmed. Follow the floor,
+    # but never rise to within 20 dB of the speech peak.
+    floor_db = float(np.percentile(levels, 10))
+    threshold_db = max(threshold_db, min(floor_db + noise_margin_db, float(levels.max()) - 20.0))
+    loud = np.flatnonzero(levels >= threshold_db)
     if not loud.size:
         return samples
     pad = max(0, int(keep_s * sample_rate))
@@ -226,7 +325,10 @@ def whisper_audio_context(sample_count: int, sample_rate: int) -> int:
     seconds = sample_count / max(1, sample_rate)
     frames = int(np.ceil(seconds * 50.0)) + 128
     frames = -(-frames // 64) * 64
-    return int(min(1500, max(384, frames)))
+    # Never below 768. large-v3-turbo on the GPU build falls apart on a tighter
+    # window: at 384 it returned garbage and looped for 10-15 s on clips that
+    # take 0.7 s at 768. The GPU makes the wider window nearly free.
+    return int(min(1500, max(768, frames)))
 
 
 class WhisperCppTranscriber:
@@ -238,7 +340,7 @@ class WhisperCppTranscriber:
     DEFAULT_PROMPT = (
         "Hey BracketBot. Baymax. Weather in Waterloo. Wave. Handshake. "
         "Fist bump. Hug. Salute. Namaste. Dance. Point at the person. Look at "
-        "me. Stop. "
+        "me. Stop. Follow me. Follow me around. Stop following me. Come here. "
         "Remind me in four minutes to take my meds. Set a timer for four "
         "minutes. Cancel my reminder. Check my heart rate. Check me out. "
         "Start my checkup. "
@@ -390,6 +492,9 @@ class WhisperServerTranscriber:
         body, content_type = _multipart(
             {
                 "temperature": "0.0",
+                # No temperature retries: on a clip with no clear speech they
+                # held a turn for 8 s and returned text from the prompt.
+                "temperature_inc": "0.0",
                 "response_format": "json",
                 "language": self.language,
                 "prompt": self.prompt,
@@ -451,6 +556,24 @@ def _bell(freqs: np.ndarray, centre: float, gain_db: float, octaves: float) -> n
     return gain_db * np.exp(-0.5 * distance * distance)
 
 
+def _fft_length(count: int) -> int:
+    return 1 << max(1, int(count - 1).bit_length())
+
+
+def _smooth(signal: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """``np.convolve(signal, kernel, mode="same")`` through the FFT.
+
+    The direct form is signal x kernel multiplies, about half a billion for a
+    five-second sentence against the 40 ms envelope window.
+    """
+    if signal.size < kernel.size:
+        return np.convolve(signal, kernel, mode="same")
+    length = _fft_length(signal.size + kernel.size - 1)
+    full = np.fft.irfft(np.fft.rfft(signal, length) * np.fft.rfft(kernel, length), n=length)
+    start = (kernel.size - 1) // 2
+    return np.maximum(full[start : start + signal.size], 0.0)
+
+
 def clarify_speech(
     audio: np.ndarray,
     sample_rate: int,
@@ -473,20 +596,25 @@ def clarify_speech(
         return np.asarray(audio, dtype=np.int16).reshape(-1)
 
     # Zero-phase EQ in the frequency domain.
-    spectrum = np.fft.rfft(samples)
-    freqs = np.fft.rfftfreq(samples.size, 1.0 / sample_rate)
+    # Padded to a power of two: a reply's arbitrary sample count can have a
+    # large prime factor, which made this one transform cost most of a second
+    # on the robot, all of it in front of the first spoken word.
+    count = samples.size
+    padded = _fft_length(count)
+    spectrum = np.fft.rfft(samples, padded)
+    freqs = np.fft.rfftfreq(padded, 1.0 / sample_rate)
     ratio_hp = (freqs / 150.0) ** 4
     gain_db = 10.0 * np.log10(np.maximum(ratio_hp / (1.0 + ratio_hp), 1e-12))
     gain_db += _bell(freqs, 300.0, -3.0, 0.9)  # mud
     gain_db += _bell(freqs, 3200.0, 7.0, 1.1)  # consonant presence
     gain_db += _bell(freqs, 7000.0, 3.0, 0.8)  # sibilant air
-    samples = np.fft.irfft(spectrum * 10.0 ** (gain_db / 20.0), n=samples.size)
+    samples = np.fft.irfft(spectrum * 10.0 ** (gain_db / 20.0), n=padded)[:count]
 
     # Downward compression driven by a smoothed RMS envelope.
     window = max(1, int(0.02 * sample_rate))
     kernel = np.hanning(window * 2 + 1)
     kernel /= kernel.sum()
-    envelope = np.sqrt(np.convolve(samples * samples, kernel, mode="same") + 1e-12)
+    envelope = np.sqrt(_smooth(samples * samples, kernel) + 1e-12)
     level_db = 20.0 * np.log10(envelope)
     over = np.maximum(0.0, level_db - threshold_db)
     samples = samples * 10.0 ** (-over * (1.0 - 1.0 / ratio) / 20.0)
@@ -617,18 +745,27 @@ class HttpTtsSynthesizer:
 class FallbackSynthesizer:
     """Prefer natural speech but keep the robot able to talk if it is unavailable."""
 
-    def __init__(self, primary, fallback):
+    def __init__(self, primary, fallback, *, retry_after_s: float = 60.0, clock=time.monotonic):
         self.primary = primary
         self.fallback = fallback
+        self.retry_after_s = retry_after_s
+        self._clock = clock
+        self._primary_down_until = 0.0
 
     def validate(self) -> None:
         self.primary.validate()
         self.fallback.validate()
 
     def synthesize(self, text: str, target_rate: int) -> np.ndarray:
+        # Replies are synthesized a sentence at a time. Retrying the primary
+        # on every sentence made one reply switch voice (and accent) halfway
+        # through, so a failure holds the fallback voice for a while.
+        if self._clock() < self._primary_down_until:
+            return self.fallback.synthesize(text, target_rate)
         try:
             return self.primary.synthesize(text, target_rate)
         except LocalVoiceError:
+            self._primary_down_until = self._clock() + self.retry_after_s
             return self.fallback.synthesize(text, target_rate)
 
 

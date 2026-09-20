@@ -50,12 +50,16 @@ def test_ground_publisher_supports_motion_without_reusing_latched_positions(tmp_
     assert data["possible_person_on_ground"] is True
     assert target_from_payload(data, time.time()) is None
 from check_in import (  # noqa: E402
+    DISMISSED_REPLY,
     FALLBACK_REPLY,
+    LAST_TURN_NOTE,
     NO_ANSWER_REPLY,
     OPENING_LINE,
     OPENING_LINES,
     LocalVoiceError,
     SadCheckIn,
+    addresses_assistant,
+    is_dismissal,
     speech_segments,
 )
 
@@ -602,6 +606,60 @@ def test_check_in_falls_back_when_llm_is_offline(monkeypatch):
     check_in.converse()
 
     assert spoken == [OPENING_LINE, FALLBACK_REPLY]
+
+
+def test_stop_ends_the_check_in_and_snoozes_the_next_one(monkeypatch):
+    monkeypatch.setattr("check_in.time.sleep", lambda _s: None)
+    llm = FakeLlm()
+    check_in, _synthesizer, spoken = check_in_for(
+        [spoken_answer(), spoken_answer()], ["Stop."], llm, answer_timeout=0.05
+    )
+    check_in.converse()
+
+    assert spoken == [OPENING_LINE, DISMISSED_REPLY]
+    assert llm.heard == []
+    assert not check_in.start_async()
+
+
+def test_wake_phrase_hands_the_turn_to_the_voice_assistant(monkeypatch):
+    monkeypatch.setattr("check_in.time.sleep", lambda _s: None)
+    llm = FakeLlm()
+    check_in, _synthesizer, spoken = check_in_for(
+        [spoken_answer(), spoken_answer()],
+        ["Hey BracketBot. Do a hug."],
+        llm,
+        answer_timeout=0.05,
+    )
+    check_in.converse()
+
+    assert spoken == [OPENING_LINE]
+    assert llm.heard == []
+    assert not check_in.start_async()
+
+
+def test_only_a_whole_answer_dismisses_the_check_in():
+    assert is_dismissal("Stop.")
+    assert is_dismissal("No, I'm fine, thanks.")
+    assert is_dismissal("Okay, stop talking please")
+    assert not is_dismissal("I can't stop crying")
+    assert not is_dismissal("I'm fine I guess, but my exam went badly")
+    assert addresses_assistant("hey, Bracket Bot do a wave")
+    assert not addresses_assistant("the bracket broke")
+
+
+def test_last_reply_is_told_not_to_ask_a_question(monkeypatch):
+    monkeypatch.setattr("check_in.time.sleep", lambda _s: None)
+    llm = FakeLlm()
+    check_in, _synthesizer, _spoken = check_in_for(
+        [spoken_answer(), spoken_answer()],
+        ["rough day", "my exam"],
+        llm,
+        max_turns=2,
+        answer_timeout=0.05,
+    )
+    check_in.converse()
+
+    assert llm.heard == ["rough day", "my exam" + LAST_TURN_NOTE]
 
 
 def test_dashboard_only_encodes_frames_while_someone_is_watching():

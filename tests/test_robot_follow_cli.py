@@ -117,7 +117,7 @@ def test_old_vision_service_refused_before_motion(tmp_path):
 @pytest.mark.parametrize("omega_sign", [1, -1])
 def test_ground_runner_holds_zero_while_speaking_and_stops_on_signal(tmp_path, monkeypatch, arrive, omega_sign):
     import threading
-    from ground_approach import GroundTarget
+    from ground_approach import STANDOFF, GroundTarget
 
     clock = [0.0]
     monkeypatch.setattr(robot_follow.time, "monotonic", lambda: clock[0])
@@ -132,7 +132,7 @@ def test_ground_runner_holds_zero_while_speaking_and_stops_on_signal(tmp_path, m
     monkeypatch.setattr(robot_follow.time, "sleep", sleep)
     monkeypatch.setattr(robot_follow, "STOP_REQUESTED", False)
     monkeypatch.setattr(robot_follow, "read_ground_target", lambda *_: GroundTarget(
-        "test", 1, 100 + clock[0], 1.8 if arrive else 3, 0.3, 0.8))
+        "test", 1, 100 + clock[0], STANDOFF + 0.8 if arrive else 3, 0.3, 0.8))
     writes = []
     monkeypatch.setattr(robot_follow, "write_twist", lambda _writer, v, w: writes.append((v, w)))
     monkeypatch.setattr(robot_follow, "write_led", lambda *_: None)

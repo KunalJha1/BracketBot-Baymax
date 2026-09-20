@@ -6,7 +6,7 @@ import pytest
 
 from follow_core import FollowConfig, FollowController, Perception, TickInputs, Track
 from ground_approach import (
-    GroundApproachLoop, GroundTarget, approach_config, target_from_payload,
+    STANDOFF, GroundApproachLoop, GroundTarget, approach_config, target_from_payload,
 )
 
 
@@ -19,6 +19,9 @@ def payload(now=100.0):
             "base_position": [0.0, 3.0, 0.2], "body_radius_m": 0.8, "confidence": 0.9,
         }],
     }
+
+
+ARRIVED_AT = STANDOFF + 0.8  # body centre distance at the standoff, for the default radius
 
 
 def target(t=0, forward=3, left=0, radius=0.8):
@@ -138,34 +141,35 @@ def test_target_switch_or_jump_aborts_attempt(change):
 
 def test_body_envelope_never_shrinks_and_gap_cannot_be_shortened():
     loop = GroundApproachLoop(approach_config())
-    tick(loop, 0, target(0, forward=2, radius=1.1))
-    out = tick(loop, 0.02, target(0.02, forward=2, radius=0.3))
-    assert out.range == pytest.approx(0.9)
+    inside = 1.1 + STANDOFF - 0.1  # 10 cm inside the standoff of the larger envelope
+    tick(loop, 0, target(0, forward=inside, radius=1.1))
+    out = tick(loop, 0.02, target(0.02, forward=inside, radius=0.3))
+    assert out.range == pytest.approx(STANDOFF - 0.1)
     assert out.v == 0
-    assert loop.set_gap(0.1) == 1
+    assert loop.set_gap(0.1) == STANDOFF
 
 
 def test_arrival_waits_for_stationary_wheels_and_is_one_shot():
     loop = GroundApproachLoop(approach_config())
     for i in range(70):
         t = i * 0.02
-        tick(loop, t, target(t, forward=1.8), measured_v=0.025)
+        tick(loop, t, target(t, forward=ARRIVED_AT), measured_v=0.025)
         assert not loop.arrived
     for i in range(70, 120):
         t = i * 0.02
-        out = tick(loop, t, target(t, forward=1.8))
+        out = tick(loop, t, target(t, forward=ARRIVED_AT))
     assert loop.arrived and out.v == out.omega == 0
     for i in range(120, 140):
         t = i * 0.02
-        out = tick(loop, t, target(t, forward=1.8 + (i - 120) * 0.02))
+        out = tick(loop, t, target(t, forward=ARRIVED_AT + (i - 120) * 0.02))
         assert out.v == out.omega == 0
 
 
 def test_stale_pose_cannot_satisfy_stationary_dwell():
     loop = GroundApproachLoop(approach_config())
-    tick(loop, 0, target(0, forward=1.8))
+    tick(loop, 0, target(0, forward=ARRIVED_AT))
     tick(loop, 0.5, None)
-    tick(loop, 0.7, target(0.7, forward=1.8))
+    tick(loop, 0.7, target(0.7, forward=ARRIVED_AT))
     assert not loop.arrived
 
 
@@ -181,11 +185,11 @@ def test_straight_approach_simulation_reaches_body_standoff(vision_interval):
         assert not out.exit
         speed = out.v
         distance -= speed * 0.02
-        assert distance - 0.8 >= 1.0
+        assert distance - 0.8 >= STANDOFF
         if loop.arrived:
             break
     assert loop.arrived
-    assert 1.0 <= distance - 0.8 <= 1.06
+    assert STANDOFF <= distance - 0.8 <= STANDOFF + 0.06
 
 
 def test_approach_inherits_follow_tuning_but_retains_creep_limits():
@@ -203,12 +207,12 @@ def test_commands_match_shared_follow_controller_through_a_changing_approach():
     loop, reference = GroundApproachLoop(cfg), FollowController(cfg)
     for i in range(120):
         t = i * 0.02
-        distance = 2.1 - 0.0015 * i
+        distance = STANDOFF + 1.1 - 0.0015 * i
         bearing = math.radians(20 - 0.15 * i)
         obs = target(t, forward=distance * math.cos(bearing), left=distance * math.sin(bearing))
         out = tick(loop, t, obs)
         expected = reference.command(Track(obs.forward, obs.left, obs.distance, obs.bearing, 0, 0),
-                                     1 + obs.radius, 0 if i == 0 else 0.02)
+                                     STANDOFF + obs.radius, 0 if i == 0 else 0.02)
         assert (out.v_cmd, out.omega_cmd) == pytest.approx(expected)
         assert out.rule == "ok"
 
@@ -216,7 +220,7 @@ def test_commands_match_shared_follow_controller_through_a_changing_approach():
 def test_small_errors_use_tuned_gains_and_continuous_bearing_deadband():
     cfg = approach_config()
     loop = GroundApproachLoop(cfg)
-    angle, distance = math.radians(4), 1.86  # 1 cm outside the body arrival band
+    angle, distance = math.radians(4), STANDOFF + 0.86  # 1 cm outside the body arrival band
     out = tick(loop, 0, target(0, forward=distance * math.cos(angle), left=distance * math.sin(angle)))
     assert out.v_cmd == pytest.approx(cfg.v_kp * 0.01 * math.cos(angle))
     assert out.omega_cmd == pytest.approx(cfg.w_kp * math.radians(1))
@@ -240,7 +244,7 @@ def test_long_control_gap_resets_pid_history_before_restart():
     out = tick(loop, 2.5, target(2.5, left=0.3))
     reference = FollowController(loop.cfg)
     obs = target(2.5, left=0.3)
-    expected = reference.command(Track(obs.forward, obs.left, obs.distance, obs.bearing, 0, 0), 1.8, 0)
+    expected = reference.command(Track(obs.forward, obs.left, obs.distance, obs.bearing, 0, 0), STANDOFF + 0.8, 0)
     assert (out.v_cmd, out.omega_cmd) == pytest.approx(expected)
 
 
