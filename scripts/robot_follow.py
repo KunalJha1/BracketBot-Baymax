@@ -1,7 +1,7 @@
 """Person-follow runner for BracketBot. Copied to /tmp by robot_dashboard.py.
 
-Depth only: people are person-sized clusters in camera.points (see
-follow_perception.py); no camera image and no neural network. Needs only BBOS
+People are person-sized clusters in camera.points with optional aligned torso
+colour cues; no separate camera image or neural network. Needs only BBOS
 and numpy, so it runs in the BBOS venv like robot_base_mode.py. While running it
 is the only writer of drive.ctrl and led.ctrl. Every decision lives in
 follow_core.FollowLoop; this file only moves data between BBOS topics and the loop.
@@ -35,7 +35,7 @@ from follow_core import (
     parse_command, start_refusal, status_line, wheel_twist,
 )
 from follow_calibration import Calibration, DEFAULT_PATH, load_calibration
-from follow_perception import ClusterConfig, base_to_local, find_people, without_self
+from follow_perception import ClusterConfig, base_to_local, find_people, outside_self_mask, without_self
 from ground_approach import GroundApproachLoop, GROUND_LINE, approach_config, target_from_payload
 
 PERIOD = 0.02  # 50 Hz control loop; drive.ctrl times out after 0.1 s
@@ -51,6 +51,7 @@ CSV_FIELDS = (
     "t", "state", "rule", "gap", "range", "bearing", "error", "v_cmd", "omega_cmd", "v", "omega",
     "measured_v", "measured_omega", "blocked", "corridor_points", "track_age", "people",
     "tick_ms", "perception_ms",
+    "association", "candidates",
 )
 STOP_REQUESTED = False
 
@@ -151,12 +152,29 @@ def other_drive_writers(ignore=()):
     return found
 
 
-def perceive(points_base, t, cluster_cfg=ClusterConfig(), calibration=None):
+def perceive(points_base, t, cluster_cfg=ClusterConfig(), calibration=None, colors=None):
     """One camera.points frame -> Perception with every person-sized cluster."""
     calibration = calibration or Calibration()
-    local = without_self(base_to_local(points_base, calibration.left_sign), calibration.self_mask)
-    people = tuple(PersonObservation(c.forward, c.left) for c in find_people(local, cluster_cfg))
+    local = base_to_local(points_base, calibration.left_sign)
+    keep = outside_self_mask(local, calibration.self_mask)
+    if colors is not None:
+        colors = np.asarray(colors)
+        colors = colors[keep] if colors.shape == local.shape else None
+    local = local[keep]
+    people = tuple(PersonObservation(c.forward, c.left, hist=c.hist)
+                   for c in find_people(local, cluster_cfg, colors=colors))
     return Perception(t, people, local)
+
+
+def point_colors(data, n):
+    names = getattr(getattr(data, "dtype", None), "names", None)
+    names = names if names is not None else data.keys()
+    if "colors" not in names:
+        return None
+    colors = np.asarray(data["colors"])
+    if colors.dtype != np.uint8 or colors.ndim != 2 or colors.shape[1] != 3 or len(colors) < n:
+        return None
+    return colors[:n].copy()
 
 
 def cloud(data):
@@ -227,10 +245,16 @@ def run_check(reader_cls, seconds=3.0, calibration=None):
         while time.monotonic() < end:
             if points.ready():
                 cal = calibration or Calibration()
-                people = find_people(without_self(base_to_local(cloud(points.data), cal.left_sign), cal.self_mask))
+                data = points.data
+                xyz = cloud(data)
+                local = base_to_local(xyz, cal.left_sign)
+                keep = outside_self_mask(local, cal.self_mask)
+                colors = point_colors(data, len(xyz))
+                people = find_people(local[keep], colors=None if colors is None else colors[keep])
                 print(json.dumps({"clusters": [
                     {"forward": round(c.forward, 2), "left": round(c.left, 2), "points": c.points,
-                     "top": round(c.top, 2), "depth": round(c.depth, 2), "width": round(c.width, 2)}
+                     "top": round(c.top, 2), "depth": round(c.depth, 2), "width": round(c.width, 2),
+                     "appearance": c.hist is not None}
                     for c in people
                 ]}), flush=True)
             time.sleep(0.05)
@@ -252,6 +276,7 @@ def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width, calibr
     measured = wheel_twist(vel[list(calibration.wheel_order)], wheel_diam, robot_width, calibration.wheel_signs)
     last_status = last_csv = 0.0
     last_flush = now
+    candidates = "[]"
     state, state_since = None, now
     log_path = args.log_dir / f"baymax_follow_{time.strftime('%Y%m%d_%H%M%S')}.csv"
     with log_path.open("w", newline="") as log_file:
@@ -292,7 +317,13 @@ def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width, calibr
                 if args.ground_approach:
                     perception = ground_perception(points.data, t, time.time(), calibration)
                 else:
-                    perception = perceive(cloud(points.data), t, calibration=calibration)
+                    data = points.data
+                    xyz = cloud(data)
+                    perception = perceive(xyz, t, calibration=calibration, colors=point_colors(data, len(xyz)))
+                    candidates = json.dumps([
+                        {"forward": round(p.forward, 3), "left": round(p.left, 3), "appearance": p.hist is not None}
+                        for p in perception.people
+                    ], separators=(",", ":"))
                 perception_ms = (time.monotonic() - perception_started) * 1000.0
 
             # Include perception work in freshness and heartbeat checks.
@@ -344,6 +375,7 @@ def control_loop(args, cfg, readers, drive, led, wheel_diam, robot_width, calibr
                     "people": "" if perception is None else len(perception.people),
                     "tick_ms": round((time.monotonic() - tick_started) * 1000, 3),
                     "perception_ms": "" if perception_ms is None else round(perception_ms, 3),
+                    "association": out.association, "candidates": candidates,
                 })
                 last_csv = t
             if t - last_flush >= 1.0:

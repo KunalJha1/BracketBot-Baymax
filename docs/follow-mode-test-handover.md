@@ -17,7 +17,9 @@ Press **Follow me** in the dashboard and stand 0.5–2 m in front of the robot.
 The only person-sized shape in that zone for half a second is locked on, and the
 robot then holds the slider's distance (0.6–1.5 m, default 1.0 m) to within
 ±20 cm while you stand, turn, or walk slowly. It finds you from the depth
-camera's 3D points alone — no neural network and no camera image.
+camera's 3D points, with optional aligned point colours to help keep the same
+target — no neural network and no separate camera image. See
+[target retention and turning](follow-target-lock.md) for the updated behavior.
 
 ## Voice: "follow me"
 
@@ -44,7 +46,10 @@ the gap -> raise `v_kd`. Check a change with `pytest tests/test_follow_sim.py` f
 - **Range is measured to the front of your torso**, about 10 cm nearer than your
   centre — that is the surface the camera sees. Tape marks line up with the front
   of the torso, not the toes.
-- **After losing you for 10 s** it re-locks onto whoever then stands in front.
+- **After a long loss** it stays stopped until Follow is stopped and restarted.
+  It no longer automatically chooses whoever stands in front. Shorter recovery
+  requires several consistent observations matching the original clothing cue;
+  without that cue, uncertain identity requires a restart.
 - It never drives backward, and stops for anything in a 0.6 m corridor ahead.
 
 ## Before you start

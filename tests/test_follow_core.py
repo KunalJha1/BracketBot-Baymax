@@ -164,10 +164,10 @@ def test_position_gate_rejects_a_cluster_2m_away_during_a_lost_coast():
     assert tracker.update(3.0, [stranger], [(3.0, 0.0)]) == "coasted"
 
 
-def test_position_gate_accepts_a_cluster_0_3m_away_during_a_lost_coast():
+def test_position_alone_cannot_reacquire_a_person_after_a_lost_coast():
     tracker = lost_coasting_tracker()
     same_person = person(0.0)
-    assert tracker.update(3.0, [same_person], [(1.3, 0.0)]) == "updated"
+    assert tracker.update(3.0, [same_person], [(1.3, 0.0)]) == "identity-required"
 
 
 def test_track_view_does_not_modify_the_filter():
@@ -418,7 +418,7 @@ def test_status_line_is_prefixed_json():
     assert payload["gap"] == 1.0
     assert payload["range"] is None
     assert set(payload) == {"state", "range", "gap", "error", "bearing_deg", "v", "w",
-                            "blocked", "age_ms", "rule"}
+                            "blocked", "age_ms", "rule", "association"}
 
 
 def test_led_patterns():

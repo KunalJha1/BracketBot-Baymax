@@ -85,11 +85,15 @@ class FollowConfig:
     lock_range_max: float = 2.0
     lock_bearing_max: float = math.radians(30.0)
     lock_assoc_dist: float = 0.3
+    lock_min_frames: int = 4
+    lock_frame_gap: float = 0.25
     # Tracking
     gate_sigma: float = 3.0
     hist_max_distance: float = 0.4
-    hist_alpha: float = 0.05
     ambiguity_ratio: float = 0.10
+    ambiguity_margin: float = 0.12  # absolute normalised score margin, including a perfect nearest match
+    reacquire_window: float = 0.25
+    reacquire_min_frames: int = 3
     meas_sigma: float = 0.08
     accel_sigma: float = 1.0
     max_pos_sigma: float = 0.4
@@ -134,7 +138,7 @@ class PersonObservation:
     forward: float
     left: float
     score: float = 1.0
-    hist: np.ndarray | None = None  # optional appearance cue; depth-only perception leaves it None
+    hist: np.ndarray | None = None  # optional torso colour cue from aligned camera.points.colors
 
     @property
     def range(self):
@@ -162,14 +166,13 @@ class Track:
     bearing: float
     v_radial: float  # person's own speed away from the robot (m/s)
     age: float  # seconds since the last accepted observation
+    omega_feedforward: float = 0.0  # target angular motion, excluding robot rotation
 
 
 def hist_distance(p, q):
     """Bhattacharyya distance of two L1-normalised histograms; 0 when either is missing.
 
-    Dormant appearance hook (spec-sanctioned): depth-only perception never supplies
-    a histogram, so ``p``/``q`` are always None here and this always returns 0.0.
-    Do not mistake it for live behaviour.
+    Missing cues are handled separately by Tracker during re-acquisition.
     """
     if p is None or q is None:
         return 0.0
@@ -242,10 +245,23 @@ class LockOn:
     def reset(self):
         self.candidates = []
         self.frames = []  # times of the frames seen while searching
+        self.last_t = None
 
     def update(self, t, people, positions):
         """Returns ``(observation, odom_xy)`` of the locked person, or None."""
         cfg = self.cfg
+        if self.last_t is not None and t <= self.last_t:
+            return None
+        if self.last_t is not None and t - self.last_t > cfg.lock_frame_gap:
+            self.reset()
+        self.last_t = t
+        eligible = [(o, xy) for o, xy in zip(people, positions)
+                    if cfg.lock_range_min <= o.range <= cfg.lock_range_max
+                    and abs(o.bearing) <= cfg.lock_bearing_max]
+        if len(eligible) > 1:
+            self.reset()  # a new arrival must not lose to an older candidate's accumulated dwell time
+            self.last_t = t
+            return None
         self.frames.append(t)
         used = set()
         for obs, xy in zip(people, positions):
@@ -272,7 +288,9 @@ class LockOn:
         qualified = []
         for cand in self.candidates:
             cand["seen"] = [s for s in cand["seen"] if s >= horizon]
-            if t - cand["first_t"] >= cfg.lock_window and len(cand["seen"]) >= cfg.lock_fraction * len(self.frames):
+            if (cand["seen"][-1] == t and len(cand["seen"]) >= cfg.lock_min_frames
+                    and t - cand["first_t"] >= cfg.lock_window
+                    and len(cand["seen"]) >= cfg.lock_fraction * len(self.frames)):
                 qualified.append(cand)
         if len(qualified) != 1:
             return None  # nobody yet, or two people in the zone: keep waiting
@@ -290,6 +308,10 @@ class Tracker:
         self.kf = None
         self.ref_hist = None
         self.last_update = None
+        self.last_frame = None
+        self.uncertain = False
+        self.confirmation = None
+        self.association = "searching"
 
     @property
     def locked(self):
@@ -297,45 +319,75 @@ class Tracker:
 
     def start(self, t, xy, hist):
         self.kf = ConstantVelocityKF(xy[0], xy[1], t, self.cfg)
-        self.ref_hist = None if hist is None else np.asarray(hist, dtype=float)
+        self.ref_hist = None if hist is None else np.asarray(hist, dtype=float).copy()
         self.last_update = t
+        self.last_frame = t
+        self.uncertain = False
+        self.confirmation = None
+        self.association = "locked"
 
     def mark_lost(self):
         self.kf.forget_velocity()
+        self.uncertain = True
+        self.confirmation = None
 
     def age(self, t):
         return t - self.last_update
 
     def update(self, t, people, positions):
-        """Returns "updated", "coasted" (no match), or "ambiguous" (two close matches)."""
+        """Match spatially and by colour; uncertainty requires sustained appearance confirmation."""
         cfg = self.cfg
+        if t <= self.last_frame:
+            return "old-frame"
+        self.last_frame = t
         self.kf.predict(t)
+        recovering = self.uncertain or self.age(t) > cfg.perception_stale
         candidates = []
         for obs, xy in zip(people, positions):
             d = self.kf.mahalanobis(xy)
+            if self.ref_hist is not None and obs.hist is None:
+                continue  # never silently drop identity evidence when a field disappears
             h = hist_distance(self.ref_hist, obs.hist)
             if d > cfg.gate_sigma or h > cfg.hist_max_distance:
                 continue
             score = 0.5 * d / cfg.gate_sigma + 0.5 * h / cfg.hist_max_distance
             candidates.append((score, obs, xy))
         if not candidates:
+            self.confirmation = None
+            self.association = "coasted"
             return "coasted"
         candidates.sort(key=lambda item: item[0])
-        if len(candidates) > 1 and candidates[1][0] <= candidates[0][0] * (1 + cfg.ambiguity_ratio):
+        if len(candidates) > 1 and candidates[1][0] <= max(
+                candidates[0][0] * (1 + cfg.ambiguity_ratio), candidates[0][0] + cfg.ambiguity_margin):
+            self.uncertain = True
+            self.confirmation = None
+            self.association = "ambiguous"
             return "ambiguous"
         _, obs, xy = candidates[0]
+        if recovering:
+            self.uncertain = True
+            if self.ref_hist is None:
+                self.association = "identity-required"
+                return "identity-required"
+            c = self.confirmation
+            if (c is None or t - c["last"] > cfg.lock_frame_gap
+                    or math.dist(c["xy"], xy) > cfg.lock_assoc_dist):
+                c = {"first": t, "count": 0}
+            c.update(last=t, xy=xy, count=c["count"] + 1)
+            self.confirmation = c
+            if c["count"] < cfg.reacquire_min_frames or t - c["first"] < cfg.reacquire_window:
+                self.association = "confirming"
+                return "confirming"
+            self.kf.forget_velocity()  # do not infer a burst of speed from the occlusion displacement
         self.kf.update(xy)
         self.last_update = t
-        if obs.hist is not None:
-            hist = np.asarray(obs.hist, dtype=float)
-            if self.ref_hist is None:
-                self.ref_hist = hist
-            else:
-                blended = (1 - cfg.hist_alpha) * self.ref_hist + cfg.hist_alpha * hist
-                self.ref_hist = blended / blended.sum()
+        # Keep the initial appearance anchor; gradual updates can learn a bystander's clothes.
+        self.uncertain = False
+        self.confirmation = None
+        self.association = "updated"
         return "updated"
 
-    def track(self, t, pose):
+    def track(self, t, pose, robot_v=0.0):
         """Robot-relative view of the person at time ``t``; does not modify the filter."""
         dt = max(0.0, t - self.kf.t)
         x = self.kf.s[0] + self.kf.s[2] * dt
@@ -346,7 +398,11 @@ class Tracker:
             v_radial = (self.kf.s[2] * (x - pose.x) + self.kf.s[3] * (y - pose.y)) / rng
         else:
             v_radial = 0.0
-        return Track(forward, left, rng, math.atan2(left, forward), float(v_radial), self.age(t))
+        c, s = math.cos(pose.h), math.sin(pose.h)
+        vf = c * self.kf.s[2] + s * self.kf.s[3] - robot_v
+        vl = -s * self.kf.s[2] + c * self.kf.s[3]
+        angular = (forward * vl - left * vf) / max(rng**2, 0.01)
+        return Track(forward, left, rng, math.atan2(left, forward), float(v_radial), self.age(t), float(angular))
 
 
 class PID:
@@ -413,7 +469,8 @@ class FollowController:
         omega = self.bearing_pid.step(
             shrink(track.bearing, cfg.deadband_bearing), dt, -cfg.omega_max, cfg.omega_max
         )
-        return v, omega
+        # Feed the target's own angular motion forward so sideways steps are anticipated.
+        return v, clamp(track.omega_feedforward + omega, -cfg.omega_max, cfg.omega_max)
 
 
 def follow_command(track, gap, cfg):
@@ -582,6 +639,7 @@ class TickOutput:
     blocked: bool
     corridor_points: int
     track_age: float | None
+    association: str = "searching"
 
     @property
     def error(self):
@@ -625,9 +683,9 @@ class FollowLoop:
             self._perceive(inp.perception)
         self._advance_state(inp.t)
 
-        tracking = self.state in (FOLLOWING, BLOCKED)
-        track = self.tracker.track(inp.t, self.pose) if tracking else None
-        if track:
+        tracking = self.state in (FOLLOWING, BLOCKED) and not self.tracker.uncertain
+        track = self.tracker.track(inp.t, self.pose, inp.measured_v) if self.tracker.locked else None
+        if tracking and track:
             v_cmd, omega_cmd = self.controller.command(track, self.gap, dt)
         else:
             self.controller.reset()
@@ -650,13 +708,17 @@ class FollowLoop:
             v, omega = self.limiter.step(verdict.v, verdict.omega, dt)
         return TickOutput(
             t=inp.t, state=self.state, v=v, omega=omega, v_cmd=v_cmd, omega_cmd=omega_cmd,
-            rule=verdict.rule, exit=verdict.exit, gap=self.gap,
+            rule=(self.tracker.association if verdict.rule == "no-track" and self.tracker.uncertain else verdict.rule),
+            exit=verdict.exit, gap=self.gap,
             range=track.range if track else None, bearing=track.bearing if track else None,
             blocked=self.corridor.blocked, corridor_points=self.corridor_points,
             track_age=track.age if track else None,
+            association=self.tracker.association,
         )
 
     def _perceive(self, frame):
+        if self.last_points_t is not None and frame.t <= self.last_points_t:
+            return
         positions = [self.pose.to_odom(o.forward, o.left) for o in frame.people]
         if self.state == SEARCHING:
             locked = self.lock_on.update(frame.t, frame.people, positions)
@@ -665,11 +727,14 @@ class FollowLoop:
                 self.tracker.start(frame.t, xy, obs.hist)
                 self.lock_on.reset()
                 self.state = FOLLOWING
-        elif self.tracker.update(frame.t, frame.people, positions) == "updated" and self.state == LOST:
-            self.state = FOLLOWING
-            self.lost_since = None
+        elif self.lost_since is None or frame.t - self.lost_since <= self.cfg.lost_timeout:
+            result = self.tracker.update(frame.t, frame.people, positions)
+            if result == "updated" and self.state == LOST:
+                self.state = FOLLOWING
+                self.lost_since = None
         person = None
-        if self.tracker.locked:
+        if (self.tracker.locked and not self.tracker.uncertain
+                and self.tracker.age(frame.t) <= self.cfg.perception_stale):
             track = self.tracker.track(frame.t, self.pose)
             person = (track.forward, track.left)
         self.corridor_points = corridor_count(frame.points, person, self.cfg)
@@ -685,10 +750,8 @@ class FollowLoop:
             else:
                 self.state = BLOCKED if self.corridor.blocked else FOLLOWING
         elif self.state == LOST and t - self.lost_since > self.cfg.lost_timeout:
-            self.state = SEARCHING
-            self.lost_since = None
-            self.tracker.reset()
-            self.lock_on.reset()
+            self.tracker.association = "restart-required"
+            self.tracker.uncertain = True  # retain the old target; never auto-select somebody else
 
 
 @dataclass(frozen=True)
@@ -737,6 +800,7 @@ def status_line(out):
         "blocked": out.blocked,
         "age_ms": None if out.track_age is None else round(out.track_age * 1000),
         "rule": out.rule,
+        "association": out.association,
     }
     return STATUS_PREFIX + json.dumps(payload, separators=(",", ":"))
 

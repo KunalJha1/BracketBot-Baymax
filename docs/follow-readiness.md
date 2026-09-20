@@ -10,6 +10,11 @@ The detector still identifies **person-sized shapes**, including some plants,
 pillars, and coat racks. Start with one person in clear space. This change does
 not add semantic person recognition or SLAM.
 
+The follow runner also uses supported aligned point colours to help retain the
+same target. Read [target retention and turning](follow-target-lock.md) before
+repeating rotation/follow tests: recovery now requires identity evidence and
+does not automatically choose a new person after a long loss.
+
 ## 1. Check the code on the laptop
 
 From a clean checkout of the branch containing the readiness fix:

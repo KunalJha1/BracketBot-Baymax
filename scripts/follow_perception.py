@@ -1,4 +1,4 @@
-"""Depth-only person finding for person-follow: no neural network, no camera image.
+"""Geometric person candidates with optional aligned point-colour appearance.
 
 Converts ``camera.points`` to robot-local (forward, left, up) and finds
 person-sized clusters on a floor grid. Pure numpy, so it runs unchanged in the
@@ -41,6 +41,7 @@ class Cluster:
     top: float  # highest point (m)
     depth: float  # footprint extent along forward (m)
     width: float  # footprint extent along left (m)
+    hist: np.ndarray | None = None
 
 
 def base_to_local(points_base, left_sign=BASE_LEFT_SIGN):
@@ -49,15 +50,51 @@ def base_to_local(points_base, left_sign=BASE_LEFT_SIGN):
     return np.column_stack([p[:, 1], left_sign * p[:, 0], p[:, 2]])
 
 
-def without_self(points_local, boxes):
-    """Remove only physically reviewed robot-body boxes, before detection and obstacle checks."""
+def outside_self_mask(points_local, boxes):
+    """Selection shared by geometry and its aligned colours."""
     p = np.asarray(points_local, dtype=np.float64).reshape(-1, 3)
     keep = np.ones(len(p), dtype=bool)
     for f0, f1, l0, l1, z0, z1 in boxes:
         keep &= ~((p[:, 0] >= f0) & (p[:, 0] <= f1)
                   & (p[:, 1] >= l0) & (p[:, 1] <= l1)
                   & (p[:, 2] >= z0) & (p[:, 2] <= z1))
-    return p[keep]
+    return keep
+
+
+def without_self(points_local, boxes):
+    """Remove only physically reviewed robot-body boxes."""
+    p = np.asarray(points_local, dtype=np.float64).reshape(-1, 3)
+    return p[outside_self_mask(p, boxes)]
+
+
+def clothing_histogram(colors):
+    """Coarse chromaticity/brightness cue, not a person ID or a learned ReID model.
+
+    BBOS point colours must be aligned uint8 RGB triplets. Unknown formats are
+    ignored, so a device schema change cannot manufacture a false colour cue.
+    """
+    if colors is None:
+        return None
+    rgb = np.asarray(colors)
+    if rgb.dtype != np.uint8 or rgb.ndim != 2 or rgb.shape[1] != 3 or len(rgb) < 10:
+        return None
+    rgb = rgb.astype(float)
+    total = np.maximum(rgb.sum(axis=1), 1)
+    features = np.column_stack([rgb[:, 0] / total, rgb[:, 1] / total, rgb.max(axis=1) / 256])
+    # Soft bins avoid changing the entire descriptor when exposure crosses one
+    # brightness-bin boundary. Keep chromaticity separate from brightness.
+    coordinates = np.clip(features * 4 - .5, 0, 3)
+    lower = np.floor(coordinates).astype(int)
+    fraction = coordinates - lower
+    hist = np.zeros(64)
+    for dr in (0, 1):
+        for dg in (0, 1):
+            for dv in (0, 1):
+                offset = np.array([dr, dg, dv])
+                bins = np.minimum(lower + offset, 3)
+                weight = np.prod(np.where(offset, fraction, 1 - fraction), axis=1)
+                hist += np.bincount(bins[:, 0] * 16 + bins[:, 1] * 4 + bins[:, 2], weights=weight, minlength=64)
+    return hist / hist.sum()
 
 
 def _label(occupied):
@@ -82,15 +119,21 @@ def _label(occupied):
     return labels
 
 
-def find_people(points_local, cfg=ClusterConfig()):
+def find_people(points_local, cfg=ClusterConfig(), colors=None):
     """Person-sized clusters in a robot-local cloud, nearest-first."""
     p = np.asarray(points_local, dtype=np.float64).reshape(-1, 3)
+    if colors is not None:
+        colors = np.asarray(colors)
+        if colors.dtype != np.uint8 or colors.shape != p.shape:
+            colors = None
     f, l, z = p[:, 0], p[:, 1], p[:, 2]
     keep = (
         (z >= cfg.z_min) & (z <= cfg.z_max)
         & (f >= cfg.forward_min) & (f <= cfg.forward_max) & (np.abs(l) <= cfg.left_max)
     )
     p = p[keep]
+    if colors is not None:
+        colors = colors[keep]
     if len(p) == 0:
         return []
     rows = int(np.ceil((cfg.forward_max - cfg.forward_min) / cfg.cell)) + 1
@@ -113,8 +156,10 @@ def find_people(points_local, cfg=ClusterConfig()):
         top = float(sel[:, 2].max())
         if top < cfg.min_top:
             continue
-        torso = sel[(sel[:, 2] >= cfg.torso_z[0]) & (sel[:, 2] <= cfg.torso_z[1])]
+        torso_mask = (sel[:, 2] >= cfg.torso_z[0]) & (sel[:, 2] <= cfg.torso_z[1])
+        torso = sel[torso_mask]
         body = torso if len(torso) >= cfg.min_torso_points else sel
+        hist = None if colors is None else clothing_histogram(colors[point_labels == k][torso_mask])
         people.append(Cluster(float(np.median(body[:, 0])), float(np.median(body[:, 1])),
-                              len(sel), top, depth, width))
+                              len(sel), top, depth, width, hist))
     return sorted(people, key=lambda c: np.hypot(c.forward, c.left))

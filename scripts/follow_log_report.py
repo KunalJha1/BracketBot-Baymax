@@ -66,6 +66,7 @@ def summarise(rows, band=0.20):
         "omega_sign_agreement": sign_agreement(rows, "omega", "measured_omega", 0.2),
         "blocked_to_stop_s": blocked_to_stop(rows),
         "rules": dict(Counter(r["rule"] for r in rows)),
+        "associations": dict(Counter(r["association"] for r in rows if r.get("association"))),
         "last_rule": rows[-1]["rule"] if rows else None,
     }
 
