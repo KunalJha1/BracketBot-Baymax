@@ -43,7 +43,9 @@ from ground_safety import (  # noqa: E402
     GroundAssessment,
     GroundAlertTracker,
     Keypoint,
+    MONOCULAR_FLOOR_HEIGHT_M,
     assess_ground_pose,
+    floor_pose_if_human,
     keypoints_in_base_frame,
 )
 
@@ -112,6 +114,22 @@ def monocular_assess(keypoints, eye, keypoint_confidence=0.35):
         return GroundAssessment("unknown", 0.0, "fewer than four confident keypoints", len(usable))
 
     directions = rays_in_base_frame([(kp.x, kp.y) for kp in usable], eye)
+
+    # Same test the robot runs: lay every joint on the floor along its ray. A
+    # body really lying there keeps human proportions whichever way it points;
+    # the single-range model below reads a body lying away from the camera as
+    # raised shoulders and head, and used to call it clear.
+    floor = {}
+    for keypoint, direction in zip(usable, directions):
+        if direction[2] < -1e-6:
+            travel = (MONOCULAR_FLOOR_HEIGHT_M - CAM_HEIGHT) / direction[2]
+            floor[keypoint.index] = CAM_ORIGIN + travel * direction
+        else:
+            floor[keypoint.index] = np.full(3, np.nan)
+    lying, _ = floor_pose_if_human(floor)
+    if lying is not None:
+        return assess_ground_pose(lying)
+
     lowest = int(np.argmax([kp.y for kp in usable]))
     contact_ray = directions[lowest]
     if contact_ray[2] >= -1e-3:

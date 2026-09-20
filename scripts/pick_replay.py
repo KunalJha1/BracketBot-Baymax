@@ -30,7 +30,7 @@ CAN_HEIGHT_METRES = 0.122
 
 
 def synthetic_cloud(can=(0.42, 0.12), box=(0.47, -0.22), tilt_degrees=9.0, table_z=0.74,
-                    noise=0.003, seed=0, table_points=150000):
+                    noise=0.003, seed=0, table_points=150000, near_edge=0.2):
     """A ``camera.points``-frame cloud: tilted table, a can, an open box, clutter."""
 
     rng = np.random.default_rng(seed)
@@ -39,7 +39,7 @@ def synthetic_cloud(can=(0.42, 0.12), box=(0.47, -0.22), tilt_degrees=9.0, table
     def surface(x):
         return table_z + slope * (x - 0.2)
 
-    x = rng.uniform(0.2, 1.0, table_points)
+    x = rng.uniform(near_edge, 1.0, table_points)
     y = rng.uniform(-0.6, 0.6, table_points)
     parts = [np.column_stack((x, y, surface(x) + rng.normal(0, noise, table_points)))]
     if can is not None:

@@ -210,11 +210,14 @@ def estimate_hr(t, rgb, fs=30.0, method="pos", prev_bpm=None, track_bpm=15.0):
 # ----------------------------------------------------------------------------
 
 FACE_SCORE = 0.75
-FACE_DETECT_MAX_WIDTH = 560
+FACE_DETECT_MAX_WIDTH = 640
+FACE_DETECT_EVERY = 2
+FOREHEAD_DARK_RATIO = 0.62
+FOREHEAD_DARK_FRACTION = 0.28
 
 
-def face_skin_mask(face, image_shape):
-    """Return a conservative forehead/cheek mask from one YuNet detection.
+def face_skin_region_masks(face, image_shape):
+    """Return separate forehead, left-cheek, and right-cheek masks.
 
     YuNet rows are ``x, y, w, h``, five landmark pairs (eyes, nose, mouth
     corners), then confidence. Fixed face-relative polygons avoid the eyes,
@@ -227,10 +230,10 @@ def face_skin_mask(face, image_shape):
     h_img, w_img = image_shape[:2]
     values = np.asarray(face, dtype=float).reshape(-1)
     if len(values) < 15 or not np.isfinite(values[:15]).all():
-        return None
+        return None, None, None
     x, y, w, h = values[:4]
     if w <= 0 or h <= 0:
-        return None
+        return None, None, None
 
     def point(rx, ry):
         px = int(np.clip(round(x + rx * w), 0, max(0, w_img - 1)))
@@ -244,10 +247,45 @@ def face_skin_mask(face, image_shape):
         (point(0.10, 0.46), point(0.38, 0.42), point(0.40, 0.72), point(0.16, 0.76)),
         (point(0.62, 0.42), point(0.90, 0.46), point(0.84, 0.76), point(0.60, 0.72)),
     )
-    mask = np.zeros((h_img, w_img), np.uint8)
+    masks = []
     for region in regions:
+        mask = np.zeros((h_img, w_img), np.uint8)
         cv2.fillConvexPoly(mask, np.asarray(region, dtype=np.int32), 255)
-    return mask
+        masks.append(mask)
+    return tuple(masks)
+
+
+def face_skin_mask(face, image_shape):
+    """Return the combined forehead-and-cheek sampling mask."""
+    masks = face_skin_region_masks(face, image_shape)
+    if masks[0] is None:
+        return None
+    return np.maximum.reduce(masks)
+
+
+def forehead_looks_covered(frame_bgr, face):
+    """Conservatively flag dark hair or another obstruction over the forehead.
+
+    The cheeks provide a same-face lighting and skin-tone reference. A warning
+    is raised only when a substantial fraction of the forehead is much darker
+    than that reference; persistence in ``measure_heart_rate`` filters shadows
+    and single-frame detector jitter before anyone is prompted.
+    """
+    import cv2
+
+    forehead, left_cheek, right_cheek = face_skin_region_masks(face, frame_bgr.shape)
+    if forehead is None:
+        return False
+    luminance = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    cheek_values = luminance[(left_cheek > 0) | (right_cheek > 0)]
+    forehead_values = luminance[forehead > 0]
+    if not len(cheek_values) or not len(forehead_values):
+        return False
+    cheek_median = float(np.median(cheek_values))
+    if cheek_median < 25.0:  # The frame is too dark for a reliable comparison.
+        return False
+    dark_fraction = float(np.mean(forehead_values < cheek_median * FOREHEAD_DARK_RATIO))
+    return dark_fraction >= FOREHEAD_DARK_FRACTION
 
 
 class FaceROI:
@@ -259,6 +297,9 @@ class FaceROI:
             str(model_path), "", (320, 320), FACE_SCORE, 0.3, 50
         )
         self.detector_size = None
+        self.frame_index = 0
+        self.cached_face = None
+        self.forehead_covered = False
 
     def __call__(self, frame_bgr, _t_ms):
         """Returns (mean_rgb (3,), nose_xy, face_width_px, mask) or None if no face."""
@@ -270,21 +311,31 @@ class FaceROI:
         if self.detector_size != detect_size:
             self.detector.setInputSize(detect_size)
             self.detector_size = detect_size
-        detection_frame = (
-            frame_bgr if detect_size == (w, h)
-            else self.cv2.resize(frame_bgr, detect_size, interpolation=self.cv2.INTER_AREA)
-        )
-        _, faces = self.detector.detect(detection_frame)
-        if faces is None or not len(faces):
-            return None
-        face = max(faces, key=lambda row: float(row[2] * row[3] * row[-1]))
-        if detect_size != (w, h):
-            face = np.asarray(face, dtype=np.float32).copy()
-            face[[0, 2, 4, 6, 8, 10, 12]] *= w / detect_w
-            face[[1, 3, 5, 7, 9, 11, 13]] *= h / detect_h
+        detect_now = self.cached_face is None or self.frame_index % FACE_DETECT_EVERY == 0
+        self.frame_index += 1
+        if detect_now:
+            detection_frame = (
+                frame_bgr if detect_size == (w, h)
+                else self.cv2.resize(frame_bgr, detect_size, interpolation=self.cv2.INTER_AREA)
+            )
+            _, faces = self.detector.detect(detection_frame)
+            if faces is None or not len(faces):
+                self.cached_face = None
+                self.forehead_covered = False
+                return None
+            face = max(faces, key=lambda row: float(row[2] * row[3] * row[-1]))
+            if detect_size != (w, h):
+                face = np.asarray(face, dtype=np.float32).copy()
+                face[[0, 2, 4, 6, 8, 10, 12]] *= w / detect_w
+                face[[1, 3, 5, 7, 9, 11, 13]] *= h / detect_h
+            self.cached_face = face
+        else:
+            face = self.cached_face
         mask = face_skin_mask(face, frame_bgr.shape)
         if mask is None or self.cv2.countNonZero(mask) < 400:  # face too small/far
+            self.forehead_covered = False
             return None
+        self.forehead_covered = forehead_looks_covered(frame_bgr, face)
         rgb = self.cv2.cvtColor(frame_bgr, self.cv2.COLOR_BGR2RGB)
         mean_rgb = self.cv2.mean(rgb, mask=mask)[:3]
         nose = np.asarray(face[8:10], dtype=np.float32)
@@ -448,7 +499,8 @@ class HeartRateTracker:
 
 def measure_heart_rate(duration_s=15.0, window_s=10.0, fs=30.0,
                        snr_min_db=-1.0, motion_max=0.03, face_gap_max_s=0.75,
-                       model_path=DEFAULT_MODEL, on_update=None, grab=None):
+                       model_path=DEFAULT_MODEL, on_update=None, on_guidance=None,
+                       grab=None):
     """
     Blocking scan. Robot should be stationary (motors holding balance only)
     and say "please hold still" first.
@@ -459,6 +511,9 @@ def measure_heart_rate(duration_s=15.0, window_s=10.0, fs=30.0,
                     several seconds of good signal already collected. Longer
                     losses reset the window and peak tracker.
     on_update(bpm, snr, progress): optional hook for the face display.
+    on_guidance(kind): optional one-shot quality prompt; currently
+                       ``clear-forehead`` when hair/another dark obstruction
+                       persistently covers the forehead sample.
     grab: zero-arg callable returning one BGR frame (or None if no new frame yet).
           Defaults to open_camera(); the robot passes its head-camera reader here.
     Returns dict(bpm, snr_db, spread_bpm, span_s, confident, n_estimates) or None.
@@ -467,6 +522,8 @@ def measure_heart_rate(duration_s=15.0, window_s=10.0, fs=30.0,
     roi = FaceROI(model_path)
     tracker = HeartRateTracker(fs=fs, window_s=window_s, snr_min_db=snr_min_db)
     last_nose, last_face_at, bad_run = None, None, 0
+    forehead_covered_run = 0
+    forehead_guidance_sent = False
     t0 = time.monotonic()
     next_est = t0 + MIN_SECONDS
 
@@ -488,6 +545,19 @@ def measure_heart_rate(duration_s=15.0, window_s=10.0, fs=30.0,
             continue
         rgb, nose, face_w, _ = r
         last_face_at = now
+
+        if getattr(roi, "forehead_covered", False):
+            forehead_covered_run += 1
+            # Never feed known obstruction pixels into the pulse buffer. After
+            # a short persistent run, discard earlier samples and ask once.
+            if forehead_covered_run >= max(3, int(0.35 * fs)):
+                tracker.clear(unlock=True)
+                last_nose = None
+                if on_guidance is not None and not forehead_guidance_sent:
+                    on_guidance("clear-forehead")
+                    forehead_guidance_sent = True
+            continue
+        forehead_covered_run = 0
 
         if last_nose is not None and np.linalg.norm(nose - last_nose) / face_w > motion_max:
             bad_run += 1

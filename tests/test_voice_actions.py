@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+import json
 import sys
 import threading
 import time
@@ -140,14 +141,15 @@ def test_stop_clears_active_led_effect(tmp_path, monkeypatch):
 class FakeScanner:
     installed = True
 
-    def __init__(self, result=None, error=None, block=False, ticks=()):
+    def __init__(self, result=None, error=None, block=False, ticks=(), guidance=()):
         self.result = result
         self.error = error
         self.block = block
         self.ticks = list(ticks)
+        self.guidance = list(guidance)
         self.calls = 0
 
-    def scan(self, cancel, on_tick=None):
+    def scan(self, cancel, on_tick=None, on_guidance=None):
         self.calls += 1
         if self.block:
             cancel.wait(2.0)
@@ -155,6 +157,9 @@ class FakeScanner:
         if on_tick is not None:
             for index, bpm in enumerate(self.ticks):
                 on_tick(bpm, (index + 1) / (len(self.ticks) or 1))
+        if on_guidance is not None:
+            for kind in self.guidance:
+                on_guidance(kind)
         if self.error:
             raise self.error
         return self.result
@@ -177,7 +182,27 @@ def test_heart_rate_scan_announces_result_and_frees_the_controller(tmp_path):
         "Your heart rate looks like about 72 beats per minute. "
         "This is a camera estimate, not a medical measurement."
     ]
-    assert leds.effects and leds.clears >= 1
+    assert leds.effects == [((70, 220, 120), "pulse", 600.0)]
+    assert leds.clears >= 1
+
+
+def test_heart_rate_scan_announces_forehead_guidance_only_once(tmp_path):
+    announced = []
+    scanner = FakeScanner(
+        {"bpm": 72.0, "confident": True},
+        guidance=["clear-forehead", "clear-forehead"],
+    )
+    controller = voice_actions.VoiceActionController(
+        FakeGestureController(), tmp_path, heart_rate_scanner=scanner
+    )
+    controller.bind(FakeSpeaker(), SimpleNamespace(), FakeLeds(), announce=announced.append)
+
+    assert controller.start("heart-rate")[0] is True
+    wait_for_controller(controller)
+
+    assert announced[0] == voice_actions.CLEAR_FOREHEAD_MESSAGE
+    assert announced.count(voice_actions.CLEAR_FOREHEAD_MESSAGE) == 1
+    assert announced[-1].startswith("Your heart rate looks like about 72")
 
 
 def test_checkup_reports_range_and_scan_failure_is_spoken_safely(tmp_path):
@@ -237,6 +262,21 @@ def test_rppg_scanner_parses_script_json(tmp_path, python_instead_of_uv):
     scanner = voice_actions.RppgScanner(script, uv_bin=python_instead_of_uv, duration_s=1)
 
     assert scanner.scan(threading.Event()) == {"bpm": 66.0, "confident": True}
+
+
+def test_rppg_scanner_forwards_forehead_guidance(tmp_path, python_instead_of_uv):
+    script = tmp_path / "robot_rppg.py"
+    script.write_text(
+        "import json\n"
+        "print(json.dumps({'guidance': 'clear-forehead'}))\n"
+        "print(json.dumps({'result': {'bpm': 66.0, 'confident': True}}))\n"
+    )
+    scanner = voice_actions.RppgScanner(script, uv_bin=python_instead_of_uv, duration_s=1)
+    guidance = []
+
+    scanner.scan(threading.Event(), on_guidance=guidance.append)
+
+    assert guidance == ["clear-forehead"]
 
 
 def test_reminder_fires_while_a_gesture_owns_the_action_lock(tmp_path):
@@ -397,6 +437,62 @@ def test_person_gesture_faces_person_then_runs(tmp_path):
     assert finder.purposes == ["gesture"]
     assert gestures.actions == ["handshake"]
     assert announced == ["Please come a little closer."]
+
+
+def test_person_gesture_still_runs_when_the_base_is_too_busy_to_turn(tmp_path):
+    for result in (
+        {"found": False, "refused": True, "reason": "another app is already driving the base"},
+        {"found": False, "error": True, "reason": "Writer for drive.ctrl already exists"},
+    ):
+        gestures = FakeGestureController()
+        gestures.start = lambda action, gestures=gestures: (
+            gestures.actions.append(action), True, "ok")[1:]
+        announced = []
+        controller = voice_actions.VoiceActionController(
+            gestures, tmp_path, person_finder=FakeFinder(result)
+        )
+        controller.bind(FakeSpeaker(), SimpleNamespace(), FakeLeds(), announce=announced.append)
+
+        assert controller.start("fist bump")[0] is True
+        wait_for_controller(controller)
+
+        assert gestures.actions == ["fist bump"]
+        assert announced == []
+
+
+def test_fist_bump_gets_a_body_turn_only_when_the_base_was_free_to_face_the_person(tmp_path):
+    class TurningFinder(FakeFinder):
+        def __init__(self, result):
+            super().__init__(result)
+            self.turned = []
+
+        def turn(self, delta_deg, cancel):
+            self.turned.append(delta_deg)
+            return {"ok": True}
+
+    found = {"found": True, "centered": True, "distance": "ok", "turned_deg": 0}
+    for result, may_turn in ((found, True), ({**found, "centered": False}, False)):
+        offered = []
+        gestures = FakeGestureController()
+
+        def start(action, turn_body=None, gestures=gestures, offered=offered):
+            offered.append(turn_body)
+            gestures.actions.append(action)
+            return True, "ok"
+
+        gestures.start = start
+        finder = TurningFinder(result)
+        controller = voice_actions.VoiceActionController(gestures, tmp_path, person_finder=finder)
+        controller.bind(FakeSpeaker(), SimpleNamespace(), FakeLeds(), announce=lambda _: None)
+
+        assert controller.start("fist bump")[0] is True
+        wait_for_controller(controller)
+
+        assert gestures.actions == ["fist bump"]
+        assert (offered[0] is not None) is may_turn
+        if may_turn:
+            assert offered[0](12.0) is True
+            assert finder.turned == [12.0]
 
 
 def test_non_person_gestures_do_not_search(tmp_path):
@@ -651,7 +747,7 @@ def test_follow_me_is_refused_when_the_runner_is_not_installed(tmp_path):
 
 FAKE_RUNNER = '''
 import json, sys
-assert sys.argv[1:] == ["--v-max", "0.3", "--ignore-writer", "person_tracker.py", "--no-led", "--relock", "--no-odom-check", "--human-gate"], sys.argv
+assert sys.argv[1:] == ["--v-max", "0.3", "--relock", "--no-odom-check", "--human-gate", "--ignore-writer", "person_tracker.py", "--no-led"], sys.argv
 print("[follow] state FOLLOWING", flush=True)
 print("FOLLOW_STATUS {}", flush=True)
 beats = 0
@@ -678,3 +774,138 @@ def test_follow_runner_heartbeats_then_asks_the_process_to_stop(tmp_path, monkey
     assert states == ["FOLLOWING"]
     assert last.startswith("stopped after ")
     assert int(last.split()[2]) >= 3
+
+
+class FakeGroundRunner:
+    installed = True
+
+    def __init__(self, lines):
+        self.lines = lines
+        self.runs = 0
+
+    def check_on_person(self, cancel, on_state=None):
+        self.runs += 1
+        return list(self.lines)
+
+
+def ground_controller(tmp_path, runner, announced):
+    controller = voice_actions.VoiceActionController(
+        FakeGestureController(), tmp_path, follow_runner=runner
+    )
+    controller.bind(FakeSpeaker(), SimpleNamespace(), FakeLeds(), announce=announced.append)
+    return controller
+
+
+def test_ground_check_announces_itself_then_speaks_the_runners_line_on_arrival(tmp_path):
+    announced = []
+    runner = FakeGroundRunner(["state APPROACHING", "say are you okay", "ground approach complete"])
+    controller = ground_controller(tmp_path, runner, announced)
+
+    assert controller.start("check-on-person")[0] is True
+    wait_for_controller(controller)
+
+    assert announced == [voice_actions.GROUND_START_MESSAGE, "are you okay"]
+    assert not controller._operation_lock.locked()
+
+
+def test_ground_check_says_why_it_could_not_move(tmp_path):
+    announced = []
+    runner = FakeGroundRunner(["refusing to start: drive.ctrl already has a writer"])
+    controller = ground_controller(tmp_path, runner, announced)
+
+    controller.start("check-on-person")
+    wait_for_controller(controller)
+
+    assert announced[-1] == "I can't come over right now: drive.ctrl already has a writer."
+
+
+def test_ground_check_needs_the_speaker_and_an_installed_runner(tmp_path):
+    controller = voice_actions.VoiceActionController(
+        FakeGestureController(), tmp_path, follow_runner=FakeGroundRunner([])
+    )
+    assert controller.start("check-on-person")[0] is False
+    assert not controller._operation_lock.locked()
+
+
+GROUND_FAKE_RUNNER = '''
+import sys
+assert sys.argv[1:] == ["--ground-approach", "--no-speech", "--v-max", "0.05", "--ignore-writer", "person_tracker.py", "--no-led"], sys.argv
+print("[follow] say hello there", flush=True)
+print("[follow] ground approach complete", flush=True)
+'''
+
+
+def test_follow_runner_ground_mode_creeps_and_leaves_speech_to_the_assistant(tmp_path):
+    script = tmp_path / "robot_follow.py"
+    script.write_text(GROUND_FAKE_RUNNER)
+    runner = voice_actions.FollowRunner(script, python_bin=sys.executable)
+
+    lines = runner.check_on_person(threading.Event())
+
+    assert lines == ["say hello there", "ground approach complete"]
+
+
+class FakeStarter:
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = 0
+        self.listening = threading.Event()
+
+    def start(self, action):
+        assert action == "check-on-person"
+        self.calls += 1
+        return self.results.pop(0), ""
+
+
+def write_alert(path, status, published_at, alerts=1):
+    path.write_text(json.dumps({
+        "status": status, "published_at": published_at,
+        "alerts": [{"track_id": i} for i in range(alerts)],
+    }))
+
+
+def test_ground_watcher_starts_once_per_alert_episode(tmp_path):
+    path = tmp_path / "alert.json"
+    clock = [100.0]
+    starter = FakeStarter([False, True, True])
+    watcher = voice_actions.GroundAlertWatcher(
+        starter, path, rearm_clear_s=10.0, clock=lambda: clock[0], wall=lambda: 500.0
+    )
+
+    assert watcher.poll() is False                      # no file yet
+    write_alert(path, "alert", 499.8)
+    assert watcher.poll() is False                      # assistant busy: stays pending
+    assert watcher.poll() is True
+    assert watcher.poll() is False                      # same episode, still lying there
+    assert starter.calls == 2
+
+    write_alert(path, "clear", 499.9)
+    watcher.poll()
+    clock[0] += 5.0
+    write_alert(path, "alert", 499.9)
+    assert watcher.poll() is False                      # cleared for too short a time
+    write_alert(path, "clear", 499.9)
+    watcher.poll()
+    clock[0] += 10.0
+    watcher.poll()
+    write_alert(path, "alert", 499.9)
+    assert watcher.poll() is True
+
+
+def test_ground_watcher_ignores_stale_ambiguous_and_mid_conversation_alerts(tmp_path):
+    path = tmp_path / "alert.json"
+    starter = FakeStarter([True])
+    watcher = voice_actions.GroundAlertWatcher(starter, path, wall=lambda: 500.0)
+
+    write_alert(path, "alert", 490.0)                   # vision app stopped publishing
+    assert watcher.poll() is False
+    write_alert(path, "alert", 499.9, alerts=2)         # two people down
+    assert watcher.poll() is False
+    path.write_text("{not json")
+    assert watcher.poll() is False
+    write_alert(path, "alert", 499.9)
+    starter.listening.set()                             # recording a wake-word turn
+    assert watcher.poll() is False
+    assert starter.calls == 0
+    starter.listening.clear()
+    assert watcher.poll() is True

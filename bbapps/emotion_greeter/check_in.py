@@ -52,13 +52,37 @@ OPENING_LINES = (
 OPENING_LINE = OPENING_LINES[0]
 FALLBACK_REPLY = "I'm sorry you're feeling down. I'm right here if you want to talk."
 NO_ANSWER_REPLY = "That's okay. I'm here whenever you want to talk."
+DISMISSED_REPLY = "Okay. I'm here if you need me."
+# The check-in has no wake word, so without a way out the person is held in it
+# for every remaining turn: "stop" reaches only the voice assistant, which
+# answers "No voice action is running" while Baymax keeps asking follow-ups.
+_DISMISSAL = re.compile(
+    r"^(?:no |okay |ok |please |baymax )*"
+    r"(?:stop(?: it| talking| that)?|be quiet|quiet|shut up|go away|"
+    r"leave me alone|never ?mind|that s all|that is all|"
+    r"i m (?:fine|okay|ok|good|all right|alright)|"
+    r"i am (?:fine|okay|ok|good|all right|alright)|"
+    r"no thanks|no thank you|bye|goodbye)"
+    r"(?: please| now| baymax| thanks| thank you)*$"
+)
+# Said mid check-in, the wake phrase means the person is talking to the voice
+# assistant, which hears it too. Answering as well makes two replies to one
+# sentence, and the check-in can only pretend to do the gesture they asked for.
+_WAKE_PHRASE = re.compile(r"\b(?:hey|hi|hay|okay|ok) bracket ?bot\b")
+LAST_TURN_NOTE = (
+    "\n\n(This is your last reply in this conversation, and nobody will hear "
+    "an answer to it: close warmly and do not ask a question.)"
+)
 CHECK_IN_SYSTEM_PROMPT = (
     "You are Baymax, a gentle, caring home robot. Your camera noticed that "
     "the person in front of you looked sad, so you opened with a short "
     f"question like \"{OPENING_LINE}\" Reply to what they say in one or two "
     "short, warm, natural sentences, because your words are spoken aloud and "
     "a long answer feels slow. Lead with the reply itself: no preamble, no "
-    "restating what they told you, no stage directions. Listen and validate "
+    "restating what they told you, no stage directions. You cannot move in "
+    "this conversation, so never act out or describe a hug or any other "
+    "gesture; if they ask for one, tell them to say \"Hey BracketBot, do a "
+    "hug.\" Listen and validate "
     "their feelings, and when it fits ask one gentle follow-up question. Do "
     "not diagnose, lecture, or claim to know how they feel; the camera cue "
     "can be wrong, so if they say they are fine, accept it kindly. If they "
@@ -89,6 +113,19 @@ def speech_segments(text: str, min_chars: int = 24) -> list[str]:
         else:
             segments.append(part)
     return segments or [text.strip()]
+
+
+def _normalized(text: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", text.lower()).split())
+
+
+def is_dismissal(text: str) -> bool:
+    """True when the whole answer asks Baymax to stop, not "I can't stop crying"."""
+    return bool(_DISMISSAL.match(_normalized(text)))
+
+
+def addresses_assistant(text: str) -> bool:
+    return bool(_WAKE_PHRASE.search(_normalized(text)))
 
 
 def load_env(path: Path) -> None:
@@ -125,6 +162,7 @@ class SadCheckIn:
         trailing_silence: float = 0.7,
         max_utterance: float = 12.0,
         speaker_drain: float = 0.4,
+        dismiss_snooze: float = 300.0,
         openings: Sequence[str] = OPENING_LINES,
         show_led: Callable[[str | None], None] = lambda status: None,
         log: Callable[[str], None] = lambda line: print(line, flush=True),
@@ -144,6 +182,10 @@ class SadCheckIn:
         self.trailing_silence = trailing_silence
         self.max_utterance = max_utterance
         self.speaker_drain = speaker_drain
+        self.dismiss_snooze = dismiss_snooze
+        # No new check-in starts before this; set when the person sends Baymax
+        # away so the same resting face does not reopen the conversation.
+        self.quiet_until = 0.0
         self.openings = tuple(openings) or (OPENING_LINE,)
         self.show_led = show_led
         self.log = log
@@ -330,6 +372,19 @@ class SadCheckIn:
                     self.log("[check-in] No answer; ending conversation")
                     return
                 self.log(f"[check-in] Heard: {answer}")
+                if addresses_assistant(answer):
+                    self.quiet_until = time.monotonic() + self.dismiss_snooze
+                    self.log("[check-in] Wake phrase heard; leaving it to the assistant")
+                    return
+                if is_dismissal(answer):
+                    self.quiet_until = time.monotonic() + self.dismiss_snooze
+                    self.speak(DISMISSED_REPLY)
+                    self.log("[check-in] Dismissed; ending conversation")
+                    return
+                if turn == self.max_turns - 1:
+                    # A closing question would go unheard, which invites an
+                    # answer nobody is listening for.
+                    answer += LAST_TURN_NOTE
                 try:
                     reply = llm.complete(answer).text
                 except Exception as exc:
@@ -345,7 +400,7 @@ class SadCheckIn:
             self.lock.release()
 
     def start_async(self) -> bool:
-        if self.busy:
+        if self.busy or time.monotonic() < self.quiet_until:
             return False
         threading.Thread(target=self.converse, name="sad-check-in", daemon=True).start()
         return True
@@ -394,6 +449,8 @@ def build_check_in(args, Config, Reader, Type, Writer) -> SadCheckIn:
 
 __all__ = [
     "CHECK_IN_SYSTEM_PROMPT",
+    "DISMISSED_REPLY",
+    "LAST_TURN_NOTE",
     "LocalVoiceError",
     "OPENING_LINE",
     "OPENING_LINES",

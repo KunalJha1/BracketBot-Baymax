@@ -184,7 +184,7 @@ def _cleanup_arm_shm():
 
 def _prepare_movement(name):
     """Read fresh safety inputs before opening any arm control writer."""
-    return prepare_recorded_movement(_saved_movements[name])
+    return prepare_recorded_movement(_saved_movements[name], name)
 
 
 def _play_movement_plan(name, plan):

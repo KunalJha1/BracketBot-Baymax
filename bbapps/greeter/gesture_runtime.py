@@ -14,6 +14,14 @@ import numpy as np
 from bbos import Config, Reader, Type, Writer
 
 try:
+    from .fist_target import (
+        body_turn_deg,
+        examine_offered_fist,
+        recorded_apex,
+        retarget_trajectory,
+        stable_fist,
+        without_target,
+    )
     from .gesture_safety import (
         active_sides,
         depth_clearance,
@@ -25,6 +33,14 @@ try:
         trajectory_arrays,
     )
 except ImportError:
+    from fist_target import (
+        body_turn_deg,
+        examine_offered_fist,
+        recorded_apex,
+        retarget_trajectory,
+        stable_fist,
+        without_target,
+    )
     from gesture_safety import (
         active_sides,
         depth_clearance,
@@ -63,8 +79,109 @@ def fresh(reader, timeout=2.0):
     return reader.data
 
 
-def prepare_recorded_movement(frames):
-    """Read all safety evidence before opening an arm control writer."""
+_SWEEP_CACHE: dict = {}
+
+# Gestures whose recording is bent toward the person's hand, and the arm that
+# does the reaching. How long to wait for that hand to be held out and still.
+AIMED_GESTURES = {"fist bump": "right"}
+FIST_WAIT_SECONDS = 2.5
+# The fist has already been seen once; this is only to find it again after the
+# base has turned.
+FIST_RELOOK_SECONDS = 2.0
+# Lift travel an aimed gesture may use, in motor turns. The right lift runs from
+# -1.0 (bottom) to 0.0 (top, where the arm homes); stay off both ends.
+AIMED_LIFT_RANGE = {"right": (-0.97, -0.03)}
+
+
+def _read_points(depth):
+    depth_data = fresh(depth)
+    count = int(depth_data["num_points"])
+    return np.asarray(depth_data["points"][:count], dtype=np.float32).copy()
+
+
+def locate_offered_fist(depth, points, wait_seconds=FIST_WAIT_SECONDS):
+    """Wait briefly for a fist that two consecutive depth frames agree on.
+
+    Returns ``(fist, points)`` with the cloud the fist was last seen in, so the
+    clearance check judges the same scene the arm is aimed into.
+    """
+    deadline = time.monotonic() + wait_seconds
+    previous, reason = examine_offered_fist(points)
+    while time.monotonic() < deadline:
+        try:
+            points = _read_points(depth)
+        except RuntimeError:
+            reason = "depth stopped updating"
+            break
+        seen, reason = examine_offered_fist(points)
+        fist = stable_fist(previous, seen)
+        if fist is not None:
+            return fist, points
+        if seen is not None:
+            reason += ", still moving" if previous is not None else ", waiting for a second look"
+        previous = seen
+    print(f"[arm] no steady fist: {reason}", flush=True)
+    return None, points
+
+
+def _arm_kinematics(side):
+    config = Config(f"arm_{side}")
+    config.ik.init()
+
+    def hand_position(motor):
+        joints = config.q2urdf(np.asarray(motor, dtype=np.float64).copy())[:7]
+        return np.asarray(config.ik.fk(list(joints))[0], dtype=np.float64)
+
+    return config, hand_position
+
+
+def turn_toward_fist(plan, side, fist, depth, points, turn_body):
+    """Turn the base part of the way toward ``fist``, then find the fist again.
+
+    Returns ``(fist, points)`` as seen after the turn. A refused or tiny turn
+    leaves both unchanged; a fist lost during the turn comes back as None.
+    """
+    _, hand_position = _arm_kinematics(side)
+    index, recorded = recorded_apex(hand_position, plan.poses[side])
+    turn = body_turn_deg(fist, recorded[index])
+    if turn == 0.0:
+        return fist, points
+    print(
+        f"[arm] turning {turn:+.0f} deg toward fist {np.round(fist, 3).tolist()}", flush=True
+    )
+    if not turn_body(turn):
+        print("[arm] body turn refused; the arm takes the whole correction", flush=True)
+        return fist, points
+    return locate_offered_fist(depth, _read_points(depth), FIST_RELOOK_SECONDS)
+
+
+def aim_plan(plan, side, fist, name=None):
+    """Bend one arm of a preflighted plan toward ``fist``; None keeps the recording."""
+    config, hand_position = _arm_kinematics(side)
+    try:
+        aimed = retarget_trajectory(
+            hand_position, plan.times, plan.poses[side], fist, config.q2urdf,
+            AIMED_LIFT_RANGE.get(side), playback_speed(name),
+        )
+    except RuntimeError as exc:
+        print(f"[arm] fist at {np.round(fist, 3).tolist()} not aimed at: {exc}", flush=True)
+        return None
+    print(
+        f"[arm] aiming at fist {np.round(fist, 3).tolist()}: hand peaks at "
+        f"{np.round(aimed.apex, 3).tolist()}, lift {aimed.lift_turns:+.2f} turns "
+        f"({aimed.lift_metres:+.3f} m), arm moved {np.round(aimed.offset, 3).tolist()} m, "
+        f"largest joint change {aimed.max_joint_delta_turns:.3f} turns",
+        flush=True,
+    )
+    return replace(plan, poses={**plan.poses, side: aimed.trajectory})
+
+
+def prepare_recorded_movement(frames, name=None, turn_body=None):
+    """Read all safety evidence before opening an arm control writer.
+
+    ``turn_body(degrees)`` turns the base in place (positive left) and says
+    whether it did; without it an aimed gesture is aimed with the arm alone.
+    """
     _, raw_poses = trajectory_arrays(frames)
     sides = active_sides(raw_poses)
     with ExitStack() as stack:
@@ -79,12 +196,38 @@ def prepare_recorded_movement(frames):
             side: np.asarray(fresh(reader)["pos"], dtype=np.float32).copy()
             for side, reader in arm_readers.items()
         }
-        depth_data = fresh(depth)
-        count = int(depth_data["num_points"])
-        points = np.asarray(depth_data["points"][:count], dtype=np.float32).copy()
-    plan = plan_recorded_gesture(frames, starts, rpy, None)
+        points = _read_points(depth)
+        plan = plan_recorded_gesture(frames, starts, rpy, None)
+        aimed_side = AIMED_GESTURES.get(name)
+        aimed = None
+        if aimed_side in plan.sides:
+            fist, points = locate_offered_fist(depth, points)
+            if fist is not None and turn_body is not None:
+                fist, points = turn_toward_fist(
+                    plan, aimed_side, fist, depth, points, turn_body
+                )
+                # The turn took a few seconds on a balancing base: judge
+                # uprightness again before any arm moves.
+                rpy = np.asarray(fresh(imu)["rpy"], dtype=np.float64).copy()
+                plan = plan_recorded_gesture(frames, starts, rpy, None)
+            if fist is None:
+                print(f"[arm] no fist held out; playing the recorded {name}", flush=True)
+            else:
+                aimed = aim_plan(plan, aimed_side, fist, name)
+        if aimed is not None:
+            plan = aimed
+            # The hand is meant to meet the fist, so the fist alone is not an
+            # obstacle. The forearm and body behind it still are.
+            points = without_target(points, fist)
     sweep_paths = {}
     for side in plan.sides:
+        # The swept path depends only on the recorded poses, so it is worked
+        # out once per recording. Every live input (tilt, arm start, and the
+        # depth cloud it is compared against) is still read fresh each time.
+        key = (side, plan.poses[side].shape, hash(plan.poses[side].tobytes()))
+        if key in _SWEEP_CACHE and aimed is None:
+            sweep_paths[side] = _SWEEP_CACHE[key]
+            continue
         config = Config(f"arm_{side}")
         config.ik.init()
         waypoints = []
@@ -100,6 +243,9 @@ def prepare_recorded_movement(frames):
             position, _ = config.ik.fk(list(joints))
             waypoints.append(np.asarray(position, dtype=np.float64))
         sweep_paths[side] = np.stack(waypoints)
+        if aimed is None:
+            # An aimed path is different every time; caching it would only grow.
+            _SWEEP_CACHE[key] = sweep_paths[side]
     clearance = depth_clearance(points, plan.sides, sweep_paths)
     return replace(plan, clearance_points=clearance)
 
@@ -241,14 +387,14 @@ class RecordedGestureController:
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"could not load gesture '{name}': {exc}") from exc
 
-    def start(self, name):
+    def start(self, name, turn_body=None):
         if arm_motion_reserved():
             return False, "My arms are busy packing, but I can still answer questions."
         if not self._lock.acquire(blocking=False):
             return False, "Another movement is already running"
         try:
             frames = self._load(name)
-            plan = prepare_recorded_movement(frames)
+            plan = prepare_recorded_movement(frames, name, turn_body)
         except Exception as exc:
             print(f"[arm] {name} preflight rejected: {exc}", flush=True)
             self._lock.release()

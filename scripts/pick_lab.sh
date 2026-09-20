@@ -2,9 +2,11 @@
 # One command for the whole pick loop: sync, look, plan, pick, recover.
 #
 #   scripts/pick_lab.sh status            # what the robot sees now (no motion)
+#   scripts/pick_lab.sh preview [--watch] # camera image with the can + box drawn on it
 #   scripts/pick_lab.sh plan  [args]      # full validated plan, no motion
 #   scripts/pick_lab.sh pick  [args]      # real pick with auto-retry, put back
 #   scripts/pick_lab.sh place [args]      # pick and drop into the box beside it
+#   scripts/pick_lab.sh clear [args]      # every can beside the box goes into it, one by one
 #   scripts/pick_lab.sh warm | cold       # start / retire the warm server (auto-started)
 #   scripts/pick_lab.sh hover [args]      # go to the hover pose and come back
 #   scripts/pick_lab.sh rest              # lower both arms to their rest pose
@@ -31,7 +33,7 @@ SSH_OPTS=(-o ControlMaster=auto -o ControlPath=/tmp/pick-lab-%C -o ControlPersis
           -o ServerAliveInterval=5 -o ServerAliveCountMax=2)
 HOST_CACHE=/tmp/pick-lab-host
 SSH() { ssh "${SSH_OPTS[@]}" "$@"; }
-FILTER='timing\]|median|lean\]|reach\]|state\] side|startup|accepted pitch|retry\]|place\]|space\]|grip\]|evidence|torque\]|cleanup|fatal|staged|rest\]|gripper\]|motion\] stage|complete\]'
+FILTER='timing\]|complete\]|median|lean\]|reach\]|state\] side|startup|accepted pitch|retry\]|place\]|space\]|grip\]|evidence|torque\]|cleanup|fatal|staged|rest\]|gripper\]|motion\] stage|complete\]'
 
 host() {
   if [ -s "$HOST_CACHE" ]; then
@@ -172,10 +174,26 @@ print('box   :', 'none' if box is None else '%.3f, %.3f  rim %.3f  %.2fx%.2f m' 
          run_detached "$H" --record $REMOTE/frames "$@" ;;
   place) SSH "$H" "rm -rf $REMOTE/frames"
          run_detached "$H" --execute --adjust --auto-space --place --record $REMOTE/frames "$@" ;;
+  clear) SSH "$H" "rm -rf $REMOTE/frames"
+         run_detached "$H" --execute --adjust --auto-space --place --all --record $REMOTE/frames "$@" ;;
   warm)  SSH "$H" "$ENSURE_SERVER; echo \"warm server pid \$(cat server.pid)\"; tail -1 server.log" ;;
   cold)  SSH "$H" "cd $REMOTE; [ -f server.pid ] && kill -TERM \$(cat server.pid) && echo 'server retiring' || echo 'no server'" ;;
   pick)  SSH "$H" "rm -rf $REMOTE/frames"
          run_detached "$H" --execute --adjust --auto-space --record $REMOTE/frames "$@" ;;
+  preview)
+    # What the pick sees, drawn on the head camera: can, box, table edge.
+    # Read-only on the robot. 'preview --watch' keeps refreshing.
+    mkdir -p "$ROOT/artifacts/pick"
+    watch=0; [ "${1:-}" = "--watch" ] && { watch=1; shift; }
+    scp -q "${SSH_OPTS[@]}" "$ROOT/scripts/pick_preview.py" "$H:$REMOTE/" || exit 1
+    while :; do
+      SSH "$H" "cd $REMOTE && $PY pick_preview.py --capture $REMOTE/preview.npz" | grep -v '^\[preview\] saved' 
+      scp -q "${SSH_OPTS[@]}" "$H:$REMOTE/preview.npz" "$ROOT/artifacts/pick/preview.npz" || exit 1
+      python3 "$ROOT/scripts/pick_preview.py" "$ROOT/artifacts/pick/preview.npz" \
+        --out "$ROOT/artifacts/pick/preview.jpg" "$@" || exit 1
+      [ "${opened:-0}" = 1 ] || { open "$ROOT/artifacts/pick/preview.jpg" 2>/dev/null; opened=1; }
+      [ "$watch" = 1 ] || break
+    done ;;
   pull)
     # Bring the last run's depth frames home for 'replay'.
     rm -rf "$FRAMES"; mkdir -p "$FRAMES"

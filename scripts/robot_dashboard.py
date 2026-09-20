@@ -1634,7 +1634,7 @@ class RobotController:
             return False, f"gap must be between {FOLLOW_GAP_MIN} and {FOLLOW_GAP_MAX} m"
         with self.state.lock:
             if self.state.follow_active() and self.state.follow_mode == "ground":
-                return False, "Ground check-in uses a fixed 1.0 m body standoff"
+                return False, "Ground check-in uses a fixed body standoff"
             self.state.follow_gap = round(float(gap), 2)
             gap = self.state.follow_gap
         self._send_follow({"type": "gap", "m": gap})

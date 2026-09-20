@@ -96,6 +96,28 @@ class FakeRobot:
         self.heading = pt.wrap_deg(self.heading + delta)
 
 
+def test_turn_command_turns_by_the_requested_angle_and_releases_the_base():
+    robot = FakeRobot()
+
+    result = pt.Tracker(robot).turn(-14.0, threading.Event())
+
+    assert result == {"ok": True, "turned_deg": -14.0}
+    assert robot.turns == [-14.0]
+    assert all(writer.closed for writer in robot.writers)
+
+
+def test_turn_command_refuses_when_the_base_is_busy_or_the_angle_is_large():
+    busy = FakeRobot(refuse="the base is in lean or twist mode")
+    with pytest.raises(pt.Refused):
+        pt.Tracker(busy).turn(10.0, threading.Event())
+    assert busy.turns == [] and busy.writers == []
+
+    robot = FakeRobot()
+    with pytest.raises(pt.Refused):
+        pt.Tracker(robot).turn(pt.MAX_REQUESTED_TURN_DEG + 1, threading.Event())
+    assert robot.turns == []
+
+
 def test_acquire_does_not_move_when_person_is_already_centered():
     robot = FakeRobot(person_yaw=3.0)
 
@@ -161,3 +183,15 @@ def test_reads_the_raw_head_topic_the_camera_daemon_publishes():
     # The daemon publishes camera.head.rgb and camera.head.jpeg; a bare
     # "camera.head" reader never becomes ready, so every search finds nobody.
     assert pt.CAMERA_TOPIC == "camera.head.rgb"
+
+
+def test_a_base_held_by_an_idle_driver_is_a_refusal_not_a_crash():
+    class HeldRobot(FakeRobot):
+        def Writer(self, *args, **kwargs):  # noqa: N802
+            raise RuntimeError("Writer for drive.ctrl already exists (pid=1)")
+
+    with pytest.raises(pt.Refused, match="already driving"):
+        pt.Tracker(HeldRobot(person_yaw=None)).acquire("gesture", None, threading.Event())
+
+    result = pt.Tracker(HeldRobot(person_yaw=30.0)).acquire("gesture", None, threading.Event())
+    assert result["found"] and not result["centered"]

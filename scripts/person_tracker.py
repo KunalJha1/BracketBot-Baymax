@@ -16,13 +16,14 @@ JSON lines over stdin/stdout:
     {"id": 1, "cmd": "acquire", "purpose": "scan", "hint_deg": null}
     {"cmd": "cancel"}
     {"id": 2, "cmd": "status"}
+    {"id": 3, "cmd": "turn", "delta_deg": 12.0}
 
 While idle it looks for faces on the head camera about twice a second and
 remembers the heading of the last person it saw. That memory is the first
 place it turns when asked to find someone.
 
 Motion is deliberately narrow: it only turns in place (zero linear speed),
-slowly, and only while an ``acquire`` request is running. ``drive.ctrl`` is
+slowly, and only while an ``acquire`` or ``turn`` request is running. ``drive.ctrl`` is
 opened for that request alone, so nav and teleop keep the base otherwise. The
 drive daemon zeroes the base 0.1 s after the last command, so a crash or kill
 stops the turn. It refuses to move when the robot is not upright, is in lean
@@ -61,6 +62,7 @@ FACE_WIDTH_M = 0.16               # typical adult face width for a rough range
 IDLE_PERIOD_S = 0.5
 MEMORY_S = 120.0
 
+MAX_REQUESTED_TURN_DEG = 45.0     # "turn" lines a gesture up; it is not a way to spin
 MAX_TURN_RAD_S = 0.6              # drive limit is 1.0 rad/s; stay well under
 MIN_TURN_RAD_S = 0.2
 TURN_KP = 0.02                    # rad/s per degree of heading error
@@ -348,6 +350,14 @@ class Tracker:
             if face is None or abs(face["bearing_deg"]) > CENTER_TOLERANCE_DEG:
                 try:
                     self.robot.preflight()
+                    try:
+                        writer = self.robot.bbos.Writer(
+                            "drive.ctrl", self.robot.bbos.Type("drive_ctrl"), keeptime=False
+                        ).__enter__()
+                    except RuntimeError as exc:
+                        # An idle teleop or nav process holds the writer without
+                        # publishing, so preflight cannot see it. Same answer.
+                        raise Refused("another app is already driving the base") from exc
                 except Refused as exc:
                     if face is None:
                         raise
@@ -356,9 +366,6 @@ class Tracker:
                     self.remember(face)
                     return {"found": True, "centered": False, "turned_deg": 0,
                             "distance": distance_band(face["distance_m"], purpose), **face}
-                writer = self.robot.bbos.Writer(
-                    "drive.ctrl", self.robot.bbos.Type("drive_ctrl"), keeptime=False
-                ).__enter__()
             if face is None:
                 hint = hint_deg if hint_deg is not None else self.memory_hint()
                 source = "voice" if hint_deg is not None else ("memory" if hint is not None else "sweep")
@@ -389,6 +396,25 @@ class Tracker:
         finally:
             if writer is not None:
                 writer.__exit__(None, None, None)
+
+
+    def turn(self, delta_deg, cancel):
+        """Turn in place by a caller-chosen angle (positive left), with the usual refusals."""
+        delta = float(delta_deg)
+        if not math.isfinite(delta) or abs(delta) > MAX_REQUESTED_TURN_DEG:
+            raise Refused(f"a {delta:.0f} degree turn is more than a gesture may ask for")
+        self.robot.preflight()
+        try:
+            writer = self.robot.bbos.Writer(
+                "drive.ctrl", self.robot.bbos.Type("drive_ctrl"), keeptime=False
+            ).__enter__()
+        except RuntimeError as exc:
+            raise Refused("another app is already driving the base") from exc
+        try:
+            self.robot.turn_by(writer, delta, cancel)
+        finally:
+            writer.__exit__(None, None, None)
+        return {"ok": True, "turned_deg": round(delta, 1)}
 
 
 def _read_commands(commands: queue.Queue, cancel: threading.Event):
@@ -442,6 +468,19 @@ def main():
                 return
             if request.get("cmd") == "status":
                 reply(request, tracker.status())
+            elif request.get("cmd") == "turn":
+                cancel.clear()
+                try:
+                    result = tracker.turn(request.get("delta_deg", 0.0), cancel)
+                except Cancelled:
+                    result = {"ok": False, "reason": "cancelled"}
+                except Refused as exc:
+                    result = {"ok": False, "refused": True, "reason": str(exc)}
+                except Exception as exc:  # noqa: BLE001 - report, never crash the helper
+                    _log(f"turn failed: {type(exc).__name__}: {exc}")
+                    result = {"ok": False, "error": True, "reason": str(exc)}
+                _log(f"turn -> {result}")
+                reply(request, result)
             elif request.get("cmd") == "acquire":
                 cancel.clear()
                 try:

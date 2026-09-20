@@ -241,13 +241,8 @@ def find_objects(arm_points, plane: TablePlane) -> list[TableObject]:
     return objects
 
 
-def select_graspable(objects, near=None, max_width=0.10, max_reach=0.70,
-                     min_top=0.05, max_top=0.30):
-    """Pick one object a single gripper can plausibly take.
-
-    With ``near`` (arm-frame ``(x, y)``) the closest candidate to that hint
-    wins; otherwise the nearest candidate to the robot does.
-    """
+def graspable_candidates(objects, max_width=0.10, max_reach=0.70, min_top=0.05, max_top=0.30):
+    """Every object a single gripper can plausibly take, nearest the robot first."""
 
     candidates = [
         item for item in objects
@@ -257,12 +252,24 @@ def select_graspable(objects, near=None, max_width=0.10, max_reach=0.70,
         and 0.15 <= item.center[0] <= max_reach
         and abs(item.center[1]) <= 0.45
     ]
+    return sorted(candidates, key=lambda item: math.hypot(*item.center[:2]))
+
+
+def select_graspable(objects, near=None, max_width=0.10, max_reach=0.70,
+                     min_top=0.05, max_top=0.30):
+    """Pick one object a single gripper can plausibly take.
+
+    With ``near`` (arm-frame ``(x, y)``) the closest candidate to that hint
+    wins; otherwise the nearest candidate to the robot does.
+    """
+
+    candidates = graspable_candidates(objects, max_width, max_reach, min_top, max_top)
     if not candidates:
         return None
     if near is not None:
         return min(candidates, key=lambda item: math.hypot(
             item.center[0] - near[0], item.center[1] - near[1]))
-    return min(candidates, key=lambda item: math.hypot(*item.center[:2]))
+    return candidates[0]
 
 
 def object_near(arm_points, plane: TablePlane, xy, radius=0.06):

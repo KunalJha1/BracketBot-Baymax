@@ -111,6 +111,24 @@ def test_face_skin_mask_covers_three_skin_regions_without_background():
     assert mask[150, 150] == 0       # background
 
 
+def test_forehead_cover_check_compares_forehead_against_same_face_cheeks():
+    face = np.array(
+        [20, 10, 100, 120, 50, 50, 90, 50, 70, 70, 52, 100, 88, 100, 0.99],
+        dtype=np.float32,
+    )
+    clear = np.full((160, 160, 3), 140, np.uint8)
+    forehead, _left, _right = rppg.face_skin_region_masks(face, clear.shape)
+    covered = clear.copy()
+    covered[forehead > 0] = 15
+
+    assert rppg.forehead_looks_covered(clear, face) is False
+    assert rppg.forehead_looks_covered(covered, face) is True
+
+    too_dark = np.full_like(clear, 10)
+    too_dark[forehead > 0] = 0
+    assert rppg.forehead_looks_covered(too_dark, face) is False
+
+
 def test_yunet_face_roi_loads_real_shipped_model():
     roi = rppg.FaceROI()
     frame = np.zeros((240, 320, 3), np.uint8)
@@ -128,11 +146,13 @@ def test_yunet_detection_uses_bounded_preview_but_full_resolution_mask(monkeypat
         def __init__(self):
             self.input_size = None
             self.detected_shape = None
+            self.calls = 0
 
         def setInputSize(self, size):
             self.input_size = size
 
         def detect(self, frame):
+            self.calls += 1
             self.detected_shape = frame.shape
             return None, face
 
@@ -142,16 +162,21 @@ def test_yunet_detection_uses_bounded_preview_but_full_resolution_mask(monkeypat
     roi.cv2 = cv2
     roi.detector = detector
     roi.detector_size = None
+    roi.frame_index = 0
+    roi.cached_face = None
     frame = np.full((960, 1280, 3), 120, np.uint8)
 
     result = roi(frame, 0)
+    cached_result = roi(frame, 1)
 
-    assert detector.input_size == (560, 420)
-    assert detector.detected_shape == (420, 560, 3)
+    assert detector.input_size == (640, 480)
+    assert detector.detected_shape == (480, 640, 3)
+    assert detector.calls == 1
     assert result is not None
+    assert cached_result is not None
     _rgb, nose, face_width, mask = result
-    assert face_width == pytest.approx(100 * 1280 / 560)
-    assert nose.tolist() == pytest.approx([60 * 1280 / 560, 80 * 960 / 420])
+    assert face_width == pytest.approx(200)
+    assert nose.tolist() == pytest.approx([120, 160])
     assert mask.shape == (960, 1280)
 
 
@@ -168,6 +193,28 @@ def test_robot_cli_self_test_loads_model_without_camera():
     assert report["ok"] is True
     assert report["model"] == rppg.DEFAULT_MODEL.name
     assert report["model_bytes"] == rppg.DEFAULT_MODEL.stat().st_size
+
+
+def test_camera_gate_rejects_unstable_luminance_even_when_video_and_face_are_good():
+    failures = robot_rppg.camera_check_failures(
+        seen=80,
+        fps=20.0,
+        faces=80,
+        face_width=72.0,
+        lum_drift=33.0,
+    )
+
+    assert failures == ["skin luminance drift exceeds 3%"]
+
+
+def test_camera_gate_accepts_complete_stable_sample():
+    assert robot_rppg.camera_check_failures(
+        seen=80,
+        fps=20.0,
+        faces=75,
+        face_width=72.0,
+        lum_drift=1.5,
+    ) == []
 
 
 @pytest.mark.parametrize("bpm", [54, 68, 82])
@@ -371,6 +418,7 @@ class SyntheticFaceROI:
         self.bpm = bpm
         self.miss_every = miss_every
         self.calls = 0
+        self.forehead_covered = False
 
     def __call__(self, _frame, t_ms):
         self.calls += 1
@@ -418,3 +466,25 @@ def test_measurement_does_not_publish_rejected_peak(monkeypatch):
     assert result is None
     assert updates
     assert all(bpm is None for bpm, _snr, _progress in updates)
+
+
+def test_measurement_prompts_once_and_discards_covered_forehead_frames(monkeypatch):
+    class CoveredThenClearROI(SyntheticFaceROI):
+        def __call__(self, frame, t_ms):
+            result = super().__call__(frame, t_ms)
+            self.forehead_covered = self.calls <= 20
+            return result
+
+    roi = CoveredThenClearROI(miss_every=0)
+    monkeypatch.setattr(rppg, "FaceROI", lambda _model: roi)
+    monkeypatch.setattr(rppg.time, "monotonic", SteppingClock())
+    guidance = []
+
+    rppg.measure_heart_rate(
+        duration_s=8.0,
+        fs=30.0,
+        on_guidance=guidance.append,
+        grab=lambda: np.zeros((4, 4, 3), np.uint8),
+    )
+
+    assert guidance == ["clear-forehead"]

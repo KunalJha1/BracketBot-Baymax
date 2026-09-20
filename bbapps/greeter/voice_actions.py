@@ -103,13 +103,27 @@ FOLLOW_STATE_MESSAGES = {
     "LOST": "I lost you. Please stand in front of me.",
     "BLOCKED": "Something is in my way.",
 }
+# Creep up to a person the vision app has confirmed is lying on the ground, then
+# ask if they are okay. Started by GroundAlertWatcher, never by a spoken request.
+GROUND_ACTIONS = frozenset({"check-on-person"})
+GROUND_APPROACH_V_MAX = 0.05
+GROUND_START_MESSAGE = (
+    "I think someone is on the ground. I'm coming over to check on you. "
+    "Say hey BracketBot, stop, to cancel."
+)
+GROUND_ALERT_FILE = Path("/tmp/bracketbot_ground_alert.json")
+GROUND_ALERT_MAX_AGE_S = 1.0
+GROUND_REARM_CLEAR_S = 10.0
 # A short chirp while driving behind someone, so they can tell it is still there
 # without looking back. Silent while searching or lost: those states speak.
 FOLLOW_CHIRP_SOUND = "follow_chirp.wav"
 FOLLOW_CHIRP_STATES = frozenset({"FOLLOWING", "BLOCKED"})
-FOLLOW_CHIRP_PERIOD_S = 2.5
+FOLLOW_CHIRP_PERIOD_S = 7.5
 FOLLOW_CHIRP_VOLUME = 0.5
-SCAN_LED = ((72, 205, 220), "pulse")
+# A green pulse makes the capture state unmistakable for the person being
+# scanned, and stays distinct from the assistant's blue thinking light.
+SCAN_LED = ((70, 220, 120), "pulse")
+CLEAR_FOREHEAD_MESSAGE = "Please move any hair off your forehead, then hold still."
 REMINDER_LED = ((255, 185, 40), "blink", 8.0)
 # A reminder can land while the audience is watching the arms rather than
 # the lights. A short chime ahead of the spoken text makes the delivery
@@ -147,7 +161,7 @@ class RppgScanner:
     def installed(self) -> bool:
         return self.script.is_file()
 
-    def scan(self, cancel: threading.Event, on_tick=None) -> dict | None:
+    def scan(self, cancel: threading.Event, on_tick=None, on_guidance=None) -> dict | None:
         """Run the scan, optionally reporting per-second estimates as they arrive.
 
         ``on_tick(bpm, progress)`` is called for every intermediate estimate the
@@ -216,6 +230,9 @@ class RppgScanner:
             if "result" in message:
                 report = message
                 continue
+            if on_guidance is not None and message.get("guidance"):
+                on_guidance(str(message["guidance"]))
+                continue
             if on_tick is not None and "progress" in message:
                 bpm = message.get("bpm")
                 on_tick(
@@ -257,15 +274,36 @@ class FollowRunner:
 
     def follow(self, cancel: threading.Event, on_state=None) -> str:
         """Follow until cancelled or the runner exits; returns the runner's last log line."""
-        process = subprocess.Popen(
+        lines = self._run(
             [
-                self.python_bin, self.script.name, "--v-max", str(self.v_max),
-                # Ours, and idle: the action lock keeps it from turning while we drive.
-                "--ignore-writer", "person_tracker.py",
-                "--no-led",                # the assistant holds BBOS's only led.ctrl writer
+                "--v-max", str(self.v_max),
                 "--relock",                # keep following until told to stop
                 "--no-odom-check",         # false-alarms whenever this balancing base turns
                 "--human-gate",            # lock onto people the vision app's YOLO sees, not shapes
+            ],
+            cancel, on_state,
+        )
+        return lines[-1] if lines else ""
+
+    def check_on_person(self, cancel: threading.Event, on_state=None) -> list[str]:
+        """Approach the one confirmed ground pose; returns the runner's log lines.
+
+        The runner keeps every ground-approach limit (0.05 m/s, 1 m outside the
+        body envelope, fresh single target, 120 s). It prints the check-in line
+        instead of playing it, because this process owns the speaker.
+        """
+        return self._run(
+            ["--ground-approach", "--no-speech", "--v-max", str(GROUND_APPROACH_V_MAX)],
+            cancel, on_state,
+        )
+
+    def _run(self, mode_args: list[str], cancel: threading.Event, on_state=None) -> list[str]:
+        process = subprocess.Popen(
+            [
+                self.python_bin, self.script.name, *mode_args,
+                # Ours, and idle: the action lock keeps it from turning while we drive.
+                "--ignore-writer", "person_tracker.py",
+                "--no-led",                # the assistant holds BBOS's only led.ctrl writer
             ],
             cwd=self.script.parent,
             stdin=subprocess.PIPE,
@@ -275,7 +313,7 @@ class FollowRunner:
             bufsize=1,
             start_new_session=True,
         )
-        last = [""]
+        lines: list[str] = []
 
         def pump():
             for line in process.stdout:
@@ -283,9 +321,9 @@ class FollowRunner:
                 if not line.startswith("[follow] "):
                     continue  # FOLLOW_STATUS telemetry is for the dashboard
                 print(line, flush=True)
-                last[0] = line.removeprefix("[follow] ")
-                if on_state is not None and last[0].startswith("state "):
-                    on_state(last[0].removeprefix("state "))
+                lines.append(line.removeprefix("[follow] "))
+                if on_state is not None and lines[-1].startswith("state "):
+                    on_state(lines[-1].removeprefix("state "))
 
         reader = threading.Thread(target=pump, name="follow-stdout", daemon=True)
         reader.start()
@@ -320,7 +358,83 @@ class FollowRunner:
                     pass
                 process.wait()
             reader.join(timeout=1.0)
-        return last[0]
+        return lines
+
+
+class GroundAlertWatcher:
+    """Start one check-in when the vision app confirms a person lying on the ground.
+
+    One attempt per alert episode: after an attempt starts, whether it arrives,
+    is refused, or is cancelled with "stop", nothing restarts until the alert
+    has stayed clear for a while. A busy assistant keeps the attempt pending.
+    """
+
+    def __init__(
+        self,
+        controller,
+        path: Path = GROUND_ALERT_FILE,
+        *,
+        poll_s: float = 0.5,
+        rearm_clear_s: float = GROUND_REARM_CLEAR_S,
+        clock=time.monotonic,
+        wall=time.time,
+    ):
+        self.controller = controller
+        self.path = Path(path)
+        self.poll_s = poll_s
+        self.rearm_clear_s = rearm_clear_s
+        self.clock, self.wall = clock, wall
+        self.armed = True
+        self._clear_since: float | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _alerting(self) -> bool:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            age = self.wall() - float(payload["published_at"])
+            return (
+                payload["status"] == "alert"
+                and 0.0 <= age <= GROUND_ALERT_MAX_AGE_S
+                # Two people down is ambiguous; the runner would refuse to move.
+                and len(payload["alerts"]) == 1
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+
+    def poll(self) -> bool:
+        """One watch step; returns whether a check-in was started."""
+        if not self._alerting():
+            now = self.clock()
+            if self._clear_since is None:
+                self._clear_since = now
+            if now - self._clear_since >= self.rearm_clear_s:
+                self.armed = True
+            return False
+        self._clear_since = None
+        if not self.armed or self.controller.listening.is_set():
+            return False
+        started, message = self.controller.start("check-on-person")
+        if started:
+            self.armed = False
+            print("[ground-watch] confirmed alert: starting check-in", flush=True)
+        return started
+
+    def start(self) -> None:
+        def run():
+            while not self._stop.wait(self.poll_s):
+                try:
+                    self.poll()
+                except Exception as exc:
+                    print(f"[ground-watch] poll failed: {exc}", flush=True)
+
+        self._thread = threading.Thread(target=run, name="ground-alert-watch", daemon=True)
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
 
 
 def tick_message(bpm: float, index: int) -> str:
@@ -559,7 +673,7 @@ class VoiceActionController:
     def start(self, action: str):
         if action not in (
             GESTURES | LED_EFFECTS.keys() | SOUND_FILES.keys() | ROUTINES.keys() | HEALTH_ACTIONS
-            | LOOK_ACTIONS | FOLLOW_ACTIONS
+            | LOOK_ACTIONS | FOLLOW_ACTIONS | GROUND_ACTIONS
         ):
             return False, f"Voice action '{action}' is not installed."
         if not self._operation_lock.acquire(blocking=False):
@@ -574,6 +688,9 @@ class VoiceActionController:
 
         if action in FOLLOW_ACTIONS:
             return self._start_follow()
+
+        if action in GROUND_ACTIONS:
+            return self._start_ground_check()
 
         if action in PERSON_GESTURES and self.person_finder is not None:
             return self._start_person_gesture(action)
@@ -617,7 +734,12 @@ class VoiceActionController:
         return True, f"Started {action}"
 
     def _face_person(
-        self, purpose: str, *, check_distance: bool = True, require_tracker: bool = False
+        self,
+        purpose: str,
+        *,
+        check_distance: bool = True,
+        require_tracker: bool = False,
+        defer_close: bool = False,
     ) -> bool:
         """Turn in place to find and face the person. False means do not continue."""
         if self.person_finder is None:
@@ -635,6 +757,13 @@ class VoiceActionController:
                 return False
             return True               # behave as before the tracker existed
         if not result.get("found"):
+            if defer_close and (result.get("refused") or result.get("error")):
+                # The base is busy (teleop open, lean mode), so nobody could be
+                # looked for. A gesture does not need the turn: the arm's own
+                # depth check decides whether it is safe, and the fist bump
+                # aims at the fist it sees, so carry on facing forward.
+                print(f"[voice-action] not turning: {result.get('reason')}", flush=True)
+                return True
             if result.get("refused"):
                 self.announce(
                     f"I can't turn to look for you right now because {result.get('reason')}. "
@@ -644,6 +773,10 @@ class VoiceActionController:
                 self.announce(NOT_FOUND_MESSAGE)
             return False
         band = result.get("distance") if check_distance else None
+        if band == "close" and defer_close:
+            # The caller tries the move first and only asks for room if the
+            # surroundings check actually refuses it.
+            return True
         if band in ("far", "close"):
             self.announce(
                 "Please come a little closer."
@@ -741,11 +874,57 @@ class VoiceActionController:
         self._thread.start()
         return True, "Okay. Stand in front of me and I'll follow you."
 
+    def _start_ground_check(self):
+        runner = self.follow_runner
+        if runner is None or not getattr(runner, "installed", True) or self.speaker is None:
+            self._operation_lock.release()
+            return False, FOLLOW_MISSING_MESSAGE
+
+        def run():
+            try:
+                self.announce(GROUND_START_MESSAGE)
+                if self._cancel.is_set() or self._shutdown.is_set():
+                    return
+                lines = runner.check_on_person(self._cancel)
+                last = lines[-1] if lines else ""
+                print(f"[voice-action] ground check-in ended: {last}", flush=True)
+                if self._cancel.is_set() or self._shutdown.is_set():
+                    return
+                said = [line.removeprefix("say ") for line in lines if line.startswith("say ")]
+                if said:
+                    self.announce(said[-1])
+                elif last.startswith("refusing to start: "):
+                    reason = last.removeprefix("refusing to start: ")
+                    self.announce(f"I can't come over right now: {reason}.")
+                else:
+                    self.announce("I've stopped. I could not reach you safely.")
+            except Exception as exc:
+                print(f"[voice-action] ground check-in failed safely: {exc}", flush=True)
+            finally:
+                self._operation_lock.release()
+
+        self._thread = threading.Thread(target=run, name="voice-action-ground-check", daemon=True)
+        self._thread.start()
+        return True, GROUND_START_MESSAGE
+
     def _start_person_gesture(self, action: str):
         def run():
             try:
-                if self._face_person("gesture"):
-                    self._run_step(action)
+                if self._face_person("gesture", defer_close=True):
+                    try:
+                        self._run_step(action)
+                    except RuntimeError:
+                        # Standing close is normal for a hug or a handshake,
+                        # so asking everyone close to step back cost three
+                        # seconds before every one of them. The depth check is
+                        # what decides whether the arms have room: ask only
+                        # when it says no, then check again.
+                        if (self._last_find or {}).get("distance") != "close":
+                            raise
+                        self.announce("Could you step back a little?")
+                        if self._cancel.wait(3.0):
+                            return
+                        self._run_step(action)
             except Exception as exc:
                 print(f"[voice-action] {action} failed safely: {exc}", flush=True)
                 self.announce(str(exc))
@@ -771,7 +950,16 @@ class VoiceActionController:
                     rgb, pattern = SCAN_LED
                     leds.start_effect(rgb, pattern, 600.0)
                 spoken = []
+                guidance_spoken = set()
                 last_tick = [0.0]
+
+                def on_guidance(kind):
+                    if kind != "clear-forehead" or kind in guidance_spoken:
+                        return
+                    if self._cancel.is_set() or self._shutdown.is_set():
+                        return
+                    guidance_spoken.add(kind)
+                    self.announce(CLEAR_FOREHEAD_MESSAGE)
 
                 def on_tick(bpm, progress):
                     # Every estimate is logged; only a spaced few are spoken.
@@ -792,7 +980,9 @@ class VoiceActionController:
                     spoken.append(bpm)
 
                 try:
-                    result = scanner.scan(self._cancel, on_tick=on_tick)
+                    result = scanner.scan(
+                        self._cancel, on_tick=on_tick, on_guidance=on_guidance
+                    )
                     message = heart_rate_message(result, checkup=checkup)
                 except Exception as exc:
                     print(f"[voice-action] heart-rate scan failed safely: {exc}", flush=True)
@@ -808,9 +998,28 @@ class VoiceActionController:
         self._thread.start()
         return True, "Started heart-rate scan"
 
+    def _body_turner(self):
+        """Callable that turns the base for an aimed gesture, or None when it may not."""
+        turn = getattr(self.person_finder, "turn", None)
+        find = self._last_find or {}
+        # No turn when the tracker just said the base is not ours to move.
+        if turn is None or not find.get("found") or find.get("centered") is False:
+            return None
+
+        def turn_body(delta_deg):
+            result = turn(delta_deg, self._cancel)
+            print(f"[voice-action] body turn {delta_deg:+.0f} deg: {result}", flush=True)
+            return bool(result.get("ok"))
+
+        return turn_body
+
     def _run_step(self, action: str) -> None:
         if action in GESTURES:
-            started, message = self.gesture_controller.start(action)
+            turn_body = self._body_turner() if action in PERSON_GESTURES else None
+            if turn_body is None:
+                started, message = self.gesture_controller.start(action)
+            else:
+                started, message = self.gesture_controller.start(action, turn_body=turn_body)
             if not started:
                 raise RuntimeError(message)
             self._start_gesture_sound(action)

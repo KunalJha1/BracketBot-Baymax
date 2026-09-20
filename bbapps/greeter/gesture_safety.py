@@ -253,12 +253,21 @@ def depth_clearance(
                 raise RuntimeError(f"{side} arm sweep path is unavailable")
             # Follow the actual recorded hand path so a table elsewhere in the
             # arm's large theoretical workspace does not cause a false block.
-            minimum_distance_squared = np.full(len(base), np.inf)
             radius_squared = profile.hand_path_clearance_m**2
+            # Only points inside the path's bounding box, grown by the largest
+            # radius tested below, can be within any of those radii. Dropping
+            # the rest first leaves every count unchanged and takes the whole
+            # cloud out of the per-waypoint loop, which was most of the delay
+            # between a spoken gesture request and the arm starting to move.
+            reach = max(profile.hand_path_clearance_m, HARD_COLLISION_RADIUS_METRES, 0.12)
+            nearby = base[
+                ((base >= path.min(axis=0) - reach) & (base <= path.max(axis=0) + reach)).all(axis=1)
+            ]
+            minimum_distance_squared = np.full(len(nearby), np.inf)
             for waypoint in path:
                 minimum_distance_squared = np.minimum(
                     minimum_distance_squared,
-                    np.sum((base - waypoint) ** 2, axis=1),
+                    np.sum((nearby - waypoint) ** 2, axis=1),
                 )
             near_path = minimum_distance_squared <= radius_squared
             count = int(np.count_nonzero(near_path))

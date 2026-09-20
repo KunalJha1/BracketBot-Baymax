@@ -31,11 +31,13 @@ from typing import Any
 import cv2
 import numpy as np
 
+from floor_roi import crop_pixels_to_rect, floor_crop, left_eye
 from ground_safety import (
     GroundAlertTracker,
     GroundAssessment,
     Keypoint,
     assess_ground_pose,
+    assess_ground_pose_monocular,
     box_position_in_base_frame,
     keypoints_in_base_frame,
 )
@@ -108,6 +110,97 @@ def intersection_over_union(left: Detection, right: Detection) -> float:
     return intersection / union if union else 0.0
 
 
+def detections_from_floor_crop(
+    detections: list[Detection], frame_width: int, frame_height: int
+) -> list[Detection]:
+    """Move detections made on ``floor_roi.floor_crop`` into camera.rect pixels."""
+
+    moved = []
+    for detection in detections:
+        corners = crop_pixels_to_rect(
+            [
+                (detection.x1, detection.y1), (detection.x2, detection.y1),
+                (detection.x1, detection.y2), (detection.x2, detection.y2),
+            ]
+        )
+        points = crop_pixels_to_rect([(kp.x, kp.y) for kp in detection.keypoints])
+        if not np.isfinite(corners).all():
+            continue
+        x1 = int(max(0, min(frame_width, round(corners[:, 0].min()))))
+        x2 = int(max(0, min(frame_width, round(corners[:, 0].max()))))
+        y1 = int(max(0, min(frame_height, round(corners[:, 1].min()))))
+        y2 = int(max(0, min(frame_height, round(corners[:, 1].max()))))
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            continue
+        keypoints = tuple(
+            Keypoint(kp.index, float(point[0]), float(point[1]), kp.confidence)
+            for kp, point in zip(detection.keypoints, points)
+            if np.isfinite(point).all()
+        )
+        moved.append(Detection(x1, y1, x2, y2, detection.confidence, keypoints))
+    return moved
+
+
+def confident_body_joints(detection: Detection, confidence: float = 0.35) -> int:
+    return sum(
+        1 for kp in detection.keypoints if 5 <= kp.index <= 16 and kp.confidence >= confidence
+    )
+
+
+def merge_detections(
+    primary: list[Detection], extra: list[Detection], overlap: float = 0.3
+) -> list[Detection]:
+    """Add people only the floor crop saw; for people both saw, keep the better pose."""
+
+    merged = list(primary)
+    for candidate in extra:
+        matches = [
+            index for index, existing in enumerate(merged)
+            if intersection_over_union(existing, candidate) >= overlap
+        ]
+        if not matches:
+            merged.append(candidate)
+            continue
+        best = max(matches, key=lambda index: intersection_over_union(merged[index], candidate))
+        if confident_body_joints(candidate) > confident_body_joints(merged[best]):
+            merged[best] = candidate
+    return merged
+
+
+# How long the view that did not run this frame keeps its last people.
+VIEW_CARRY_S = 1.0
+
+
+def next_view_focus(
+    focus: str | None,
+    misses: int,
+    ground_statuses: dict[int, str],
+    tracked: list["TrackedDetection"],
+    floor_detections: list[Detection],
+) -> tuple[str | None, int]:
+    """Which view ("rect" or "floor") should get every frame, if any.
+
+    While somebody is ``checking`` or ``alert`` the approach needs a fresh pose
+    every frame, so stay on the view that is seeing them. If that view loses
+    them twice running (they left the crop as the robot drew near, or came into
+    it), try the other one.
+    """
+
+    candidates = {
+        track_id for track_id, status in ground_statuses.items()
+        if status in ("checking", "alert")
+    }
+    if not candidates:
+        return None, 0
+    seen = [item for item in tracked if item.track_id in candidates]
+    if seen:
+        from_floor = any(item.detection is other for item in seen for other in floor_detections)
+        return ("floor" if from_floor else "rect"), 0
+    if misses + 1 >= 2:
+        return ("rect" if focus == "floor" else "floor"), 0
+    return focus, misses + 1
+
+
 def tracking_similarity(left: Detection, right: Detection) -> float:
     """Blend box overlap with center proximity for low-frame-rate tracking."""
 
@@ -131,7 +224,9 @@ def tracking_similarity(left: Detection, right: Detection) -> float:
 class PersonTracker:
     """Assign short-lived, session-local IDs to overlapping person boxes."""
 
-    def __init__(self, minimum_iou: float = 0.15, max_missed: int = 2) -> None:
+    # A body on the floor is detected in fits and starts; two missed frames used
+    # to rename it, which restarted the alert hold and aborted any approach.
+    def __init__(self, minimum_iou: float = 0.15, max_missed: int = 8) -> None:
         self.minimum_iou = minimum_iou
         self.max_missed = max_missed
         self.next_id = 1
@@ -1315,6 +1410,12 @@ def run(args: argparse.Namespace) -> int:
     map_metrics: dict[str, Any] = {"ready": False}
     last_map_scan = 0.0
     last_safety_publish = 0.0
+    last_emergency_led = 0.0
+    rect_detections: list[Detection] = []
+    floor_detections: list[Detection] = []
+    rect_detections_at = floor_detections_at = 0.0
+    view_focus: str | None = None
+    view_misses = 0
     last_safety_status = None
     last_ground_assessments: dict[int, GroundAssessment] = {}
 
@@ -1331,6 +1432,7 @@ def run(args: argparse.Namespace) -> int:
     try:
         with Reader("camera.rect", keeptime=False) as camera, \
              Reader("camera.points", keeptime=False, aligned_to=camera) as point_reader, \
+             Reader("camera.head.rgb", keeptime=False) as head_reader, \
              Reader("slam.pose", keeptime=False) as slam_reader, \
              Reader("mapping.grid2d", keeptime=False) as map_reader:
             while not camera.ready():
@@ -1373,7 +1475,36 @@ def run(args: argparse.Namespace) -> int:
                     else 1.0 / max(started - previous_started, 1e-9)
                 )
                 previous_started = started
-                detections = detector.detect(frame, confidence=args.yolo_confidence)
+                # One pose pass per frame: this CPU is saturated, and two passes
+                # took the pipeline from 0.3 s to 1-2 s. Normally every third
+                # frame looks at the raw-resolution floor crop instead of
+                # camera.rect; once somebody looks low, every frame goes to
+                # whichever view is seeing them. The other view's people are
+                # carried forward briefly so nobody blinks out of the tracker.
+                use_floor = (
+                    not args.no_floor_roi
+                    and head_reader.ready()
+                    and (view_focus == "floor" or (view_focus is None and frame_count % 3 == 2))
+                )
+                if use_floor:
+                    crop = cv2.cvtColor(
+                        np.ascontiguousarray(floor_crop(left_eye(head_reader.data["rgb"]))),
+                        cv2.COLOR_RGB2BGR,
+                    )
+                    floor_detections = detections_from_floor_crop(
+                        detector.detect(crop, confidence=args.yolo_confidence),
+                        frame.shape[1],
+                        frame.shape[0],
+                    )
+                    floor_detections_at = started
+                else:
+                    rect_detections = detector.detect(frame, confidence=args.yolo_confidence)
+                    rect_detections_at = started
+                if started - rect_detections_at > VIEW_CARRY_S:
+                    rect_detections = []
+                if started - floor_detections_at > VIEW_CARRY_S:
+                    floor_detections = []
+                detections = merge_detections(rect_detections, floor_detections)
                 yolo_finished = time.monotonic()
                 dashboard.update_targets(
                     detections,
@@ -1407,6 +1538,18 @@ def run(args: argparse.Namespace) -> int:
                             robot_position=robot_position,
                             robot_yaw=robot_yaw,
                         )
+                        if assessment.state == "unknown":
+                            # No depth on the joints: the cloud ends ~1.7 m out.
+                            # Bone lengths on the floor plane still tell a lying
+                            # body from a raised one at any range.
+                            assessment = assess_ground_pose_monocular(
+                                item.detection.keypoints,
+                                frame.shape[1],
+                                frame.shape[0],
+                                keypoint_confidence=args.pose_confidence,
+                                robot_position=robot_position,
+                                robot_yaw=robot_yaw,
+                            )
                         ground_assessments[item.track_id] = assessment
                         if assessment.state != "unknown":
                             last_ground_assessments[item.track_id] = assessment
@@ -1419,6 +1562,13 @@ def run(args: argparse.Namespace) -> int:
                     }
                 ground_statuses = ground_tracker.update(
                     ground_assessments, time.monotonic()
+                )
+                view_focus, view_misses = next_view_focus(
+                    view_focus,
+                    view_misses,
+                    ground_statuses,
+                    tracked,
+                    floor_detections,
                 )
                 if any(status == "alert" for status in ground_statuses.values()):
                     ground_status = "alert"
@@ -1508,6 +1658,16 @@ def run(args: argparse.Namespace) -> int:
                     )
                     last_safety_status = ground_status
                     last_safety_publish = now
+                # Flash the neck red/blue for as long as the fall alert holds.
+                # The request expires by itself, so it is refreshed well inside
+                # its TTL and released the moment the alert clears.
+                if ground_status == "alert":
+                    if now - last_emergency_led >= 1.0:
+                        speech_relay.post_led_emergency(True)
+                        last_emergency_led = now
+                elif last_emergency_led:
+                    speech_relay.post_led_emergency(False)
+                    last_emergency_led = 0.0
                 expression = None
                 if detections:
                     primary = max(
@@ -1547,6 +1707,11 @@ def run(args: argparse.Namespace) -> int:
                     and expression.distress >= args.sad_confidence / 2
                 )
                 associated = face_belongs_to_person(expression, detections)
+                if check_in is not None and check_in.busy:
+                    # Count the cooldown from the end of the conversation. A
+                    # three-turn check-in outlasts the cooldown, so measured
+                    # from its start the same face reopened it straight away.
+                    trigger.last_triggered_at = time.monotonic()
                 if trigger.update(expression, associated, time.monotonic()):
                     cue = f"sadness cue ({expression.confidence:.0%})"
                     if check_in is None:
@@ -1618,6 +1783,7 @@ def run(args: argparse.Namespace) -> int:
                 last_frame = frame
                 time.sleep(max(0.0, args.scan_interval - elapsed))
     finally:
+        speech_relay.post_led_emergency(False)
         actions.stop()
         server.shutdown()
         server.server_close()
@@ -1641,6 +1807,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=SCRIPT_DIR / "sad_prompt.wav",
     )
     parser.add_argument("--yolo-confidence", type=float, default=0.4)
+    parser.add_argument(
+        "--no-floor-roi",
+        action="store_true",
+        help="skip the second pose pass on the raw-resolution crop of the floor ahead",
+    )
     parser.add_argument("--face-confidence", type=float, default=0.75)
     parser.add_argument("--expression-smoothing", type=float, default=0.25)
     parser.add_argument(

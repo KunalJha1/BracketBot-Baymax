@@ -147,3 +147,17 @@ def test_led_status_round_trips_and_expires(tmp_path):
 
     speech_relay.post_led_status("idle", spool=tmp_path)
     assert speech_relay.read_led_status(spool=tmp_path) is None
+
+
+def test_led_emergency_round_trips_expires_and_ignores_status(tmp_path):
+    speech_relay.post_led_emergency(True, ttl=3.0, spool=tmp_path)
+    # A check-in changing or releasing its color must not end the emergency.
+    speech_relay.post_led_status("listening", spool=tmp_path)
+    speech_relay.post_led_status("idle", spool=tmp_path)
+    assert speech_relay.read_led_emergency(spool=tmp_path) is True
+    later = lambda: time.time() + 60.0
+    assert speech_relay.read_led_emergency(spool=tmp_path, now=later) is False
+
+    speech_relay.post_led_emergency(True, spool=tmp_path)
+    speech_relay.post_led_emergency(False, spool=tmp_path)
+    assert speech_relay.read_led_emergency(spool=tmp_path) is False
