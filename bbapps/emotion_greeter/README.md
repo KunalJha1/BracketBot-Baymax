@@ -20,10 +20,13 @@ falls back to playing `sad_prompt.wav`. If the LLM cannot be reached it gives
 a short fixed, supportive reply. Use `--no-check-in` to keep the recorded
 prompt only.
 
-The default trigger requires a **60% smoothed distress score** -- the summed
-sadness, anger, disgust and fear probabilities -- for 0.6 seconds, clears for
-1.5 seconds before re-arming, and has a 30-second cooldown. A distress score at
-or above `--sad-instant-confidence` (85%) skips the hold and speaks on the
+The default trigger requires a **72% smoothed distress score** -- the summed
+sadness, anger, disgust and fear probabilities -- with one of those classes
+leading the reading, for 1.0 second, clears for 1.5 seconds before re-arming,
+and has a 30-second cooldown. The bar sits above the 50-70% that a resting face
+produces as a diffuse spread ("neutral 25%"), which used to start check-ins on
+people who were not frowning; a held frown scores 87-100%. A distress score at
+or above `--sad-instant-confidence` (90%) skips the hold and speaks on the
 first frame, because waiting out a hold on a face the models are already sure
 about is what made the robot feel slow. The single `sadness`
 class cannot be used for this: AffectNet scores a plain frown as disgust 60% /

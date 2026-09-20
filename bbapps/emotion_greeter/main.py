@@ -177,6 +177,8 @@ class PersonTracker:
 
 
 SAD_LABELS = frozenset({"sad", "sadness"})
+# Classes that may lead a reading that starts a check-in.
+TRIGGER_LABELS = SAD_LABELS | frozenset(DISTRESS_LABELS)
 
 
 def leans_sad(expression: Expression | None) -> bool:
@@ -193,13 +195,19 @@ class SadVoiceTrigger:
     (``instant_confidence`` or higher) fires on the first reading: waiting a
     further second and a half on a face the models are already sure about is
     the difference between the robot feeling attentive and feeling laggy.
+
+    The summed distress score alone is not enough: a resting face often reads
+    as a diffuse spread ("neutral 25%", distress 55-60%), which used to start
+    check-ins on people who were not frowning at all. So a negative emotion
+    also has to be the leading class, and the bar sits above that noise band
+    (a held frown scores 87-100%).
     """
 
-    hold_seconds: float = 0.6
+    hold_seconds: float = 1.0
     cooldown_seconds: float = 30.0
     reset_seconds: float = 1.5
-    confidence: float = 0.6
-    instant_confidence: float = 0.85
+    confidence: float = 0.72
+    instant_confidence: float = 0.9
     first_sad_at: float | None = None
     first_clear_at: float | None = None
     last_triggered_at: float | None = None
@@ -220,6 +228,7 @@ class SadVoiceTrigger:
             person_present
             and expression is not None
             and expression.distress >= self.confidence
+            and expression.label in TRIGGER_LABELS
         )
         if sad_visible:
             self.first_clear_at = None
@@ -1668,16 +1677,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sad-confidence",
         type=float,
-        default=0.6,
+        default=0.72,
         help="summed sadness+anger+disgust+fear needed to start a check-in",
     )
     parser.add_argument(
         "--sad-instant-confidence",
         type=float,
-        default=0.85,
+        default=0.9,
         help="summed distress that starts the check-in without waiting out the hold",
     )
-    parser.add_argument("--sad-hold-seconds", type=float, default=0.6)
+    parser.add_argument("--sad-hold-seconds", type=float, default=1.0)
     parser.add_argument("--sad-cooldown", type=float, default=30.0)
     parser.add_argument("--sad-reset-seconds", type=float, default=1.5)
     parser.add_argument("--speak-on-start", action="store_true")

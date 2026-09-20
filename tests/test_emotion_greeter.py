@@ -149,6 +149,29 @@ def test_trigger_uses_summed_negative_affect_not_the_sadness_label():
     assert trigger.update(frown, True, 1.0)
 
 
+def test_trigger_ignores_diffuse_distress_on_a_resting_face():
+    """Seen on the robot: "neutral 25%" with the four negative classes summing
+    past the threshold started check-ins on people who were not frowning."""
+
+    trigger = SadVoiceTrigger(hold_seconds=1.0, confidence=0.6)
+    resting = expression(label="neutral", confidence=0.25, distress=0.65)
+
+    assert not trigger.update(resting, True, 0)
+    assert not trigger.update(resting, True, 5.0)
+    assert not trigger.warming
+
+
+def test_default_trigger_sits_above_the_resting_face_noise_band():
+    trigger = SadVoiceTrigger()
+    noisy = expression(label="sadness", confidence=0.5, distress=0.68)
+    frown = expression(label="disgust", confidence=0.6, distress=0.87)
+
+    assert not trigger.update(noisy, True, 0)
+    assert not trigger.update(noisy, True, 5.0)
+    assert not trigger.update(frown, True, 6.0)
+    assert trigger.update(frown, True, 7.0)
+
+
 def test_trigger_ignores_a_confident_but_untroubled_face():
     trigger = SadVoiceTrigger(hold_seconds=1.0, confidence=0.6)
     calm = expression(label="surprise", confidence=0.66, distress=0.19)
