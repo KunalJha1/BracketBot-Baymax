@@ -137,6 +137,7 @@ Controls:
 | Base mode | Toggle 4° lean / balance | `Z` |
 | Positioning | Detect table and place both arms | `R` |
 | Follow | Follow the person standing in front; distance slider | `F` |
+| Ground check-in | Slowly approach one confirmed person on the ground, stop and speak once | Button |
 | Cancellation | Stop the current action/routine safely | `Esc` |
 
 The dashboard uploads only the selected allowlisted asset and its small runner
@@ -177,6 +178,21 @@ reply with identical text is free too.
 
 **Introduce Baymax** (`H`) and **Sign off** (`J`) are the two routines built
 from these lines: a light, the spoken line, then a wave.
+
+## Ground check-in
+
+**Check on person** on [the local dashboard](http://127.0.0.1:8020/) arms a
+single approach to the existing depth-grounded lying-pose detector. It uses
+range and bearing PID control, caps forward motion at **0.05 m/s** and turning
+at **0.20 rad/s**, and stops **1.0 m outside the observed body envelope**. Once
+the wheels have settled it says, "hello specimen, are you in trouble", then
+ends the action. Press the button again for another attempt; `Esc` cancels.
+
+This mode needs the updated robot vision service and existing robot-specific
+follow calibration. It does not start automatically when an alert appears.
+Fresh pose/depth, a clear corridor, and the open dashboard are required for
+motion. Setup, dry runs, and remaining hardware checks are in
+[`docs/ground-check-in.md`](docs/ground-check-in.md).
 
 ## Follow mode (person following)
 

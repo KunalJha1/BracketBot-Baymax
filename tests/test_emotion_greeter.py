@@ -1,5 +1,7 @@
 from pathlib import Path
 import sys
+import json
+import time
 
 import pytest
 import numpy as np
@@ -24,7 +26,28 @@ from main import (  # noqa: E402
     face_belongs_to_person,
     square_face_box,
     yolo_detections,
+    publish_ground_safety_file,
 )
+
+
+def test_ground_publisher_supports_motion_without_reusing_latched_positions(tmp_path):
+    from ground_approach import target_from_payload
+
+    now = time.time()
+    path = tmp_path / "ground.json"
+    observation = {"track_id": 4, "state": "possible_person_on_ground", "latch_status": "alert",
+                   "base_position": [0, 3, 0.2], "body_radius_m": 0.8, "confidence": 0.9}
+    publish_ground_safety_file(path, "alert", [{"track_id": 4}], camera_timestamp_ns=int(now * 1e9),
+                               map_epoch=1, observations=[observation], depth_aligned=True)
+    data = json.loads(path.read_text())
+    assert data["approach_schema_version"] == 1
+    assert data["possible_person_on_ground"] is True
+    assert target_from_payload(data, time.time()).track_id == 4
+    publish_ground_safety_file(path, "alert", [{"track_id": 4}], camera_timestamp_ns=int(now * 1e9),
+                               map_epoch=1, observations=[], depth_aligned=False)
+    data = json.loads(path.read_text())
+    assert data["possible_person_on_ground"] is True
+    assert target_from_payload(data, time.time()) is None
 from check_in import (  # noqa: E402
     FALLBACK_REPLY,
     NO_ANSWER_REPLY,

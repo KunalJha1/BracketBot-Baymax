@@ -45,6 +45,7 @@ class GroundAssessment:
     body_extent_m: float | None = None
     base_position: tuple[float, float, float] | None = None
     map_position: tuple[float, float] | None = None
+    body_radius_m: float | None = None
 
     @property
     def suspected(self) -> bool:
@@ -202,6 +203,10 @@ def assess_ground_pose(
 
     base_position_array = np.median(body_array, axis=0)
     base_position = tuple(float(value) for value in base_position_array)
+    # Include every visible joint and a margin for unobserved hands/head/clothing.
+    # Approaching a torso centre alone could put the wheels over outstretched legs.
+    all_joints = np.asarray(list(keypoints_3d.values()), dtype=np.float32)
+    body_radius = float(np.linalg.norm(all_joints[:, :2] - base_position_array[:2], axis=1).max()) + 0.25
     map_position = None
     if robot_position is not None and robot_yaw is not None:
         map_position = base_to_map(base_position_array, robot_position, robot_yaw)
@@ -220,6 +225,7 @@ def assess_ground_pose(
         round(body_extent, 3),
         base_position,
         map_position,
+        body_radius,
     )
 
 
@@ -268,12 +274,17 @@ class GroundAlertTracker:
                 # Missing depth is not evidence that a previously confirmed
                 # person got up. Keep the alert latched until positive clearing.
                 statuses[track_id] = "alert" if state.confirmed else "unknown"
+                state.first_suspected_at = None
+                state.first_clear_at = None
 
         for track_id, state in list(self.tracks.items()):
             if track_id in assessments:
                 continue
             if state.confirmed:
+                state.first_clear_at = None
                 statuses[track_id] = "alert"
-            elif now - state.last_seen_at > max(2.0, self.clear_seconds):
-                del self.tracks[track_id]
+            else:
+                state.first_suspected_at = None
+                if now - state.last_seen_at > max(2.0, self.clear_seconds):
+                    del self.tracks[track_id]
         return statuses

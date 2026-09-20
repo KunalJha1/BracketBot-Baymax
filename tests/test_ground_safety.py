@@ -46,6 +46,8 @@ def test_low_extended_3d_pose_is_possible_person_on_ground():
     assert assessment.map_position is not None
     assert assessment.map_position[0] == pytest.approx(10.0, abs=0.1)
     assert assessment.map_position[1] > 21.0
+    for joint in low_person_pose().values():
+        assert np.linalg.norm(joint[:2] - np.asarray(assessment.base_position)[:2]) + 0.249 <= assessment.body_radius_m
 
 
 def test_upright_torso_is_clear_even_with_feet_on_floor():
@@ -110,3 +112,13 @@ def test_alert_requires_persistence_and_unknown_does_not_clear_it():
     assert tracker.update({7: unknown}, 20.0)[7] == "alert"
     assert tracker.update({7: clear}, 21.0)[7] == "alert"
     assert tracker.update({7: clear}, 22.0)[7] == "clear"
+
+
+@pytest.mark.parametrize("missing", [True, False])
+def test_detection_gap_restarts_confirmation_hold(missing):
+    tracker = GroundAlertTracker(hold_seconds=2)
+    low = assess_ground_pose(low_person_pose())
+    tracker.update({7: low}, 0)
+    tracker.update({} if missing else {7: assess_ground_pose({})}, 1)
+    assert tracker.update({7: low}, 3)[7] == "checking"
+    assert tracker.update({7: low}, 5)[7] == "alert"

@@ -35,6 +35,12 @@ never writes to `drive.ctrl` itself. See
 [`docs/slam-ground-safety.md`](../../docs/slam-ground-safety.md) for response
 policy, limitations, and the required physical calibration protocol.
 
+The interlock also publishes current observations, the camera capture time,
+vision session ID, and a conservative body radius for the dashboard's
+**Check on person** action. Latched alerts alone cannot authorize approach:
+the separate drive runner requires a fresh, currently observed ground pose.
+See [`docs/ground-check-in.md`](../../docs/ground-check-in.md) for setup.
+
 ## Expression accuracy
 
 Measured on 1,750 RAF-DB faces (in-the-wild photos the models never trained
