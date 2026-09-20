@@ -528,8 +528,22 @@ class ExpressionAnalyzer:
             self.missing()
             return None
 
+        # YuNet occasionally returns a box with NaN coordinates. NaN loses
+        # every comparison, so such a row slips past the min-face-size check
+        # below and then raises "cannot convert float NaN to integer" in
+        # square_face_box, which killed the whole app mid-run. Drop those rows
+        # before choosing the largest face, so one bad box costs one frame.
+        usable = [
+            row
+            for row in faces
+            if np.isfinite(np.asarray(row[:4], dtype=np.float64)).all()
+        ]
+        if not usable:
+            self.missing()
+            return None
+
         self.missing_frames = 0
-        face = max(faces, key=lambda row: float(row[2] * row[3]))
+        face = max(usable, key=lambda row: float(row[2] * row[3]))
         x, y, face_width, face_height = (float(value) for value in face[:4])
         if max(face_width, face_height) < self.min_face_size:
             # Upscaling a tiny face to 224 px mostly produces noise (RAF-DB

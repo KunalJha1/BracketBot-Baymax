@@ -688,3 +688,32 @@ def test_check_in_reports_when_nobody_can_play_the_relayed_line(monkeypatch):
 
     with pytest.raises(LocalVoiceError):
         check_in.speak("Hey, why are you sad?")
+
+
+def test_analyzer_survives_a_nan_face_box():
+    """YuNet can return NaN coordinates. NaN loses every comparison, so it used
+    to slip past the size check and crash square_face_box, killing the app."""
+
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    analyzer = fake_analyzer(
+        [float("nan"), float("nan"), float("nan"), float("nan")],
+        [FakeNet(one_hot("sadness"))],
+    )
+
+    assert analyzer.analyze(frame) is None
+
+
+def test_analyzer_ignores_a_nan_box_but_still_reads_a_good_face():
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    analyzer = fake_analyzer([50, 50, 80, 100], [FakeNet(one_hot("sadness"))])
+    nan_row = np.asarray([float("nan")] * 15, dtype=np.float32)
+    good_row = np.asarray([50, 50, 80, 100] + [0.0] * 10 + [0.9], dtype=np.float32)
+    analyzer.face_detector.detect = lambda _frame: (
+        2,
+        np.stack([nan_row, good_row]),
+    )
+
+    result = analyzer.analyze(frame)
+
+    assert result is not None
+    assert result.label == "sadness"

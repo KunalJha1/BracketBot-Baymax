@@ -1,0 +1,17 @@
+[Unit]
+Description=Restart the BracketBot emotion greeter if it dies
+# app_manager owns starting the app; this only re-creates its lock after a
+# crash, so it is useless without it.
+After=app_manager.service
+Wants=app_manager.service
+
+[Service]
+Type=simple
+User=bracketbot
+ExecStart=/home/bracketbot/bbapps/emotion_greeter/watchdog.sh
+# Restart the watchdog itself if it ever exits.
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
