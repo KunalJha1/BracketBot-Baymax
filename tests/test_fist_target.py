@@ -179,6 +179,25 @@ def test_the_lift_never_has_to_move_faster_than_its_limit():
     assert aimed.lift_turns > 0.3
 
 
+def test_a_very_high_fist_gets_the_rest_of_the_lift_before_the_reach():
+    times, poses = recording()
+    index, apex = recorded_apex(poses, lifting_hand_position)
+    fist = apex + [ft.STANDOFF_METRES, 0.0, 0.17]
+
+    aimed = ft.retarget_trajectory(
+        lifting_hand_position, times, poses, fist, lift_range=(-5.0, 5.0)
+    )
+
+    # The reach alone covers 0.24 turns here; the other 0.35 is there from the start.
+    assert aimed.lift_metres == pytest.approx(0.17, abs=1e-6)
+    assert 0.0 < aimed.lift_preraise_turns <= ft.MAX_LIFT_PRERAISE_TURNS
+    assert aimed.trajectory[0, 0] == pytest.approx(0.4 + aimed.lift_preraise_turns)
+    assert aimed.trajectory[-1, 0] == pytest.approx(0.4 + aimed.lift_preraise_turns)
+    assert np.allclose(aimed.offset, 0.0, atol=1e-6)
+    lift_speed = np.abs(np.diff(aimed.trajectory[:, 0]) / np.diff(times))
+    assert lift_speed.max() <= ft.LIFT_PEAK_TURNS_PER_SECOND * 1.01
+
+
 def test_a_lift_parked_outside_its_range_is_not_dragged_back_in():
     times, poses = recording()
     index, apex = recorded_apex(poses, lifting_hand_position)

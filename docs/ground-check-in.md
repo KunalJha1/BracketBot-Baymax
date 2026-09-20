@@ -212,3 +212,23 @@ alert file:
 The robot still needs about a metre of genuinely clear floor ahead: a table or
 chair within 0.85 m is a real `BLOCKED`.
 
+## After arriving: asking, listening, standing down
+
+The assistant speaks the arrival line, then writes
+`/tmp/bracketbot_ground_arrived.json`. The vision app (which owns the microphone
+side of unprompted conversations, `check_in.py`) sees it within a frame and runs
+`SadCheckIn.converse_ground`:
+
+- It listens once, asks again if it hears nothing, then listens once more.
+- `ground_answer_kind` sorts the answer. Any sign of trouble ("help", "hurts",
+  "can't get up", "not okay", a bare "yes") beats a reassuring word, so
+  "I'm okay but my arm hurts" is `help`.
+- **okay** ("I'm okay", "no", "just resting", "I don't need help"): it says it
+  will leave them be, and the red/blue lights stop for that person for as long
+  as they stay down. Getting up and going down again is a new alert.
+- **help** or an unclear answer: it says it is staying and calls out that someone
+  needs help; unclear answers get one short LLM reply. The lights stay on.
+- **silence** twice: it calls out that someone may need help. The lights stay on.
+
+The robot cannot phone anyone; "calling out" is speech through its own speaker.
+

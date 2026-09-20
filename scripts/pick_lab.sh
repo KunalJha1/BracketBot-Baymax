@@ -33,7 +33,7 @@ SSH_OPTS=(-o ControlMaster=auto -o ControlPath=/tmp/pick-lab-%C -o ControlPersis
           -o ServerAliveInterval=5 -o ServerAliveCountMax=2)
 HOST_CACHE=/tmp/pick-lab-host
 SSH() { ssh "${SSH_OPTS[@]}" "$@"; }
-FILTER='say\]|timing\]|complete\]|median|lean\]|reach\]|state\] side|startup|accepted pitch|retry\]|place\]|space\]|grip\]|evidence|torque\]|cleanup|fatal|staged|rest\]|gripper\]|motion\] stage|complete\]'
+FILTER='load\]|say\]|timing\]|complete\]|median|lean\]|reach\]|state\] side|startup|accepted pitch|retry\]|place\]|space\]|grip\]|evidence|torque\]|cleanup|fatal|staged|rest\]|gripper\]|motion\] stage|complete\]'
 
 host() {
   if [ -s "$HOST_CACHE" ]; then
@@ -94,7 +94,10 @@ ENSURE_SERVER="cd $REMOTE; \
 # motion; 'stop' still works because pick.pid exists while the job runs.
 run_detached() {
   local h="$1"; shift
-  SSH "$h" "$ENSURE_SERVER; rm -f pick.log; \
+  # A busy robot plans several times slower: name whatever is eating the cores.
+  SSH "$h" "awk -v cores=\$(nproc) '\$1 > cores {print \"[pick][load] robot load \" \$1 \" on \" cores \" cores; busiest: \"; exit 1}' /proc/loadavg \
+        || ps -eo pcpu,args --sort=-pcpu | awk 'NR>1 && NR<4 {print \"[pick][load]   \" \$1 \"% \" \$2 \" \" \$3}'; \
+      $ENSURE_SERVER; rm -f pick.log; \
       printf '%s\n' '$*' > jobs/.incoming && mv jobs/.incoming jobs/\$(date +%s%N)-\$\$.job; \
       for _ in \$(seq 1 100); do [ -f pick.log ] && break; sleep 0.05; done; \
       tail -n +1 -f pick.log & TAIL=\$!; \

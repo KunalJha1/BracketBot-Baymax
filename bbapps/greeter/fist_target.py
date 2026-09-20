@@ -59,6 +59,14 @@ MAX_BODY_TURN_DEG = 30.0
 # sinks with the return, so it must cover its travel in the time the recording
 # gives it without going faster than any other eased arm move.
 LIFT_PEAK_TURNS_PER_SECOND = 0.30
+# A fist higher than that gets the rest of the lift before the reach begins: the
+# first and last frames sit this much higher, and the eased move into and out of
+# the gesture does the travel. Costs up to 2.5 s of lead-in, so it is only used
+# for what the reach itself cannot cover.
+MAX_LIFT_PRERAISE_TURNS = 0.50
+# How much of the arm bend to try, most first. Fine steps, so a fist at the
+# edge of reach loses a little accuracy rather than a quarter of the correction.
+BEND_SHARES = (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.25)
 
 KEYFRAME_STRIDE = 4
 MAX_JOINT_DELTA_TURNS = 0.15
@@ -159,18 +167,24 @@ def recorded_apex(hand_position, trajectory) -> tuple[int, np.ndarray]:
     return int(np.argmax(recorded[:, 0])), recorded
 
 
-def _lift_plan(hand_position, pose, wanted_height, lift_range, max_turns):
-    """Lift change (turns) toward ``wanted_height`` metres, and the hand shift it gives."""
+def _lift_plan(hand_position, pose, wanted_height, lift_range, max_moving_turns):
+    """Lift change (turns) toward ``wanted_height`` metres, and the hand shift per turn.
+
+    Returns ``(before, moving, per_turn)``: turns raised before the reach starts,
+    turns raised during it, and the hand displacement one turn gives.
+    """
     nudged = pose.copy()
     nudged[0] += 0.05
     per_turn = (hand_position(nudged) - hand_position(pose)) / 0.05
     if abs(per_turn[2]) < 1e-3:
-        return 0.0, np.zeros(3)
+        return 0.0, 0.0, np.zeros(3)
     # A lift already parked outside its range is left where it is, not pulled in.
     low = min(lift_range[0] - pose[0], 0.0)
     high = max(lift_range[1] - pose[0], 0.0)
-    turns = float(np.clip(wanted_height / per_turn[2], max(low, -max_turns), min(high, max_turns)))
-    return turns, turns * per_turn
+    reach = max_moving_turns + MAX_LIFT_PRERAISE_TURNS
+    turns = float(np.clip(wanted_height / per_turn[2], max(low, -reach), min(high, reach)))
+    moving = float(np.clip(turns, -max_moving_turns, max_moving_turns))
+    return turns - moving, moving, per_turn
 
 
 def _position_solve(position_of, joints, goal, iterations=12, damping=0.02):
@@ -202,8 +216,9 @@ class Retarget:
     offset: np.ndarray            # applied apex correction after clamping
     apex_error_m: float
     max_joint_delta_turns: float
-    lift_turns: float = 0.0       # lift change at the apex; zero at both ends
+    lift_turns: float = 0.0       # lift change at the apex
     lift_metres: float = 0.0
+    lift_preraise_turns: float = 0.0   # the part of it already there at both ends
 
 
 def retarget_trajectory(
@@ -216,7 +231,7 @@ def retarget_trajectory(
     refused; the caller then plays the recording as it is.
     """
     refusal = None
-    for share in (1.0, 0.75, 0.5, 0.25):
+    for share in BEND_SHARES:
         try:
             return _retarget(
                 hand_position, times, trajectory, fist, urdf_joints, share,
@@ -259,18 +274,20 @@ def _retarget(
     weight = np.minimum(rise, fall)
     weight = weight * weight * (3.0 - 2.0 * weight)
 
-    lift_turns, lift_shift = 0.0, np.zeros(3)
+    before, moving, per_turn = 0.0, 0.0, np.zeros(3)
     if lift_range is not None:
         # Smoothstep peaks at 1.5x its mean speed.
         shortest = min(times[apex_index], times[-1] - times[apex_index]) / playback_speed
-        lift_turns, lift_shift = _lift_plan(
+        before, moving, per_turn = _lift_plan(
             hand_position, original[apex_index], wanted[2], lift_range,
             LIFT_PEAK_TURNS_PER_SECOND * shortest / 1.5,
         )
+    lift_shift = (before + moving) * per_turn
     # The lifted recording is the new starting shape; the arm bends from there.
+    lift = before + weight * moving
     trajectory = original.copy()
-    trajectory[:, 0] += weight * lift_turns
-    recorded = recorded + np.outer(weight, lift_shift)
+    trajectory[:, 0] += lift
+    recorded = recorded + np.outer(lift, per_turn)
     offset = share * np.clip(wanted - lift_shift, MIN_OFFSET, MAX_OFFSET)
 
     keyframes = sorted(
@@ -327,5 +344,5 @@ def _retarget(
         raise RuntimeError(f"aimed fist bump misses its target by {apex_error * 100:.1f} cm")
     return Retarget(
         bent.astype(np.float32), apex_index, apex, offset, apex_error, max_delta,
-        lift_turns, float(lift_shift[2]),
+        before + moving, float(lift_shift[2]), before,
     )

@@ -107,6 +107,7 @@ def locate_offered_fist(depth, points, wait_seconds=FIST_WAIT_SECONDS):
     """
     deadline = time.monotonic() + wait_seconds
     previous, reason = examine_offered_fist(points)
+    looks = [reason]
     while time.monotonic() < deadline:
         try:
             points = _read_points(depth)
@@ -114,13 +115,21 @@ def locate_offered_fist(depth, points, wait_seconds=FIST_WAIT_SECONDS):
             reason = "depth stopped updating"
             break
         seen, reason = examine_offered_fist(points)
+        looks.append(reason)
         fist = stable_fist(previous, seen)
         if fist is not None:
             return fist, points
         if seen is not None:
             reason += ", still moving" if previous is not None else ", waiting for a second look"
         previous = seen
-    print(f"[arm] no steady fist: {reason}", flush=True)
+    # Every look, not just the last, so a fist that flickers can be told from
+    # one that was never there.
+    seen_count = sum(look.startswith("fist at") for look in looks)
+    print(
+        f"[arm] no steady fist: {reason} ({seen_count} of {len(looks)} looks saw a fist; "
+        f"others: {'; '.join(dict.fromkeys(l for l in looks if not l.startswith('fist at'))) or 'none'})",
+        flush=True,
+    )
     return None, points
 
 
@@ -169,7 +178,7 @@ def aim_plan(plan, side, fist, name=None):
     print(
         f"[arm] aiming at fist {np.round(fist, 3).tolist()}: hand peaks at "
         f"{np.round(aimed.apex, 3).tolist()}, lift {aimed.lift_turns:+.2f} turns "
-        f"({aimed.lift_metres:+.3f} m), arm moved {np.round(aimed.offset, 3).tolist()} m, "
+        f"({aimed.lift_metres:+.3f} m, {aimed.lift_preraise_turns:+.2f} before the reach), arm moved {np.round(aimed.offset, 3).tolist()} m, "
         f"largest joint change {aimed.max_joint_delta_turns:.3f} turns",
         flush=True,
     )
@@ -370,6 +379,8 @@ class RecordedGestureController:
         self._cancel = threading.Event()
         self._shutdown = threading.Event()
         self._thread = None
+        # How much later than usual the recording starts, for anything timed to it.
+        self.lead_delay_seconds = 0.0
 
     def _load(self, name):
         movement_name = recorded_movement_name(name)
@@ -400,6 +411,15 @@ class RecordedGestureController:
             self._lock.release()
             return False, spoken_safety_refusal(name, exc)
         self._cancel.clear()
+        # An aimed gesture may begin with the lift already raised, which makes
+        # the eased move to the first frame longer than the recording's own.
+        first = {side: plan.poses[side][0] for side in plan.sides}
+        unraised = {
+            side: np.concatenate((plan.starts[side][:1], first[side][1:])) for side in plan.sides
+        }
+        self.lead_delay_seconds = ease_seconds(plan.starts, first) - ease_seconds(
+            plan.starts, unraised
+        )
 
         def run():
             try:

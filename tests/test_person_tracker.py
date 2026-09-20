@@ -43,6 +43,12 @@ def test_turn_command_is_bounded_and_signed():
     assert pt.slew(0.0, 0.6, 0.02) == pytest.approx(0.03)
 
 
+@pytest.fixture(autouse=True)
+def no_teleop(monkeypatch, request):
+    if "relay" not in request.node.name:
+        monkeypatch.setattr(pt, "teleop_relay_listening", lambda: False)
+
+
 class FakeWriter:
     def __init__(self):
         self.closed = False
@@ -77,10 +83,11 @@ class FakeRobot:
     def yaw(self):
         return self.heading
 
-    def open_drive(self):
+    open_drive = pt.Robot.open_drive
+
+    def preflight(self, base_may_be_driven=False):
         if self.refuse:
             raise pt.Refused(self.refuse)
-        return self.Writer()
 
     def look(self, frames=2):
         if self.person_yaw is None:
@@ -223,3 +230,14 @@ def test_relay_drive_sends_teleop_the_twist_as_json(monkeypatch):
 
         assert json.loads(listener.recv(256)) == {"v": 0.0, "w": 0.25}
     assert pt.teleop_relay_listening() is False
+
+
+def test_turns_go_through_the_relay_while_teleop_owns_the_base(monkeypatch):
+    monkeypatch.setattr(pt, "teleop_relay_listening", lambda: True)
+    robot = FakeRobot()
+    robot.Writer = lambda *a, **k: pytest.fail("drive.ctrl belongs to teleop")
+
+    drive = robot.open_drive()
+
+    assert isinstance(drive, pt.TeleopRelayDrive)
+    drive.__exit__(None, None, None)

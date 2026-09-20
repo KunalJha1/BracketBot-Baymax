@@ -846,3 +846,72 @@ def test_analyzer_ignores_a_nan_box_but_still_reads_a_good_face():
 
     assert result is not None
     assert result.label == "sadness"
+
+
+# --- Ground check-in conversation -------------------------------------------------
+
+@pytest.mark.parametrize("answer,kind", [
+    ("I'm okay", "okay"), ("no", "okay"), ("yeah I'm fine, just resting", "okay"),
+    ("I don't need help", "okay"), ("all good", "okay"),
+    ("help", "help"), ("yes", "help"), ("I'm not okay", "help"), ("not so good", "help"),
+    ("I fell and I can't get up", "help"), ("I'm okay but my arm hurts", "help"),
+    ("who are you", "unclear"),
+])
+def test_ground_answers_err_towards_help(answer, kind):
+    from check_in import ground_answer_kind
+
+    assert ground_answer_kind(answer) == kind
+
+
+def ground_conversation(monkeypatch, mic_sessions, answers, llm=None):
+    monkeypatch.setattr("check_in.time.sleep", lambda _s: None)
+    check_in, _synthesizer, spoken = check_in_for(mic_sessions, answers, llm or FakeLlm(), answer_timeout=0.01)
+    results = []
+    check_in.converse_ground(results.append)
+    return check_in, spoken, results
+
+
+def test_ground_check_in_stands_down_when_the_person_says_they_are_okay(monkeypatch):
+    from check_in import GROUND_OKAY_REPLY
+
+    check_in, spoken, results = ground_conversation(monkeypatch, [spoken_answer()], ["I'm okay, just resting"])
+
+    assert spoken == [GROUND_OKAY_REPLY]          # the arrival question was the assistant's
+    assert results == ["okay"]
+    assert check_in.status == "idle" and not check_in.busy
+
+
+def test_ground_check_in_asks_once_more_then_calls_out_when_nobody_answers(monkeypatch):
+    from check_in import GROUND_ASK_AGAIN, GROUND_NO_ANSWER_REPLY
+
+    _check_in, spoken, results = ground_conversation(monkeypatch, [[], []], [])
+
+    assert spoken == [GROUND_ASK_AGAIN, GROUND_NO_ANSWER_REPLY]
+    assert results == ["silent"]
+
+
+def test_ground_check_in_keeps_the_emergency_when_the_person_needs_help(monkeypatch):
+    from check_in import GROUND_CONTEXT_NOTE, GROUND_HELP_REPLY
+
+    _check_in, spoken, results = ground_conversation(monkeypatch, [spoken_answer()], ["my leg hurts"])
+    assert (spoken, results) == ([GROUND_HELP_REPLY], ["help"])
+
+    llm = FakeLlm()
+    _check_in, spoken, results = ground_conversation(monkeypatch, [spoken_answer()], ["who are you"], llm)
+    assert llm.heard == ["who are you" + GROUND_CONTEXT_NOTE]
+    assert results == ["help"] and len(spoken) == 1
+
+    _check_in, spoken, results = ground_conversation(monkeypatch, [spoken_answer()], ["who are you"], FakeLlm(fail=True))
+    assert (spoken, results) == ([GROUND_HELP_REPLY], ["help"])
+
+
+def test_ground_arrival_signal_is_only_honoured_while_fresh(tmp_path):
+    from check_in import read_ground_arrival
+
+    path = tmp_path / "arrived.json"
+    assert read_ground_arrival(path) is None
+    path.write_text('{"arrived_at": 100.0}')
+    assert read_ground_arrival(path, now=lambda: 103.0) == 100.0
+    assert read_ground_arrival(path, now=lambda: 120.0) is None
+    path.write_text("not json")
+    assert read_ground_arrival(path) is None

@@ -1383,6 +1383,8 @@ def run(args: argparse.Namespace) -> int:
     )
     speaker = RobotSpeaker(args.voice_prompt)
     check_in = start_check_in(args)
+    if check_in is not None:
+        from check_in import read_ground_arrival
     trigger = SadVoiceTrigger(
         hold_seconds=args.sad_hold_seconds,
         cooldown_seconds=args.sad_cooldown,
@@ -1411,6 +1413,8 @@ def run(args: argparse.Namespace) -> int:
     last_map_scan = 0.0
     last_safety_publish = 0.0
     last_emergency_led = 0.0
+    ground_acknowledged: set[int] = set()
+    last_ground_arrival: float | None = None
     rect_detections: list[Detection] = []
     floor_detections: list[Detection] = []
     rect_detections_at = floor_detections_at = 0.0
@@ -1554,12 +1558,25 @@ def run(args: argparse.Namespace) -> int:
                         if assessment.state != "unknown":
                             last_ground_assessments[item.track_id] = assessment
                 else:
-                    ground_assessments = {
-                        item.track_id: GroundAssessment(
-                            "unknown", 0.0, "camera/depth timestamps are not aligned", 0
+                    # No usable depth this frame. The floor-plane test needs none,
+                    # so a body on the floor is still seen; only a pose it cannot
+                    # judge stays unknown.
+                    for item in tracked:
+                        assessment = assess_ground_pose_monocular(
+                            item.detection.keypoints,
+                            frame.shape[1],
+                            frame.shape[0],
+                            keypoint_confidence=args.pose_confidence,
+                            robot_position=robot_position,
+                            robot_yaw=robot_yaw,
                         )
-                        for item in tracked
-                    }
+                        if assessment.state == "unknown":
+                            assessment = GroundAssessment(
+                                "unknown", 0.0, "camera/depth timestamps are not aligned", 0
+                            )
+                        ground_assessments[item.track_id] = assessment
+                        if assessment.state != "unknown":
+                            last_ground_assessments[item.track_id] = assessment
                 ground_statuses = ground_tracker.update(
                     ground_assessments, time.monotonic()
                 )
@@ -1661,7 +1678,23 @@ def run(args: argparse.Namespace) -> int:
                 # Flash the neck red/blue for as long as the fall alert holds.
                 # The request expires by itself, so it is refreshed well inside
                 # its TTL and released the moment the alert clears.
-                if ground_status == "alert":
+                alert_tracks = {
+                    track_id for track_id, status in ground_statuses.items() if status == "alert"
+                }
+                # "I'm okay" stands the emergency down for that person only, and
+                # only while they stay down: getting up and falling again is new.
+                ground_acknowledged &= alert_tracks
+                arrived = None if check_in is None else read_ground_arrival()
+                if arrived is not None and arrived != last_ground_arrival:
+                    asked_about = set(alert_tracks)
+
+                    def ground_result(result: str, asked_about=asked_about) -> None:
+                        if result == "okay":
+                            ground_acknowledged.update(asked_about)
+
+                    if check_in.start_ground_async(ground_result):
+                        last_ground_arrival = arrived
+                if alert_tracks - ground_acknowledged:
                     if now - last_emergency_led >= 1.0:
                         speech_relay.post_led_emergency(True)
                         last_emergency_led = now

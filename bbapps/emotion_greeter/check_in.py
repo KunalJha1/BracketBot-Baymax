@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+import json
 import os
 from pathlib import Path
 import random
@@ -73,6 +74,69 @@ _DISMISSAL = re.compile(
     r"no thanks|no thank you|bye|goodbye)"
     r"(?: please| now| baymax| thanks| thank you)*$"
 )
+# --- Ground check-in: the robot has driven up to somebody lying on the floor. ---
+# The voice assistant speaks the arrival line (it owns the speaker and the drive
+# action), then drops this file; the vision app listens for the answer, because
+# the microphone, transcriber and LLM for unprompted conversations live here.
+GROUND_ARRIVAL_FILE = Path("/tmp/bracketbot_ground_arrived.json")
+GROUND_ARRIVAL_MAX_AGE_S = 8.0
+GROUND_OKAY_REPLY = (
+    "Okay, glad you're alright. I'll leave you be. Just say Hey BracketBot if you need me."
+)
+# Same polarity as the arrival line ("... are you in trouble"), so a bare "no"
+# always means "I'm fine" and a bare "yes" always means trouble.
+GROUND_ASK_AGAIN = "I didn't hear you. Are you in trouble? Say I'm okay, or say help."
+GROUND_NO_ANSWER_REPLY = (
+    "I can't hear an answer. If anyone is nearby, someone here may need help. I'm staying right here."
+)
+GROUND_HELP_REPLY = (
+    "Okay. I'm staying right here with you. If anyone is nearby, someone here needs help."
+)
+GROUND_CONTEXT_NOTE = (
+    " (Context: you are a robot that just found this person lying on the floor and asked "
+    "if they are okay. Be calm and practical in one or two short sentences. Do not give "
+    "medical instructions; suggest calling for help or emergency services if they are hurt.)"
+)
+_GROUND_NOT_OKAY = re.compile(
+    r"\b(?:not (?:so |too |very |really |that |feeling |doing )*(?:okay|ok|fine|good|alright|all right|well)|"
+    r"help|hurt|hurts|pain|fell|fallen|"
+    r"can t (?:get up|move|breathe)|cannot (?:get up|move|breathe)|stuck|dizzy|bleeding|"
+    r"ambulance|emergency|doctor|9 ?1 ?1)\b"
+)
+_GROUND_OKAY = re.compile(
+    r"\b(?:i m|i am|im|we re|we are|all|it s|its|everything s|everything is|that s|doing)? ?"
+    r"(?:okay|ok|fine|good|alright|all right|all good)\b|"
+    r"\b(?:just|only) (?:resting|relaxing|lying|laying|sleeping|napping|chilling|stretching|"
+    r"sitting|joking|kidding|testing|playing)\b|"
+    r"\b(?:don t|do not|dont) need (?:any )?help\b|\bno help\b|\bgo away\b|\bleave me\b"
+)
+
+
+_GROUND_NO_HELP = re.compile(r"\b(?:(?:don t|do not|dont) (?:need|want)|no need for|need no|no) (?:any )?help\b")
+_GROUND_BARE_YES = re.compile(r"^(?:yes|yeah|yep|yup|uh huh|i am|i think so|kind of|a little|a bit)(?: please)?$")
+
+
+def ground_answer_kind(text: str) -> str:
+    """"help", "okay" or "unclear". Any sign of trouble wins over a reassuring word."""
+    words = _normalized(text)
+    # "I don't need help" must not trip on the word "help".
+    declined = _GROUND_NO_HELP.sub(" ", words)
+    if _GROUND_NOT_OKAY.search(declined) or _GROUND_BARE_YES.match(words):
+        return "help"
+    if _GROUND_OKAY.search(words) or is_dismissal(text):
+        return "okay"
+    return "unclear"
+
+
+def read_ground_arrival(path: Path = GROUND_ARRIVAL_FILE, now=time.time) -> float | None:
+    """When the assistant last said it reached someone, if that was moments ago."""
+    try:
+        arrived = float(json.loads(path.read_text())["arrived_at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return arrived if 0 <= now() - arrived <= GROUND_ARRIVAL_MAX_AGE_S else None
+
+
 # Said mid check-in, the wake phrase means the person is talking to the voice
 # assistant, which hears it too. Answering as well makes two replies to one
 # sentence, and the check-in can only pretend to do the gesture they asked for.
@@ -414,6 +478,58 @@ class SadCheckIn:
             )
             self.status = "idle"
             self.lock.release()
+
+    def converse_ground(self, on_result: Callable[[str], None]) -> None:
+        """Listen to the person the robot just drove up to; report how it ended.
+
+        ``on_result`` gets "okay" (stand down), "help" or "silent" (keep the
+        emergency showing). The arrival question has already been spoken.
+        """
+        if not self.lock.acquire(blocking=False):
+            return
+        result = "silent"
+        try:
+            for attempt in range(2):
+                answer = self.listen()
+                if answer:
+                    break
+                if attempt == 0:
+                    self.speak(GROUND_ASK_AGAIN)
+            if not answer:
+                self.log("[ground-check-in] No answer")
+                self.speak(GROUND_NO_ANSWER_REPLY)
+                return
+            self.log(f"[ground-check-in] Heard: {answer}")
+            kind = ground_answer_kind(answer)
+            if kind == "okay":
+                result = "okay"
+                self.speak(GROUND_OKAY_REPLY)
+                return
+            result = "help"
+            if kind == "help":
+                self.speak(GROUND_HELP_REPLY)
+                return
+            try:
+                self.speak(self.llm_factory().complete(answer + GROUND_CONTEXT_NOTE).text)
+            except Exception as exc:
+                self.log(f"[ground-check-in] LLM unavailable: {type(exc).__name__}: {exc}")
+                self.speak(GROUND_HELP_REPLY)
+        except Exception as exc:
+            self.log(f"[ground-check-in] Conversation failed: {type(exc).__name__}: {exc}")
+        finally:
+            self.status = "idle"
+            self.lock.release()
+            self.log(f"[ground-check-in] Result: {result}")
+            on_result(result)
+
+    def start_ground_async(self, on_result: Callable[[str], None]) -> bool:
+        # No quiet period here: a sad check-in's snooze must not mute an emergency.
+        if self.busy:
+            return False
+        threading.Thread(
+            target=self.converse_ground, args=(on_result,), name="ground-check-in", daemon=True
+        ).start()
+        return True
 
     def start_async(self) -> bool:
         if self.busy or time.monotonic() < self.quiet_until:

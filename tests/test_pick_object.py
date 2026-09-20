@@ -215,7 +215,7 @@ def test_lift_clears_the_box_rim_and_release_spots_stay_inside_the_walls():
     for position, quaternion, _ in candidates:
         assert lift_point[2] - 0.04 < position[2] <= lift_point[2]  # level, or sunk a little
         offset = np.abs(position[:2] - np.asarray(box.center[:2]))
-        assert np.all(offset <= 0.35 / 2 - PLACE_INSIDE_WALL_METRES + 1e-9)
+        assert np.all(offset <= np.array([0.37, 0.35]) / 2 - PLACE_INSIDE_WALL_METRES + 1e-9)
         assert np.linalg.norm(quaternion) == pytest.approx(1.0)
     # later spots move toward the pick, shortening the reach
     nearer = [np.linalg.norm(c[0][:2] - lift_point[:2]) for c in candidates[:3]]
@@ -249,7 +249,8 @@ def test_cans_already_in_the_box_are_not_targets_and_drop_spots_rotate():
     assert inside_footprint(box, (0.50, -0.20))
     assert not inside_footprint(box, (0.40, 0.10))
     turned = TableObject((0.47, -0.22, 0.79), 0.10, 0.40, 0.10, np.pi / 2, 5000)
-    assert inside_footprint(turned, (0.47, -0.05)) and not inside_footprint(turned, (0.62, -0.22))
+    assert inside_footprint(turned, (0.47, -0.08)) and not inside_footprint(turned, (0.62, -0.22))
+    assert not inside_footprint(box, (0.47 + 0.125 + 0.035, -0.22))   # against the outside of a wall
 
     cloud = synthetic_cloud(can=(0.40, 0.10), box=None, table_points=40000)
     everywhere = TableObject((0.40, 0.10, 0.79), 0.10, 0.30, 0.30, 0.0, 5000)
@@ -324,3 +325,151 @@ def test_backup_goes_through_the_teleop_relay_when_the_drive_writer_is_taken():
     with pytest.raises(Exception, match="shared memory"):
         with po.drive_channel(lambda name: name, broken):
             pass
+
+
+def test_a_grip_that_never_stalled_is_not_a_hold():
+    from scripts.pick_object import grip_is_weak
+
+    for amps in (4.29, 4.33, 4.39, 4.67):      # every hold that reached a stall
+        assert not grip_is_weak(amps, 0.90)
+    for amps in (0.61, 0.93):                  # measured: nothing solid in the jaws
+        assert grip_is_weak(amps, 0.90)
+    assert grip_is_weak(2.0, 1.50)             # the bar rises with the squeeze asked for
+
+
+def test_a_can_touching_the_box_wall_is_still_found_and_so_is_the_box():
+    from scripts.pick_object import measure_frame
+    from scripts.pick_replay import synthetic_cloud
+
+    # The can's edge is against the box's wall (box spans y -0.345..-0.095).
+    cloud = synthetic_cloud(can=(0.40, -0.06), box=(0.47, -0.22), table_points=40000,
+                            box_height=0.07)   # a real tray: its rim is below a can's top
+    _, item, box = measure_frame(cloud, report=lambda *_: None)
+    assert item is not None and item.center[:2] == pytest.approx((0.40, -0.06), abs=0.015)
+    assert item.top == pytest.approx(0.12, abs=0.015)
+    assert box is not None and box.center[:2] == pytest.approx((0.47, -0.22), abs=0.03)
+
+
+def test_spacing_backs_away_freely_but_closes_in_only_clear_of_the_table_edge():
+    from scripts.pick_object import spacing_move
+
+    assert spacing_move(0.40, 0.20) == 0.0                       # already comfortable
+    assert spacing_move(0.20, 0.10) == pytest.approx(0.15)       # too close: back up (capped)
+    assert spacing_move(0.30, 0.10) == pytest.approx(0.07)
+    assert spacing_move(0.52, 0.30) == pytest.approx(-0.15)      # too far: close in (capped)
+    assert spacing_move(0.52, 0.19) == pytest.approx(-0.04)      # ...only to the edge floor
+    assert spacing_move(0.52, 0.12) == 0.0                       # edge already close: stay put
+
+
+class FakeIK:
+    """Converges a fifth of the way per call toward the nearest point it can reach."""
+
+    def __init__(self, reach):
+        self.reach, self.calls = reach, 0
+
+    def reset(self, joints):
+        self.joints = np.asarray(joints, dtype=np.float64).copy()
+
+    def solve_with_nominal(self, position, _quaternion, _nominal):
+        self.calls += 1
+        goal = np.asarray(position, dtype=np.float64)
+        goal = goal * min(1.0, self.reach / np.linalg.norm(goal))
+        self.joints[:3] += 0.8 * (goal - self.joints[:3])
+        return list(self.joints)
+
+    def fk(self, joints):
+        return np.asarray(joints[:3], dtype=np.float64), np.array([0.0, 0.0, 0.0, 1.0])
+
+
+def test_ik_stops_solving_once_it_has_settled_and_reports_how_far_short_it_fell():
+    from types import SimpleNamespace
+    from scripts.pick_object import solve_config
+
+    cfg = SimpleNamespace(ik=FakeIK(reach=0.5))
+    seeds = [np.zeros(8), np.zeros(8)]
+    assert solve_config(cfg, [0.3, 0.0, 0.2], [0, 0, 0, 1], seeds, np.zeros(8)) is not None
+    assert cfg.ik.calls < 20                      # one seed, and not all 20 iterations of it
+    assert solve_config.best_error < 0.008
+
+    cfg.ik.calls = 0
+    assert solve_config(cfg, [0.6, 0.0, 0.0], [0, 0, 0, 1], seeds, np.zeros(8)) is None
+    assert cfg.ik.calls < 40
+    assert solve_config.best_error == pytest.approx(0.1, abs=1e-3)
+
+
+def test_ik_waypoints_follow_the_distance_moved():
+    from scripts import table_rest as tr
+    from scripts.pick_object import MIN_SEGMENT_SAMPLES, segment_samples
+
+    assert segment_samples([0.4, 0, 0.9], [0.4, 0, 0.91]) == MIN_SEGMENT_SAMPLES
+    assert segment_samples([0.4, 0, 0.9], [0.52, 0, 0.9]) == 30
+    assert segment_samples([0, 0, 0], [1.0, 0, 0]) == tr.IK_SAMPLES_PER_SEGMENT
+
+
+def test_recorded_frames_are_written_off_the_scan_loop(tmp_path):
+    from scripts.pick_object import record_frame
+
+    cloud = np.random.default_rng(0).random((500, 3)).astype(np.float32)
+    record_frame(tmp_path / "frames" / "frame_000.npz", cloud)
+    record_frame.pending.join()
+    assert np.array_equal(np.load(tmp_path / "frames" / "frame_000.npz")["points"], cloud)
+
+
+def test_a_squeeze_is_only_judged_once_the_jaws_have_stopped():
+    from scripts.pick_object import jaws_stopped
+
+    closing = list(np.linspace(1.0, 0.58, 40))            # still travelling: not yet
+    assert not jaws_stopped(closing)
+    assert jaws_stopped(closing + [0.31] * 12)            # stalled on the can
+    assert not jaws_stopped([0.31] * 5)                   # too few readings to say
+
+
+def test_a_can_seen_only_from_the_front_is_centred_on_its_axis():
+    from scripts.pick_object import centre_on_axis
+    from scripts.tabletop_scene import TableObject, fit_table_plane
+
+    rng = np.random.default_rng(5)
+    axis = np.array([0.38, -0.16])
+    table = np.column_stack((rng.uniform(0.2, 0.9, 20000), rng.uniform(-0.5, 0.5, 20000),
+                             rng.normal(0.75, 0.002, 20000)))
+    # Only the third of the can's surface that faces the camera (at the origin).
+    facing = np.arctan2(-axis[1], -axis[0])
+    angle = facing + rng.uniform(-0.6, 0.6, 600)
+    face = np.column_stack((axis[0] + 0.033 * np.cos(angle), axis[1] + 0.033 * np.sin(angle),
+                            0.75 + rng.uniform(0.0, 0.12, 600)))
+    arm = np.vstack((table, face))
+    plane = fit_table_plane(arm)
+    seen = 0.5 * (face[:, :2].min(axis=0) + face[:, :2].max(axis=0))   # what depth reports
+    assert np.hypot(*(seen - axis)) > 0.015                              # ...is off the axis
+    item = TableObject((seen[0], seen[1], 0.75), 0.12, 0.05, 0.04, 0.0, 600)
+    fixed = centre_on_axis(item, arm, plane)
+    assert fixed.center[:2] == pytest.approx(tuple(axis), abs=0.006)
+    wide = TableObject((seen[0], seen[1], 0.75), 0.12, 0.30, 0.25, 0.0, 600)
+    assert centre_on_axis(wide, arm, plane) is wide                      # boxes are left alone
+
+
+def test_cell_labelling_matches_a_flood_fill_numbered_by_first_cell():
+    from scripts.tabletop_scene import _cell_keys, _label_cells
+
+    rng = np.random.default_rng(1)
+    for fill in (0.15, 0.45, 0.8):       # scattered specks, winding blobs, one big mass
+        cells = np.argwhere(rng.random((30, 40)) < fill) - 12   # negative coordinates too
+        unique = np.unique(_cell_keys(cells))
+        where = {int(key): index for index, key in enumerate(unique)}
+        expected = np.full(len(unique), -1)
+        count = 0
+        for start in range(len(unique)):
+            if expected[start] >= 0:
+                continue
+            expected[start], stack = count, [start]
+            while stack:
+                key = int(unique[stack.pop()])
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        other = where.get(key + (dx << 22) + dy)
+                        if other is not None and expected[other] < 0:
+                            expected[other] = count
+                            stack.append(other)
+            count += 1
+        label, found = _label_cells(unique)
+        assert found == count and np.array_equal(label, expected)

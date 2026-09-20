@@ -796,8 +796,10 @@ def ground_controller(tmp_path, runner, announced):
     return controller
 
 
-def test_ground_check_announces_itself_then_speaks_the_runners_line_on_arrival(tmp_path):
+def test_ground_check_announces_itself_then_speaks_the_runners_line_on_arrival(tmp_path, monkeypatch):
     announced = []
+    arrival = tmp_path / "arrived.json"
+    monkeypatch.setattr(voice_actions.note_ground_arrival, "__defaults__", (arrival,))
     runner = FakeGroundRunner(["state APPROACHING", "say are you okay", "ground approach complete"])
     controller = ground_controller(tmp_path, runner, announced)
 
@@ -806,6 +808,8 @@ def test_ground_check_announces_itself_then_speaks_the_runners_line_on_arrival(t
 
     assert announced == [voice_actions.GROUND_START_MESSAGE, "are you okay"]
     assert not controller._operation_lock.locked()
+    # The vision app is told to start listening for the answer.
+    assert time.time() - json.loads(arrival.read_text())["arrived_at"] < 5
 
 
 def test_ground_check_says_why_it_could_not_move(tmp_path):

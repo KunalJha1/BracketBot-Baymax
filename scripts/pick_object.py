@@ -32,7 +32,13 @@ import threading
 import time
 import traceback
 
-import numpy as np
+# Before numpy loads: OpenBLAS otherwise starts a thread per core, and on the
+# robot (every core already busy with slam, depth and the apps) those threads
+# fight for time. Measured there: a 15000x50 product takes 35 ms threaded,
+# 2.6 ms on one thread. The arrays here are far too small to gain from more.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+import numpy as np  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import table_rest as tr  # noqa: E402
@@ -76,9 +82,14 @@ GRIP_CLOSE_TORQUE_NM = 0.90
 GRIP_OPEN_TORQUE_NM = -0.45
 MAX_GRIP_TORQUE_NM = 1.50
 GRIP_SETTLE_SECONDS = 0.8
+GRIP_STALL_TIMEOUT_SECONDS = 3.0   # the longest a squeeze waits for the jaws to stop
+GRIPPER_OPEN_TOLERANCE_RADIANS = 0.08
+RELEASE_STOP_RADIANS = 0.70        # stop pushing open here; the jaws coast the rest
 CONTACT_CURRENT_AMPS = 0.8
 HOLDING_MIN_RADIANS = 0.10
 FULL_GRIP_RADIANS = 0.31   # jaw angle holding a drinks can across its middle
+GRIPPER_NM_PER_AMP = 0.204  # gripper motor torque constant (see GRIP_CLOSE_TORQUE_NM)
+WEAK_GRIP_FRACTION = 0.5    # under this share of the commanded stall current: not a hold
 PINCH_FRACTION = 0.75      # closed further than this fraction of a full hold: a rim pinch
 MAX_PICK_CYCLES = 3        # scan-and-pick rounds per object before giving up on it
 MAX_OBJECTS = 8            # --all stops after this many, whatever is still in view
@@ -120,7 +131,14 @@ SPACE_SPEED_MPS = 0.10
 SPACE_PULSE_SECONDS = 2.0
 SPACE_MAX_PULSES = 5
 SPACE_MIN_OBJECT_METRES = 0.34   # nearer than this the arm cannot fold to grasp
-SPACE_GOAL_OBJECT_METRES = 0.40
+SPACE_GOAL_OBJECT_METRES = 0.37   # just inside the band: backing further pushes the box out of reach
+SPACE_MAX_OBJECT_METRES = 0.45   # further than this the IK starts refusing grasps
+SPACE_EDGE_FLOOR_METRES = 0.15   # never close in past this distance to the table edge
+SPACE_MAX_STEP_METRES = 0.15     # one pulse never asks for more than this
+SPACE_MIN_PULSE_SECONDS = 0.6    # shorter and a balancing base only rocks in place
+SPACE_FORWARD_SPEED_MPS = 0.06   # closing in is slower than backing away
+CLOSE_IN_STEP_METRES = 0.05      # one step toward the table when the box is out of reach
+CLOSE_IN_MIN_OBJECT_METRES = 0.30  # closing in never brings the target nearer than this
 DRIVE_PERIOD_SECONDS = 0.01
 RAISE_CLEARANCE_METRES = 0.03
 # Hanging rest pose: joints straight, prismatic lift all the way down. The
@@ -147,21 +165,31 @@ LEAN_MODE, BALANCE_MODE = 1, 0
 # shoulder and fail beyond ~0.52 m, where tipping the ~14 cm fingers down
 # costs horizontal reach.
 IK_CONVERGED_METRES = 0.008
+WORKSPACE_LOW_METRES = (0.0, -0.9, 0.40)    # arm-frame box that perception looks at
+WORKSPACE_HIGH_METRES = (1.3, 0.9, 1.65)
+SEGMENT_SAMPLE_METRES = 0.004   # Cartesian spacing of IK waypoints along a segment
+MIN_SEGMENT_SAMPLES = 24
+# Measured: a can 4 cm past the arm's reach missed by 1.8 cm at every one of
+# the 15 pitch/yaw options. Once every pitch has fallen this short in a row,
+# the other yaw fractions (which move the grasp by millimetres) are not tried.
+HOPELESS_MISS_METRES = 0.015
+HOPELESS_OPTIONS = len(GRASP_PITCHES_DEGREES)
+IK_STALLED_STEP = 1e-5          # urdf joint change per solve below which IK has settled
 MAX_REACH_METRES = 0.48      # empirical guide only: the IK decides
 HARD_REACH_METRES = 0.68     # beyond this no lean can help, so do not try
 LEAN_STEP_DEGREES = 2.0
 # Placing into a container: hold the object this far above its rim before
 # opening, so the jaws clear the walls and the drop is short.
 PLACE_CLEAR_RIM_METRES = 0.07    # the object's base passes this far above the rim
-PLACE_MIN_RIM_METRES = 0.03      # the least the object's base may clear the rim by
-PREGRASP_NEAR_BACKOFF_METRES = 0.05  # shorter hover for objects close to the body
 PLACE_SINK_METRES = 0.035        # fallback: let the carry sink this much (< the rim clearance)
-PLACE_INSIDE_WALL_METRES = 0.08  # release at least this far inside the walls
+PLACE_INSIDE_WALL_METRES = 0.065  # release at least this far inside the walls
 SCAN_SPREAD_METRES = 0.05
 STEADY_WINDOW_FRAMES = 4
 STEADY_TILT_DEGREES = 2.5
 STEADY_EDGE_METRES = 0.03
 STEADY_TIMEOUT_SECONDS = 12.0
+CAN_RADIUS_METRES = 0.033      # a standard drinks can
+CAN_MAX_WIDTH_METRES = 0.09    # narrower than this is treated as a can
 OFF_TABLE_METRES = 0.03  # depth blurs the edge; allow this much in front of it
 CARRY_SECONDS = 5.0
 
@@ -348,7 +376,7 @@ def grasp_orientation(pitch_degrees, yaw):
 
 
 def grasp_waypoints(item, side, pitch_degrees, table_height_at, yaw_fraction=1.0,
-                    lift_metres=None, backoff=None):
+                    lift_metres=None):
     """Pregrasp, grasp and lift positions plus the grasp quaternion.
 
     ``yaw_fraction`` scales the approach heading between straight ahead (0)
@@ -370,8 +398,7 @@ def grasp_waypoints(item, side, pitch_degrees, table_height_at, yaw_fraction=1.0
         max(MIN_GRASP_ABOVE_TABLE + tip_drop, item.top - GRASP_BELOW_TOP_METRES),
     ))
     grasp = np.array([cx, cy, table_z + grasp_height]) + GRASP_TIP_PAST_AXIS_METRES * approach
-    backoff = PREGRASP_BACKOFF_METRES if backoff is None else backoff
-    pregrasp = grasp - backoff * approach + np.array([0.0, 0.0, PREGRASP_RAISE_METRES])
+    pregrasp = grasp - PREGRASP_BACKOFF_METRES * approach + np.array([0.0, 0.0, PREGRASP_RAISE_METRES])
     lift = grasp + np.array([0.0, 0.0, LIFT_METRES if lift_metres is None else lift_metres])
     return pregrasp, grasp, lift, quaternion
 
@@ -442,25 +469,36 @@ def solve_config(cfg, position, quaternion, seeds, template, iterations=20):
     solver moves toward a known-good branch instead of snapping near the end.
     """
 
+    solve_config.best_error = float("inf")
     for seed in seeds:
         seed = np.asarray(seed, dtype=np.float64)
         cfg.ik.reset(list(seed[:7]))
-        solution = None
+        solution = previous = None
         for _ in range(iterations):
             solution = cfg.ik.solve_with_nominal(list(position), list(quaternion), list(seed[:7]))
-            if solution is None:
+            if solution is None or len(solution) < 7:
                 break
+            joints = np.asarray(solution[:7], dtype=np.float64)
+            # Each call is ~10 ms on the robot. Once the solver stops moving,
+            # further calls return the same answer, reachable or not.
+            if previous is not None and float(np.max(np.abs(joints - previous))) < IK_STALLED_STEP:
+                break
+            previous = joints
         if solution is None or len(solution) < 7:
             continue
         candidate = np.asarray(template, dtype=np.float64).copy()
         candidate[:7] = np.asarray(solution[:7], dtype=np.float64)
         reached, _ = cfg.ik.fk(list(candidate[:7]))
         error = float(np.linalg.norm(np.asarray(reached) - np.asarray(position)))
+        solve_config.best_error = min(solve_config.best_error, error)
         if error > IK_CONVERGED_METRES:
             continue
         # Seeds are ordered by preference, so the first converged one wins.
         return candidate
     return None
+
+
+solve_config.best_error = float("inf")  # closest any seed of the last call got (m)
 
 
 def lift_seeds(template, drops=(0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30)):
@@ -659,7 +697,7 @@ def lift_for_box(box):
     return LIFT_METRES if box is None else max(LIFT_METRES, box.top + PLACE_CLEAR_RIM_METRES)
 
 
-def place_candidates(box, lift_point, pitch_degrees, yaw, already_placed=0, allow_sink=True):
+def place_candidates(box, lift_point, pitch_degrees, yaw, already_placed=0):
     """Release poses to try, best first: ``(position, quaternion, description)``.
 
     The object is carried level at the lift height (its base already clears
@@ -670,15 +708,16 @@ def place_candidates(box, lift_point, pitch_degrees, yaw, already_placed=0, allo
     """
 
     centre = np.asarray(box.center[:2], dtype=np.float64)
-    toward = np.asarray(lift_point[:2], dtype=np.float64) - centre
-    distance = float(np.linalg.norm(toward))
-    inside = max(0.0, min(box.length, box.width) / 2.0 - PLACE_INSIDE_WALL_METRES)
-    spots = [centre]
-    if distance > 1e-6:
-        spots += [centre + toward / distance * min(inside, distance) * fraction
-                  for fraction in (0.5, 1.0)]
-    # Measured on bracketbot-184: over the box at full lift height, 45-85 deg
-    # solve where a flat 25 deg wrist does not, so steeper ones are tried too.
+    # The reachable part of a box is the part nearest the arm, which can be a
+    # long way from its centre: a 30 cm box centred 0.53 m out still has a
+    # corner 0.42 m out. Work in the box's own axes and keep the release
+    # PLACE_INSIDE_WALL_METRES inside each wall.
+    major = np.array([math.cos(box.yaw), math.sin(box.yaw)])
+    axes = np.column_stack((major, [-major[1], major[0]]))
+    room = np.maximum(0.0, np.array([box.length, box.width]) / 2.0 - PLACE_INSIDE_WALL_METRES)
+    wanted = (np.asarray(lift_point[:2], dtype=np.float64) - centre) @ axes
+    nearest = centre + axes @ np.clip(wanted, -room, room)
+    spots = [centre, (centre + nearest) / 2.0, nearest]
     # Each delivery prefers a different spot, so cans do not land on each other.
     turn = already_placed % len(spots)
     spots = spots[turn:] + spots[:turn]
@@ -688,7 +727,7 @@ def place_candidates(box, lift_point, pitch_degrees, yaw, already_placed=0, allo
     # The lift height is near the top of the arm's travel, where few poses
     # solve; as a fallback the carry may sink a little on the way over. The
     # object's base still clears the rim (PLACE_CLEAR_RIM_METRES is larger).
-    for sink in (0.0, PLACE_SINK_METRES) if allow_sink else (0.0,):
+    for sink in (0.0, PLACE_SINK_METRES):
         for pitch in pitches:
             quaternion, _ = grasp_orientation(pitch, yaw)
             for spot in spots:
@@ -718,6 +757,27 @@ def ready_ik(cfg):
             cfg._pick_ik_ready = True
         except AttributeError:  # a Config that refuses new attributes: init each time
             pass
+
+
+def jaws_stopped(radians_history, window=12, tolerance=0.01):
+    """True once the last ``window`` jaw readings (~0.2 s) span under ``tolerance`` rad."""
+
+    if len(radians_history) < window:
+        return False
+    recent = radians_history[-window:]
+    return max(recent) - min(recent) <= tolerance
+
+
+def grip_is_weak(current_amps, torque_nm):
+    """True when the squeeze never stalled against anything solid.
+
+    Holding a can, the gripper stalls and draws what its torque command asks
+    for: 4.3-4.7 A at 0.90 Nm on every hold that survived a lift. Closing on a
+    can that is sliding away, or on its very edge, it keeps moving and draws
+    under 1 A (measured 0.61 and 0.93 A; the second was lifted and dropped).
+    """
+
+    return current_amps < WEAK_GRIP_FRACTION * torque_nm / GRIPPER_NM_PER_AMP
 
 
 def grip_is_pinched(radians, expected=None):
@@ -761,8 +821,31 @@ def ordered_options(pitches, remembered=None):
     return options
 
 
-def plan_pick(cfg, start, side, item, plane, pitch, yaw_fraction=1.0, lift_metres=None,
-              backoff=None):
+class OutOfReach(RuntimeError):
+    """No IK solution for the grasp itself; ``missed_by`` is the closest any seed got (m)."""
+
+    def __init__(self, message, missed_by):
+        super().__init__(message)
+        self.missed_by = missed_by
+
+
+def segment_samples(start_position, end_position):
+    """IK waypoints for a straight Cartesian move: one per SEGMENT_SAMPLE_METRES."""
+
+    distance = float(np.linalg.norm(np.asarray(end_position, dtype=np.float64)
+                                    - np.asarray(start_position, dtype=np.float64)))
+    return int(min(tr.IK_SAMPLES_PER_SEGMENT,
+                   max(MIN_SEGMENT_SAMPLES, math.ceil(distance / SEGMENT_SAMPLE_METRES))))
+
+
+def segment_log(stage, message):
+    """Per-waypoint IK progress is ~30 lines a plan; keep only what explains a result."""
+
+    if "waypoint=" not in message or "reject=" in message:
+        log(stage, message)
+
+
+def plan_pick(cfg, start, side, item, plane, pitch, yaw_fraction=1.0, lift_metres=None):
     """Full validated motor path plus the indices where each phase ends."""
 
     lateral = SHOULDER_LATERAL_METRES if side == "left" else -SHOULDER_LATERAL_METRES
@@ -776,7 +859,7 @@ def plan_pick(cfg, start, side, item, plane, pitch, yaw_fraction=1.0, lift_metre
     # further from the robot than it does straight ahead.
     raise_observation = dict(observation, near_edge=plane.near_edge_at(lateral))
     pregrasp, grasp, lift, grasp_quaternion = grasp_waypoints(
-        item, side, pitch, plane.height_at, yaw_fraction, lift_metres, backoff)
+        item, side, pitch, plane.height_at, yaw_fraction, lift_metres)
     log(
         "plan",
         f"side={side} raise_edge={raise_observation['near_edge']:.3f} "
@@ -830,7 +913,8 @@ def plan_pick(cfg, start, side, item, plane, pitch, yaw_fraction=1.0, lift_metre
     home_urdf = np.asarray(cfg.q2urdf(home.copy()), dtype=np.float64)
     grasp_config = solve_config(cfg, grasp, grasp_quaternion, lift_seeds(home_urdf), home_urdf)
     if grasp_config is None:
-        raise RuntimeError(f"no converged IK configuration for grasp {fmt(grasp)}")
+        raise OutOfReach(f"no converged IK configuration for grasp {fmt(grasp)}",
+                         solve_config.best_error)
     targets = {}
     for name, point in (("pregrasp", pregrasp), ("lift", lift)):
         targets[name] = solve_config(
@@ -858,16 +942,26 @@ def plan_pick(cfg, start, side, item, plane, pitch, yaw_fraction=1.0, lift_metre
             options.append(other)
         errors = []
         for option in options:
-            attempt = list(path)
-            cfg.ik.reset(list(current_urdf[:7]))
-            try:
-                tr._append_segment(
-                    cfg, nominal, attempt, position, orientation, target, option,
-                    f"{side}:{name}", logger=lambda stage, message: log(stage, message),
-                    endpoint_error_limit=endpoint_limit, clearance_observation=observation,
-                )
-            except RuntimeError as exc:
-                errors.append(str(exc))
+            # One IK solve is ~10 ms on the robot, so sample by distance (a
+            # 12 cm move needs ~30, not 96); a rejected coarse segment gets
+            # the full count before it is given up on.
+            coarse = segment_samples(position, target)
+            for samples in dict.fromkeys((coarse, tr.IK_SAMPLES_PER_SEGMENT)):
+                attempt = list(path)
+                cfg.ik.reset(list(current_urdf[:7]))
+                try:
+                    tr._append_segment(
+                        cfg, nominal, attempt, position, orientation, target, option,
+                        f"{side}:{name}", logger=segment_log,
+                        samples=samples,
+                        endpoint_error_limit=endpoint_limit, clearance_observation=observation,
+                    )
+                except RuntimeError as exc:
+                    failure = str(exc)
+                    continue
+                break
+            else:
+                errors.append(failure)
                 continue
             path = attempt
             break
@@ -912,13 +1006,59 @@ def split_dense(path, marks):
     return phases
 
 
-def inside_footprint(box, xy, margin=0.02):
-    """True when arm-frame ``xy`` lies within the container's rectangle."""
+def centre_on_axis(item, arm, plane):
+    """Move a can-sized object's centre from its visible face to its axis.
+
+    The head camera sees only the side of a can that faces it, so the middle
+    of the points it returns lies in front of the can's axis (the narrower the
+    visible patch, the further in front). The front face itself is measured
+    well: the axis is one can radius behind it, along the ray from the camera.
+    Without this the jaws close on the near rim (measured 0.17-0.24 rad
+    against 0.31 for a hold across the middle).
+    """
+
+    if item.width > CAN_MAX_WIDTH_METRES or item.points == 0:
+        return item
+    height = plane.height_above(arm)
+    near = ((np.hypot(arm[:, 0] - item.center[0], arm[:, 1] - item.center[1]) <= 0.06)
+            & (height > 0.3 * item.top) & (height < item.top + 0.01))
+    if np.count_nonzero(near) < 15:
+        return item
+    ranges = np.hypot(arm[near, 0], arm[near, 1])
+    bearing = float(np.median(np.arctan2(arm[near, 1], arm[near, 0])))
+    axis_range = float(np.quantile(ranges, 0.15)) + CAN_RADIUS_METRES
+    x, y = axis_range * math.cos(bearing), axis_range * math.sin(bearing)
+    if math.hypot(x - item.center[0], y - item.center[1]) > CAN_RADIUS_METRES:
+        return item  # a correction larger than the can itself is not a can
+    return TableObject((float(x), float(y), float(plane.height_at(x, y))), item.top,
+                       item.length, item.width, item.yaw, item.points)
+
+
+def inside_footprint(box, xy, margin=-0.03):
+    """True when arm-frame ``xy`` lies clearly within the container's walls.
+
+    The margin is negative: a can standing against the outside of a wall has
+    its centre a few centimetres from the measured edge, and depth inflates
+    that edge, so only centres well inside count as "in the box".
+    """
 
     major = np.array([math.cos(box.yaw), math.sin(box.yaw)])
     offset = np.asarray(xy, dtype=np.float64) - np.asarray(box.center[:2], dtype=np.float64)
     along, across = float(offset @ major), float(offset @ np.array([-major[1], major[0]]))
     return abs(along) <= box.length / 2 + margin and abs(across) <= box.width / 2 + margin
+
+
+def workspace_points(arm):
+    """Drop depth points nowhere near a table in reach (floor, walls, ceiling).
+
+    Over half of every cloud; each later step costs time per point. The box is
+    wider than the plane fit's own region and tall enough for any object on it.
+    """
+
+    low, high = WORKSPACE_LOW_METRES, WORKSPACE_HIGH_METRES
+    return arm[(arm[:, 0] >= low[0]) & (arm[:, 0] <= high[0])
+               & (arm[:, 1] >= low[1]) & (arm[:, 1] <= high[1])
+               & (arm[:, 2] >= low[2]) & (arm[:, 2] <= high[2])]
 
 
 def measure_frame(camera_points, near=None, virtual=None, box_side=None, report=log,
@@ -930,7 +1070,7 @@ def measure_frame(camera_points, near=None, virtual=None, box_side=None, report=
     Returns ``(plane, item, box)``; ``item`` is None when nothing is graspable.
     """
 
-    arm = points_to_arm(np.asarray(camera_points, dtype=np.float64))
+    arm = workspace_points(points_to_arm(np.asarray(camera_points, dtype=np.float64)))
     plane = fit_table_plane(arm)
     # Only things standing on the table: a chair back in front of the near
     # edge is can-sized in depth and closer to the robot than the real target.
@@ -939,7 +1079,9 @@ def measure_frame(camera_points, near=None, virtual=None, box_side=None, report=
     if filled_box is not None:
         # Cans already delivered sit inside the box: they are done, not targets.
         objects = [found for found in objects
-                   if not inside_footprint(filled_box, found.center[:2])]
+                   if found.length > 0.15  # the container itself, not its contents
+                   or not inside_footprint(filled_box, found.center[:2])]
+    objects = [centre_on_axis(found, arm, plane) for found in objects]
     measure_frame.candidates = graspable_candidates(objects, max_reach=1.0)
     item = select_graspable(objects, near=near, max_reach=1.0)
     if near is not None and (
@@ -1074,10 +1216,34 @@ def wait_for_steady_view(Reader, timeout=STEADY_TIMEOUT_SECONDS):
     return False
 
 
+def record_frame(path, cloud):
+    """Queue one depth cloud for the background writer (see ``--record``)."""
+
+    if record_frame.worker is None or not record_frame.worker.is_alive():
+        def write():
+            while True:
+                target, points = record_frame.pending.get()
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    np.savez(target, points=points)
+                except OSError as exc:
+                    log("scan", f"could not record {target.name}: {exc}")
+                finally:
+                    record_frame.pending.task_done()
+
+        record_frame.worker = threading.Thread(target=write, name="frame-recorder", daemon=True)
+        record_frame.worker.start()
+    record_frame.pending.put((path, cloud))
+
+
+record_frame.pending = queue.Queue()
+record_frame.worker = None
+
+
 def scan(Reader, frames=5, timeout=12.0):
     """Fit the table and select a graspable object on fresh, consistent frames."""
 
-    picks, sightings = [], []
+    picks, sightings, measured = [], [], []
     scan.others = []
     near = scan.near
     misses = 0
@@ -1098,16 +1264,20 @@ def scan(Reader, frames=5, timeout=12.0):
             count = int(reader.data["num_points"])
             cloud = np.asarray(reader.data["points"])[:count]
             if scan.record_dir is not None:
-                scan.record_dir.mkdir(parents=True, exist_ok=True)
-                np.savez_compressed(scan.record_dir / f"frame_{scan.recorded:03d}.npz",
-                                    points=cloud.astype(np.float32))
+                # Compressing a cloud costs as much as measuring it (~0.5 s on
+                # the robot), so a writer thread does it while the scan goes on.
+                record_frame(scan.record_dir / f"frame_{scan.recorded:03d}.npz",
+                             cloud.astype(np.float32))
                 scan.recorded += 1
+            measure_began = time.monotonic()
             try:
                 plane, item, box = measure_frame(cloud, near, scan.virtual, scan.box_side,
                                                  filled_box=scan.filled_box)
             except RuntimeError as exc:
                 log("scan", f"frame rejected: {exc}")
                 continue
+            finally:
+                measured.append(time.monotonic() - measure_began)
             if item is None:
                 # Nothing at the locked spot any more: an automatic lock made
                 # on a bad frame must not blind every later one.
@@ -1127,6 +1297,8 @@ def scan(Reader, frames=5, timeout=12.0):
             centres = np.asarray([found.center[:2] for _, found in picks[-frames:]])
             if float(np.max(np.ptp(centres, axis=0))) <= SCAN_SPREAD_METRES:
                 plane, item = combine_picks(picks[-frames:])
+                log("timing", f"scan measured {len(measured)} frames, "
+                              f"{1000 * sum(measured) / len(measured):.0f} ms each")
                 scan.others = merge_candidates(sightings[-frames:], skip=item)
                 log("scan", f"{len(sightings[-1])} graspable in the last frame, "
                             f"{len(scan.others)} steady besides the target: " + ", ".join(
@@ -1386,25 +1558,43 @@ def measure_edge(Reader, frames=3):
 
 
 def nearest_target_distance(Reader):
-    """Forward distance of the object the pick would choose, or None."""
+    """``(forward distance of the object the pick would choose, table near edge)``.
+
+    Uses the pick's own detection (``measure_frame``), so it sees the same
+    target the pick will, including a can standing against the box. ``None``
+    when there is no table or no target.
+    """
 
     with tr.nonsuppressing(Reader("camera.points", keeptime=False)) as reader:
         deadline = time.monotonic() + 4.0
         while time.monotonic() < deadline:
             if reader.ready():
                 count = int(reader.data["num_points"])
-                arm = points_to_arm(np.asarray(reader.data["points"])[:count].astype(np.float64))
                 try:
-                    plane = fit_table_plane(arm)
+                    plane, item, _ = measure_frame(
+                        np.asarray(reader.data["points"])[:count], scan.near, None,
+                        scan.box_side, report=lambda *_: None, filled_box=scan.filled_box)
                 except RuntimeError:
                     return None
-                objects = find_objects(arm, plane)
-                item = select_graspable(objects, near=scan.near, max_reach=1.0)
-                if item is None and scan.near is not None:
-                    item = object_near(arm, plane, scan.near)
-                return None if item is None else float(item.center[0])
+                return None if item is None else (float(item.center[0]), float(plane.near_edge))
             time.sleep(0.02)
     return None
+
+
+def spacing_move(distance, near_edge):
+    """Signed base move (m, + is backward) that centres the target in reach.
+
+    Zero inside the comfortable band. Backing away is always allowed; closing
+    in is only allowed while the measured table edge stays SPACE_EDGE_FLOOR
+    away after the move, so the base can never be driven into the table.
+    """
+
+    if SPACE_MIN_OBJECT_METRES <= distance <= SPACE_MAX_OBJECT_METRES:
+        return 0.0
+    move = SPACE_GOAL_OBJECT_METRES - distance
+    if move < 0.0:
+        move = -min(-move, max(0.0, near_edge - SPACE_EDGE_FLOOR_METRES))
+    return float(np.clip(move, -SPACE_MAX_STEP_METRES, SPACE_MAX_STEP_METRES))
 
 
 TELEOP_RELAY = ("127.0.0.1", 8765)  # scripts/robot_teleop.py RELAY_PORT
@@ -1442,29 +1632,74 @@ def drive_channel(Type, Writer):
         manager.__exit__(None, None, None)
 
 
-def auto_space(Reader, Type, Writer):
-    """Back the base up until the target sits at a comfortable grasp distance.
+def close_in(Reader, Type, Writer, metres=None):
+    """Drive the base a short step toward the table; returns whether it moved.
 
-    Depth is the ground truth: drive a continuous pulse (a balancing base only
-    wiggles on short ones), stop, let it settle, measure the object again, and
-    repeat. Backward only, so it can never drive into the table.
+    Used when the box is just beyond the arm: the base has wheels, so "out of
+    reach" is only true once it cannot get any closer. Never past
+    SPACE_EDGE_FLOOR_METRES from the measured table edge, and never so far that
+    the target ends up too close for the arm to fold onto.
     """
 
-    distance = nearest_target_distance(Reader)
-    if distance is None:
+    metres = CLOSE_IN_STEP_METRES if metres is None else metres
+    measured = nearest_target_distance(Reader)
+    if measured is None:
+        return False
+    distance, near_edge = measured
+    room = min(near_edge - SPACE_EDGE_FLOOR_METRES, distance - CLOSE_IN_MIN_OBJECT_METRES)
+    step = min(metres, room)
+    if step < 0.02:
+        log("space", f"cannot close in: table edge {near_edge:.3f} m, target {distance:.3f} m")
+        return False
+    seconds = max(SPACE_MIN_PULSE_SECONDS, step / SPACE_FORWARD_SPEED_MPS)
+    log("space", f"closing in {step * 100:.0f} cm so the box comes within reach")
+    with drive_channel(Type, Writer) as twist:
+        try:
+            began = time.monotonic()
+            while time.monotonic() - began < seconds and not cancel_event.is_set():
+                twist(SPACE_FORWARD_SPEED_MPS)
+                time.sleep(DRIVE_PERIOD_SECONDS)
+        finally:
+            for _ in range(60):
+                twist(0.0)
+                time.sleep(DRIVE_PERIOD_SECONDS)
+    time.sleep(1.5)  # let the balancer settle before trusting depth
+    after = nearest_target_distance(Reader)
+    log("space", f"target {distance:.3f} -> "
+                 f"{'lost' if after is None else format(after[0], '.3f')} m")
+    return True
+
+
+def auto_space(Reader, Type, Writer):
+    """Shift the base until the target sits at a comfortable grasp distance.
+
+    Depth is the ground truth: drive one continuous pulse sized to the error
+    (a balancing base only wiggles on very short ones), stop, let it settle,
+    measure the object again, and repeat. It backs away freely; it closes in
+    only within what the measured table edge allows (see ``spacing_move``).
+    """
+
+    measured = nearest_target_distance(Reader)
+    if measured is None:
         log("space", "no target visible; skipping spacing")
         return
-    log("space", f"target is {distance:.3f} m ahead (want >= {SPACE_MIN_OBJECT_METRES:.2f})")
-    if distance >= SPACE_MIN_OBJECT_METRES:
+    distance, near_edge = measured
+    log("space", f"target is {distance:.3f} m ahead, table edge {near_edge:.3f} m "
+                 f"(want {SPACE_MIN_OBJECT_METRES:.2f}-{SPACE_MAX_OBJECT_METRES:.2f})")
+    if not spacing_move(distance, near_edge):
         return
     with drive_channel(Type, Writer) as twist:
         try:
             for pulse in range(1, SPACE_MAX_PULSES + 1):
-                if cancel_event.is_set() or distance >= SPACE_GOAL_OBJECT_METRES:
+                move = spacing_move(distance, near_edge)
+                if cancel_event.is_set() or abs(move) < 0.02:
                     break
+                speed = -SPACE_SPEED_MPS if move > 0 else SPACE_FORWARD_SPEED_MPS
+                seconds = float(np.clip(abs(move) / abs(speed), SPACE_MIN_PULSE_SECONDS,
+                                        SPACE_PULSE_SECONDS))
                 began = time.monotonic()
-                while time.monotonic() - began < SPACE_PULSE_SECONDS and not cancel_event.is_set():
-                    twist(-SPACE_SPEED_MPS)
+                while time.monotonic() - began < seconds and not cancel_event.is_set():
+                    twist(speed)
                     time.sleep(DRIVE_PERIOD_SECONDS)
                 for _ in range(60):
                     twist(0.0)
@@ -1474,8 +1709,9 @@ def auto_space(Reader, Type, Writer):
                 if measured is None:
                     log("space", "lost sight of the target; stopping the spacing")
                     break
-                log("space", f"pulse {pulse}: target {distance:.3f} -> {measured:.3f} m")
-                distance = measured
+                log("space", f"pulse {pulse}: {'back' if move > 0 else 'forward'} "
+                             f"{seconds:.1f}s, target {distance:.3f} -> {measured[0]:.3f} m")
+                distance, near_edge = measured
         finally:
             for _ in range(30):
                 twist(0.0)
@@ -1639,6 +1875,13 @@ def execute(plan_only=True, pid_file=None, stop_at=None, adjust=False,
                     log("complete", f"delivered {placed} object(s)")
                     return result
                 continue
+            if result == "NO_DROP":
+                moved = close_in(Reader, Type, Writer)
+                if not moved:
+                    speak("out-of-reach")
+                    log("complete", f"the box is out of the arm's reach and the base cannot get "
+                                    f"closer; delivered {placed}")
+                    return "PLACED" if placed else None
             failures += 1
             if failures >= MAX_PICK_CYCLES:
                 log("complete", f"gave up after {failures} rounds on one object; "
@@ -1713,26 +1956,15 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
 
     def plan_can(target, begin):
         """Validated phases for one object, from ``begin`` (rest pose or ready pose)."""
-        failures = []
+        failures, hopeless = [], 0
         pitches = (NEAR_GRASP_PITCHES_DEGREES if object_reach(target) < NEAR_OBJECT_METRES
                    else GRASP_PITCHES_DEGREES)
         # The object rarely moves between tests, so the option that validated
         # last time is tried first instead of re-rejecting the ones before it.
-        # A can close to the body needs a steep wrist, which puts the hover
-        # point and the lift near the top of the arm's travel. Fall back to a
-        # shorter hover and then a lower lift (still above the rim) before
-        # giving up on it.
-        lifts = [lift_metres]
-        if place_box is not None and lift_metres > place_box.top + PLACE_MIN_RIM_METRES + 0.005:
-            lifts.append(place_box.top + PLACE_MIN_RIM_METRES)
-        shapes = [(lifts[0], PREGRASP_BACKOFF_METRES), (lifts[0], PREGRASP_NEAR_BACKOFF_METRES)]
-        shapes += [(lift, PREGRASP_NEAR_BACKOFF_METRES) for lift in lifts[1:]]
-        options = ordered_options(pitches, pick_with.accepted.get(side))
-        for lift_height, backoff, pitch, yaw_fraction in (
-                (lift, back, *option) for lift, back in shapes for option in options):
+        for pitch, yaw_fraction in ordered_options(pitches, pick_with.accepted.get(side)):
             try:
                 path, marks, observation = plan_pick(cfg, begin, side, target, plane, pitch,
-                                                     yaw_fraction, lift_height, backoff)
+                                                     yaw_fraction, lift_metres)
                 phases = split_dense(path, marks)
                 for name, phase in phases.items():
                     tr.validate_calibration(phase, low, high, f"{side}:{name}", logger=log)
@@ -1743,19 +1975,22 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
                 failures.append(f"pitch {pitch:.0f} yaw x{yaw_fraction:.1f}: {exc}")
                 log("plan", f"pitch={pitch:.0f}deg yaw_fraction={yaw_fraction:.1f} "
                             f"rejected: {exc}")
+                far = isinstance(exc, OutOfReach) and exc.missed_by > HOPELESS_MISS_METRES
+                hopeless = hopeless + 1 if far else 0
+                if hopeless >= HOPELESS_OPTIONS:
+                    # Every pitch fell short: reach, which no yaw fraction fixes.
+                    log("plan", f"{hopeless} options in a row fell {exc.missed_by * 100:.0f} cm "
+                                "short of the grasp: out of reach, not trying the rest")
+                    break
                 continue
             raised = phases.pop("raise")
             phases["approach"] = np.vstack([raised, phases["approach"][1:]])
             pick_with.accepted[side] = (pitch, yaw_fraction)
             _, grasp, lift, quaternion = grasp_waypoints(
-                target, side, pitch, plane.height_at, yaw_fraction, lift_height, backoff)
-            if (lift_height, backoff) != shapes[0]:
-                log("plan", f"used a {backoff * 100:.0f} cm hover and a "
-                            f"{lift_height * 100:.0f} cm lift to reach this one")
+                target, side, pitch, plane.height_at, yaw_fraction, lift_metres)
             return {"item": target, "phases": phases, "ready_index": len(raised) - 1,
                     "observation": observation, "pitch": pitch, "yaw_fraction": yaw_fraction,
                     "grasp": grasp, "lift": lift, "quaternion": quaternion,
-                    "lift_height": lift_height,
                     "options_tried": len(failures) + 1}
         raise RuntimeError("no validated grasp: " + " | ".join(failures))
 
@@ -1765,10 +2000,8 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
         yaw = job["yaw_fraction"] * math.atan2(target_item.center[1] - shoulder_y,
                                                target_item.center[0])
         reasons = []
-        # Sinking on the way over is only safe from the full-height lift.
-        full_lift = job["lift_height"] >= lift_metres - 1e-6
         for target, quaternion, description in place_candidates(
-                place_box, job["lift"], job["pitch"], yaw, already_placed, full_lift):
+                place_box, job["lift"], job["pitch"], yaw, already_placed):
             try:
                 carry = plan_place(cfg, side, phases["lift"][-1], target, quaternion,
                                    job["observation"], low, high)
@@ -1783,6 +2016,12 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
         return None
 
     def plan_extras(job, already_placed):
+        if "carry" in job:  # the first object's drop was checked before moving
+            return plan_retries(job)
+        job["carry"] = None if place_box is None else plan_carry(job, already_placed)
+        return plan_retries(job)
+
+    def plan_retries(job):
         # Runs while the arm is busy streaming poses, which never touches
         # cfg.ik; the motion loop collects the result before it needs it, so
         # the solver is never shared between threads.
@@ -1806,10 +2045,7 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
                     continue
                 attempts.append((offset, descend, lifted))
             log("retry", f"{len(attempts)} validated attempts planned while moving")
-        carry = None
-        if place_box is not None and attempts:
-            carry = plan_carry(job, already_placed)
-        job["attempts"], job["carry"] = attempts, carry
+        job["attempts"] = attempts
         return job
 
     TIMING.mark("scan done, planning")
@@ -1822,6 +2058,13 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
     log("plan", f"accepted pitch={first['pitch']:.0f}deg "
                 f"yaw_fraction={first['yaw_fraction']:.1f} phases=" + ",".join(
                     f"{name}:{len(phase)}" for name, phase in phases.items()))
+    if place_box is not None and not plan_only:
+        # Check the drop before touching anything: picking a can up only to
+        # put it back cost ~50 s a round when the box was just out of reach.
+        first["carry"] = plan_carry(first, pick_with.placed)
+        if first["carry"] is None:
+            return "NO_DROP"
+
     # The ready pose: arm raised above the table edge, gripper open. Every
     # later object is planned from here, so the arm never goes back to rest
     # between objects.
@@ -1865,7 +2108,10 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
             if cancel_event.is_set() or jobs.abandon.is_set():
                 break
             try:
-                jobs.put(plan_extras(plan_can(other, ready), pick_with.placed + number))
+                queued = plan_extras(plan_can(other, ready), pick_with.placed + number)
+                if place_box is not None and queued["carry"] is None:
+                    raise RuntimeError("no reachable drop from its lift")
+                jobs.put(queued)
             except RuntimeError as exc:
                 jobs.skipped += 1
                 log("plan", f"skipping ({other.center[0]:.2f}, {other.center[1]:.2f}): "
@@ -1914,7 +2160,7 @@ def _run_motion(outcome, Config, Reader, Type, Writer, cfg, side, start, job, st
         torque = stack.enter_context(tr.nonsuppressing(
             Writer(f"arm_{side}.torque", Type("arm_torque"), keeptime=False)))
 
-        grip = {"tau": 0.0, "force_mode": False, "radians": 0.0}
+        grip = {"tau": 0.0, "force_mode": False, "radians": 0.0, "current": 0.0}
 
         def command(pose):
             with control.buf() as frame:
@@ -1941,16 +2187,25 @@ def _run_motion(outcome, Config, Reader, Type, Writer, cfg, side, start, job, st
             grip["tau"] = newtons_metre
             set_torque(True, force_grip=True)
             began = time.monotonic()
-            while time.monotonic() - began < GRIP_SETTLE_SECONDS:
+            # Squeeze until the jaws have actually stopped. A fixed wait read
+            # the current while they were still travelling (a moving motor
+            # draws little), which made a good grip look like no grip at all.
+            history = []
+            while time.monotonic() - began < GRIP_STALL_TIMEOUT_SECONDS:
                 command(pose)
                 time.sleep(tr.TICK_SECONDS)
+                if state.ready():
+                    history.append(gripper_radians(cfg, np.asarray(state.data["pos"])))
+                if (time.monotonic() - began >= GRIP_SETTLE_SECONDS
+                        and jaws_stopped(history)):
+                    break
             data = tr.fresh(state)
             radians = gripper_radians(cfg, np.asarray(data["pos"]))
             current = abs(float(np.asarray(data["current"])[GRIPPER_INDEX]))
             holding = radians >= HOLDING_MIN_RADIANS
             log("grip", f"force={newtons_metre:.2f}Nm gripper={radians:.3f}rad "
                         f"current={current:.2f}A holding={holding}")
-            grip["radians"] = radians
+            grip["radians"], grip["current"] = radians, current
             return holding
 
         def release(pose):
@@ -1964,12 +2219,43 @@ def _run_motion(outcome, Config, Reader, Type, Writer, cfg, side, start, job, st
                     # Stop pushing once the jaws are open: a blind 0.8 s shove
                     # can drive the joint past its range (see GRIPPER_VALID_RADIANS).
                     if state.ready() and gripper_radians(
-                            cfg, np.asarray(state.data["pos"])) >= GRIPPER_OPEN_RADIANS:
+                            cfg, np.asarray(state.data["pos"])) >= RELEASE_STOP_RADIANS:
                         break
             grip["tau"] = 0.0
             set_torque(True, force_grip=False)
             command(pose)
             time.sleep(0.4)
+
+        def open_jaws(pose):
+            """Bring the jaws to the open angle with torque, whatever they read now.
+
+            The gripper's position mode barely moves it (measured: a 2 s close
+            ramp left it at 1.005 rad), so the opening ramp in the approach
+            cannot be trusted. Too wide and the squeeze runs out of time before
+            it reaches the can; too narrow and the can does not fit.
+            """
+            radians = gripper_radians(cfg, np.asarray(tr.fresh(state)["pos"]))
+            error = radians - GRIPPER_OPEN_RADIANS
+            # Only ever open further. Too wide is harmless (the squeeze waits
+            # for a stall); closing them here overshot to 0.41 rad, barely a
+            # can's width, and the hand then pinched or missed.
+            if error >= -GRIPPER_OPEN_TOLERANCE_RADIANS:
+                return
+            grip["tau"] = GRIP_OPEN_TORQUE_NM
+            set_torque(True, force_grip=True)
+            began = time.monotonic()
+            while time.monotonic() - began < 1.5:
+                command(pose)
+                time.sleep(tr.TICK_SECONDS)
+                if state.ready():
+                    now = gripper_radians(cfg, np.asarray(state.data["pos"]))
+                    if (now - GRIPPER_OPEN_RADIANS) * error <= 0:
+                        break
+            grip["tau"] = 0.0
+            set_torque(True, force_grip=False)
+            command(pose)
+            log("grip", f"jaws were at {radians:.3f} rad; set to "
+                        f"{gripper_radians(cfg, np.asarray(tr.fresh(state)['pos'])):.3f} rad")
 
         def play(poses, ceiling, cancellable, stage, pace=None):
             # ``pace`` names the MIN_PHASE_SECONDS floor; short moves then run
@@ -2050,6 +2336,7 @@ def _run_motion(outcome, Config, Reader, Type, Writer, cfg, side, start, job, st
                         if cancel_event.is_set():
                             break
                         log("retry", f"attempt={number}/{len(attempts)} nudge_cm={fmt(offset * 100)}")
+                        open_jaws(descend[0].copy())
                         stage = "descend"
                         reached = play(descend, DESCEND_SECONDS, True, "descend", pace="descend")
                         if cancel_event.is_set():
@@ -2059,7 +2346,13 @@ def _run_motion(outcome, Config, Reader, Type, Writer, cfg, side, start, job, st
                         if holding:
                             holding = hold_with_force(descend[-1].copy(), grip_torque)
                         result = "PICKED" if holding else "MISS"
-                        if holding and number < len(attempts) and grip_is_pinched(
+                        if holding and grip_is_weak(grip["current"], grip_torque):
+                            # The jaws never stalled: there is nothing solid in
+                            # them. Lifting now is how a can gets dropped.
+                            log("grip", f"weak ({grip['current']:.2f} A, no stall); "
+                                        "re-gripping, not lifting")
+                            holding, result = False, "WEAK"
+                        elif holding and number < len(attempts) and grip_is_pinched(
                                 grip["radians"], LAST_GOOD_GRIP_RADIANS.get(side)):
                             # Only the rim is caught. Lifting this drops the can and
                             # knocks it over; let go where it stands and re-grip.
@@ -2305,6 +2598,7 @@ def run_job(parser, args):
     finally:
         if speak.thread is not None:
             speak.thread.join(timeout=8.0)  # let the last line finish before the job ends
+        record_frame.pending.join()  # 'pull' right after the job must find every frame
         if args.pid_file:
             try:
                 args.pid_file.unlink()

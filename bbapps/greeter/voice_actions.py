@@ -115,6 +115,7 @@ GROUND_START_MESSAGE = (
     "Say hey BracketBot, stop, to cancel."
 )
 GROUND_ALERT_FILE = Path("/tmp/bracketbot_ground_alert.json")
+GROUND_ARRIVAL_FILE = Path("/tmp/bracketbot_ground_arrived.json")  # check_in.GROUND_ARRIVAL_FILE
 GROUND_ALERT_MAX_AGE_S = 1.0
 GROUND_REARM_CLEAR_S = 10.0
 # A short chirp while driving behind someone, so they can tell it is still there
@@ -377,6 +378,16 @@ class FollowRunner:
                 process.wait()
             reader.join(timeout=1.0)
         return lines
+
+
+def note_ground_arrival(path: Path = GROUND_ARRIVAL_FILE) -> None:
+    """Tell the vision app the arrival question was just asked (see check_in.py)."""
+    try:
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"arrived_at": time.time()}))
+        os.replace(temporary, path)
+    except OSError as exc:
+        print(f"[voice-action] could not signal ground arrival: {exc}", flush=True)
 
 
 class GroundAlertWatcher:
@@ -708,6 +719,8 @@ class VoiceActionController:
         if cue is None or self.speaker is None or self.speaker_cfg is None:
             return
         filename, delay = cue
+        # A high fist bump raises the lift first, so the recording starts later.
+        delay += getattr(self.gesture_controller, "lead_delay_seconds", 0.0)
 
         def run():
             if self._cancel.wait(delay) or not self.gesture_controller.running():
@@ -955,6 +968,9 @@ class VoiceActionController:
                 said = [line.removeprefix("say ") for line in lines if line.startswith("say ")]
                 if said:
                     self.announce(said[-1])
+                    # The vision app holds the microphone side of unprompted
+                    # conversations: it now listens for "I'm okay" or "help".
+                    note_ground_arrival()
                 elif last.startswith("refusing to start: "):
                     reason = last.removeprefix("refusing to start: ")
                     self.announce(f"I can't come over right now: {reason}.")
