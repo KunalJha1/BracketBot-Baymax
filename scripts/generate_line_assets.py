@@ -29,9 +29,16 @@ from local_tts_server import (  # noqa: E402
     DEFAULT_PITCH,
     DEFAULT_RATE,
     DEFAULT_VOICE,
+    SUPPORTED_SAMPLE_RATES,
     SpeechCache,
     synthesize_wav,
 )
+
+
+# The dashboard plays these through ``robot_effect.py``, which refuses a file
+# whose rate is not the speaker's own, so they are rendered at the deployed
+# speaker rate rather than the TTS bridge's higher default.
+SPEAKER_SAMPLE_RATE = 16000
 
 
 MANIFEST = LINES_DIR / "manifest.json"
@@ -44,6 +51,11 @@ def main() -> int:
     parser.add_argument(
         "--pitch", type=int, choices=range(-10, 11), default=DEFAULT_PITCH,
         metavar="{-10..10}",
+    )
+    parser.add_argument(
+        "--sample-rate", type=int, default=SPEAKER_SAMPLE_RATE,
+        choices=SUPPORTED_SAMPLE_RATES,
+        help=f"output rate; must match the robot speaker (default: {SPEAKER_SAMPLE_RATE})",
     )
     parser.add_argument(
         "--cache-dir", default=str(DEFAULT_CACHE_DIR),
@@ -72,25 +84,31 @@ def main() -> int:
             and recorded.get("voice") == args.voice
             and recorded.get("rate") == args.rate
             and recorded.get("pitch") == args.pitch
+            and recorded.get("sample_rate") == args.sample_rate
         )
         if unchanged:
             audio = line.path.read_bytes()
             status = "kept"
         else:
             try:
-                audio = synthesize_wav(line.text, args.voice, args.rate, args.pitch)
+                audio = synthesize_wav(
+                    line.text, args.voice, args.rate, args.pitch, args.sample_rate
+                )
             except (OSError, subprocess.SubprocessError) as exc:
                 print(f"{line.id}: synthesis failed: {exc}", file=sys.stderr)
                 return 1
             line.path.write_bytes(audio)
             status = "rendered"
-        cache.put(line.text, args.voice, args.rate, args.pitch, audio)
+        cache.put(
+            line.text, args.voice, args.rate, args.pitch, args.sample_rate, audio
+        )
         entries[line.id] = {
             "file": line.filename,
             "text": line.text,
             "voice": args.voice,
             "rate": args.rate,
             "pitch": args.pitch,
+            "sample_rate": args.sample_rate,
             "bytes": len(audio),
             "sha256": hashlib.sha256(audio).hexdigest(),
         }

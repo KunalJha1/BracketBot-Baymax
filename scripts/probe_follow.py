@@ -125,7 +125,7 @@ def main():
     if points and "points" in points:
         n = int(np.asarray(points["num_points"]).item())
         report["cloud"] = cloud_summary(points["points"][:n], args.person_left)
-        np.savez_compressed(args.out / "points.npz", points=points["points"][:n], mask=points["mask"][:n])
+        np.savez_compressed(args.out / "points.npz", points=points["points"][:n], idx_2d=points["idx_2d"][:n])
     depth = frames.get("camera.depth")
     if depth and "depth" in depth:
         np.save(args.out / "camera_depth.npy", depth["depth"])

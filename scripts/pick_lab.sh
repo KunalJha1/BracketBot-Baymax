@@ -6,6 +6,8 @@
 #   scripts/pick_lab.sh pick  [args]      # real pick with auto-retry
 #   scripts/pick_lab.sh hover [args]      # go to the hover pose and come back
 #   scripts/pick_lab.sh rest              # lower both arms to their rest pose
+#   scripts/pick_lab.sh lean on|off       # plug-and-play lean mode (default 4 deg)
+#   scripts/pick_lab.sh space             # back up until the target is graspable
 #   scripts/pick_lab.sh fix-gripper SIDE  # drive a gripper back into range
 #   scripts/pick_lab.sh stop              # safe-stop a running attempt
 #   scripts/pick_lab.sh log               # full log of the last attempt
@@ -126,6 +128,15 @@ print('box   :', 'none' if box is None else '%.3f, %.3f  rim %.3f  %.2fx%.2f m' 
   hover) run_detached "$H" --execute --stop-at pregrasp "$@" ;;
   rest)  ssh "$H" "cd $REMOTE && $PY -u pick_object.py --rest 2>&1 | grep -E '$FILTER'" ;;
   fix-gripper) ssh "$H" "cd $REMOTE && $PY -u pick_object.py --fix-gripper $* 2>&1 | grep -E '$FILTER'" ;;
+  lean)
+    # Plug-and-play lean: "lean on [deg]" holds it in the background, "lean off" restores balance.
+    case "${1:-status}" in
+      on)  scp -q "${SSH_OPTS[@]}" "$ROOT/scripts/robot_base_mode.py" "$H:$REMOTE/" && \
+           SSH "$H" "cd $REMOTE; [ -f lean.pid ] && kill -INT \$(cat lean.pid) 2>/dev/null; sleep 0.3; \
+             setsid nohup $PY robot_base_mode.py --angle ${2:-4} --pid-file $REMOTE/lean.pid > lean.log 2>&1 < /dev/null & sleep 1.2; tail -2 $REMOTE/lean.log" ;;
+      off) SSH "$H" "cd $REMOTE; if [ -f lean.pid ]; then kill -INT \$(cat lean.pid) && sleep 0.8 && tail -2 lean.log; else echo 'lean is not held by pick_lab'; fi" ;;
+      *)   SSH "$H" "cd $REMOTE; if [ -f lean.pid ] && kill -0 \$(cat lean.pid) 2>/dev/null; then echo 'lean ON'; tail -1 lean.log; else echo 'lean OFF'; fi" ;;
+    esac ;;
   stop)  ssh "$H" "if [ -f $REMOTE/pick.pid ]; then kill -INT \$(cat $REMOTE/pick.pid) && echo 'safe stop requested'; else echo 'nothing running'; fi" ;;
   log)   ssh "$H" "cat $REMOTE/pick.log" ;;
   *) echo "unknown command: $CMD"; sed -n '2,20p' "$0"; exit 2 ;;

@@ -11,12 +11,13 @@ or replace qualified care.
 
 ## What works today
 
-- An accessible local dashboard with a typed allowlist of 19 primitive actions:
+- An accessible local dashboard with a typed allowlist of 23 primitive actions:
   eight gestures, adaptive two-arm table positioning, five light expressions,
-  three sound cues, and two original instrumental music cues.
-- Seven deterministic multi-step routines, including **welcome**,
-  **double wave**, **calm moment**, and **dance party**, built from the same
-  primitives future assistant plans will use.
+  three sound cues, two original instrumental music cues, and four
+  pre-rendered spoken lines.
+- Nine deterministic multi-step routines, including **welcome**,
+  **introduce Baymax**, **calm moment**, **dance party**, and **sign off**,
+  built from the same primitives future assistant plans will use.
 - A stateful 4° **Lean / Balance** toggle with continuous BBOS refresh,
   upright gating, disconnect fallback, and explicit balance restoration.
 - **Place arms on table** uses fresh depth points to detect a broad reachable
@@ -127,7 +128,8 @@ Controls:
 | Lights | Calm, ready, thinking, celebrate, off | `5`–`9` |
 | Sounds | Processing, birthday, battery reminder | `P`, `B`, `L` |
 | Music | Original calm and upbeat instrumentals | `M`, `U` |
-| Routines | Welcome, thinking, celebrate, goodbye, double wave, calm moment, dance party | `W`, `T`, `C`, `G`, `V`, `K`, `X` |
+| Lines | Introduce yourself, what I can do, comfort, farewell | `I`, `A`, `E`, `Y` |
+| Routines | Welcome, thinking, celebrate, goodbye, double wave, calm moment, dance party, introduce Baymax, sign off | `W`, `T`, `C`, `G`, `V`, `K`, `X`, `H`, `J` |
 | Base mode | Toggle 4° lean / balance | `Z` |
 | Positioning | Detect table and place both arms | `R` |
 | Follow | Follow the person standing in front; distance slider | `F` |
@@ -138,6 +140,39 @@ to `/tmp` on the active robot. It does not require this repository to be cloned
 on the robot. `ActionSpec` is the common primitive schema, while `RoutineSpec`
 stores ordered action IDs; no browser request or future model output can supply
 an arbitrary command.
+
+## Pre-rendered spoken lines
+
+The **Lines** family is the handful of sentences BracketBot says the same way
+every time: its self-introduction, a short tour of what it can really do, an
+offer of company, and a farewell. Each one is written in
+[`scripts/canned_lines.py`](scripts/canned_lines.py), rendered once to a
+speaker-ready WAV in `assets/lines/`, and played through the ordinary
+allowlisted sound path.
+
+That means a scripted sentence costs one WAV playback instead of a wake word, a
+transcription, a model round trip, and live speech synthesis — and it still
+works with no network, no OpenRouter key, and no microphone. A line declares
+only the `speaker` channel, so it can never move the robot, and it remains
+available while a manipulation policy owns the arms.
+
+Render or re-render them on a machine with the macOS speech engine:
+
+```sh
+python3 scripts/generate_line_assets.py
+python3 scripts/generate_line_assets.py --force --voice "Reed (English (US))"
+```
+
+The renderer records each line's exact text, voice, rate, pitch, sample rate,
+and checksum in `assets/lines/manifest.json`, and a test fails if a line's text
+is edited without re-rendering its audio. Lines are rendered at the robot
+speaker's mono 16 kHz format because `robot_effect.py` refuses anything else.
+Until a line is rendered, its dashboard button safely rejects with the command
+to run. The same audio is written into the TTS bridge's cache, so a live spoken
+reply with identical text is free too.
+
+**Introduce Baymax** (`H`) and **Sign off** (`J`) are the two routines built
+from these lines: a light, the spoken line, then a wave.
 
 ## Follow mode (person following)
 
@@ -371,6 +406,7 @@ BAYMAX_VOICE_BACKEND=local
 # Optional: defaults shown below
 BAYMAX_RESPONSE_CACHE_PATH=~/.cache/bracketbot/question-responses.sqlite3
 BAYMAX_RESPONSE_CACHE_TTL_DAYS=30
+BAYMAX_RESPONSE_CACHE_SEED=assets/response-cache-seed.json
 ```
 
 Install the key-free local speech runtime once on the robot:
@@ -422,6 +458,20 @@ BAYMAX_TTS_VOICE="Reed (English (US))" BAYMAX_TTS_RATE=170 BAYMAX_TTS_PITCH=0 \
 `BAYMAX_TTS_PITCH` accepts `-10` through `10`; use `0` for the voice's natural
 pitch.
 
+Synthesized speech is cached on disk under
+`~/.cache/bracketbot/tts`, keyed by the exact text and voice settings, so a
+sentence the robot has already spoken is served from the cache instead of
+running `say` and `afconvert` again. Render a rehearsed script into the cache
+before a demo, or disable caching entirely:
+
+```sh
+python3 scripts/local_tts_server.py --prewarm my-lines.txt
+python3 scripts/local_tts_server.py --no-cache
+```
+
+A cache miss still synthesizes normally, and any cache failure degrades to
+plain synthesis rather than breaking speech.
+
 When the Gemini voice backend is selected, `BAYMAX_GEMINI_VOICE` defaults to
 the upbeat `Puck` voice.
 
@@ -429,10 +479,27 @@ the upbeat `Puck` voice.
 well suited to the assistant's short, simple spoken queries. Browserbase is
 optional for ordinary conversation but required for live web answers. Without
 an OpenRouter key, allowlisted gestures still work and questions receive a
-short configuration message unless an exact answer is already cached. Stable,
+short configuration message unless a matching answer is already cached. Stable,
 standalone questions are cached for 30 days; current-information questions,
 context-dependent follow-ups, and any response that uses a tool are never
-cached. Set `BAYMAX_RESPONSE_CACHE_PATH=off` to disable the cache. Run all
+cached. Set `BAYMAX_RESPONSE_CACHE_PATH=off` to disable the cache.
+
+The cache key is the question with the wake phrase, politeness, filler, and
+contractions removed, so “what can you do”, “Hey BracketBot, what can you
+do?”, and “so, um, what can you do for me?” are one entry. On a miss it makes
+one conservative near-match attempt within the same model and system prompt:
+two questions must use the same words in some order, or share at least 85% of
+their topic words, and a question with a single topic word is only ever
+matched exactly. “Are you a nurse?” therefore never returns the answer to “Are
+you a doctor?”. Both tiers are caching only; the model still receives the
+person's real words.
+
+Prepared answers in [`assets/response-cache-seed.json`](assets/response-cache-seed.json)
+are warmed into the cache at startup, so the common questions are answered with
+no network at all. Seeding never overwrites an answer the robot actually gave.
+Point `BAYMAX_RESPONSE_CACHE_SEED` at another file, or set it to `off` to skip
+seeding. Every seeded entry is hand-written and reviewed; the assistant never
+edits that file. Run all
 gesture tests in simulation/dry-run first and keep a person beside the physical
 e-stop when voice motion is enabled.
 
@@ -517,6 +584,10 @@ trusting any of it.
 | `scripts/table_rest.py` | Depth-adaptive, bounded two-arm tabletop positioning |
 | `scripts/greeter_action.py` | Dashboard bridge for robot-local camera gestures |
 | `scripts/generate_music_assets.py` | Deterministically regenerates original PCM music cues |
+| `scripts/canned_lines.py` | The robot's fixed spoken lines, shared by the dashboard and renderer |
+| `scripts/generate_line_assets.py` | Renders each fixed line to a speaker-ready WAV and warms the TTS cache |
+| `assets/lines/` | Rendered spoken lines and the manifest recording their exact text |
+| `assets/response-cache-seed.json` | Hand-written prepared answers warmed into the question cache |
 | `scripts/generate_salute_asset.py` | Rebuilds the salute from the recorded wave lift |
 | `scripts/check_yolo_runtime.py` | Camera-free YOLO runtime compatibility smoke test |
 | `scripts/handshake_test.py` | Focused standalone handshake runner |

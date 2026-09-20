@@ -10,13 +10,16 @@ from local_tts_server import SpeechCache, TtsServer, prewarm
 
 
 WAV = b"RIFF....WAVEfake"
+RATE = 48000
+
+
+def make_server(cache, voice="Test Voice", rate=172, pitch=0, sample_rate=RATE):
+    return TtsServer(("127.0.0.1", 0), voice, rate, pitch, cache, sample_rate)
 
 
 @pytest.fixture
 def server(tmp_path):
-    instance = TtsServer(
-        ("127.0.0.1", 0), "Test Voice", 178, 4, SpeechCache(tmp_path / "tts")
-    )
+    instance = make_server(SpeechCache(tmp_path / "tts"))
     try:
         yield instance
     finally:
@@ -26,8 +29,8 @@ def server(tmp_path):
 def fake_synthesis(server, audio=WAV):
     calls = []
 
-    def synthesize(text):
-        calls.append(text)
+    def synthesize(text, sample_rate=None):
+        calls.append((text, sample_rate or server.sample_rate))
         return audio
 
     server.synthesize = synthesize
@@ -41,16 +44,14 @@ def test_repeated_line_is_synthesized_once(server):
     assert server.speak("Hello there.") == WAV
     assert server.speak("Something else.") == WAV
 
-    assert calls == ["Hello there.", "Something else."]
+    assert calls == [("Hello there.", RATE), ("Something else.", RATE)]
 
 
 def test_cache_survives_a_new_server_over_the_same_directory(server, tmp_path):
     fake_synthesis(server)
     server.speak("Hello there.")
 
-    replacement = TtsServer(
-        ("127.0.0.1", 0), "Test Voice", 178, 4, SpeechCache(tmp_path / "tts")
-    )
+    replacement = make_server(SpeechCache(tmp_path / "tts"))
     try:
         calls = fake_synthesis(replacement)
         assert replacement.speak("Hello there.") == WAV
@@ -61,22 +62,33 @@ def test_cache_survives_a_new_server_over_the_same_directory(server, tmp_path):
 
 def test_voice_settings_are_part_of_the_cache_key(tmp_path):
     cache = SpeechCache(tmp_path / "tts")
-    cache.put("Hello there.", "Test Voice", 178, 4, WAV)
+    cache.put("Hello there.", "Test Voice", 172, 0, RATE, WAV)
 
-    assert cache.get("Hello there.", "Test Voice", 178, 4) == WAV
-    assert cache.get("Hello there.", "Other Voice", 178, 4) is None
-    assert cache.get("Hello there.", "Test Voice", 150, 4) is None
-    assert cache.get("Hello there.", "Test Voice", 178, 0) is None
-    assert cache.get("Hello again.", "Test Voice", 178, 4) is None
+    assert cache.get("Hello there.", "Test Voice", 172, 0, RATE) == WAV
+    assert cache.get("Hello there.", "Other Voice", 172, 0, RATE) is None
+    assert cache.get("Hello there.", "Test Voice", 150, 0, RATE) is None
+    assert cache.get("Hello there.", "Test Voice", 172, 4, RATE) is None
+    assert cache.get("Hello there.", "Test Voice", 172, 0, 16000) is None
+    assert cache.get("Hello again.", "Test Voice", 172, 0, RATE) is None
+
+
+def test_each_requested_rate_is_cached_separately(server):
+    calls = fake_synthesis(server)
+
+    server.speak("Hello there.", 16000)
+    server.speak("Hello there.", 16000)
+    server.speak("Hello there.", 48000)
+
+    assert calls == [("Hello there.", 16000), ("Hello there.", 48000)]
 
 
 def test_disabled_cache_always_synthesizes(tmp_path):
-    instance = TtsServer(("127.0.0.1", 0), "Test Voice", 178, 4, SpeechCache(None))
+    instance = make_server(SpeechCache(None))
     try:
         calls = fake_synthesis(instance)
         instance.speak("Hello there.")
         instance.speak("Hello there.")
-        assert calls == ["Hello there.", "Hello there."]
+        assert calls == [("Hello there.", RATE), ("Hello there.", RATE)]
         assert instance.cache.enabled is False
     finally:
         instance.server_close()
@@ -88,8 +100,8 @@ def test_an_unwritable_cache_directory_degrades_instead_of_failing(tmp_path):
     cache = SpeechCache(blocker / "tts")
 
     assert cache.enabled is False
-    cache.put("Hello there.", "Test Voice", 178, 4, WAV)
-    assert cache.get("Hello there.", "Test Voice", 178, 4) is None
+    cache.put("Hello there.", "Test Voice", 172, 0, RATE, WAV)
+    assert cache.get("Hello there.", "Test Voice", 172, 0, RATE) is None
 
 
 def test_prewarm_renders_new_lines_only(server, tmp_path):
@@ -112,14 +124,14 @@ def test_prewarm_renders_new_lines_only(server, tmp_path):
     )
 
     assert prewarm(server, script) == 2
-    assert calls == ["A fresh line.", "Another fresh line."]
+    assert calls == [("A fresh line.", RATE), ("Another fresh line.", RATE)]
     assert prewarm(server, script) == 0
 
 
 def test_prewarm_keeps_going_after_one_failure(server, tmp_path):
     attempted = []
 
-    def synthesize(text):
+    def synthesize(text, sample_rate=None):
         attempted.append(text)
         if "bad" in text:
             raise OSError("engine unavailable")
@@ -131,4 +143,4 @@ def test_prewarm_keeps_going_after_one_failure(server, tmp_path):
 
     assert prewarm(server, script) == 1
     assert attempted == ["a bad line", "a good line"]
-    assert server.cache.get("a good line", "Test Voice", 178, 4) == WAV
+    assert server.cache.get("a good line", "Test Voice", 172, 0, RATE) == WAV

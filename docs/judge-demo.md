@@ -38,6 +38,21 @@ exit.” A zero exit status is the completion evidence accepted by the
 orchestrator. The global Stop uses the same cancellation path without running
 the finale.
 
+## The network-free path
+
+Every spoken beat that the presenter controls should be a pre-rendered line
+from the **Lines** family, not a live model answer. **Introduce Baymax** (`H`)
+plays the self-introduction and waves; **What I can do** (`A`) gives the
+capability tour; **Sign off** (`J`) closes. These need no network, no wake
+word, and no transcription, and they stay available while the packing policy
+owns the arms.
+
+Keep the live conversation for the one unscripted judge question. Warm
+`assets/response-cache-seed.json` (loaded automatically at greeter startup) so
+the common questions are answered from the cache, and rehearse one spoken
+question beforehand so Whisper and the TTS cache are warm. If the link is
+down, say so plainly and use a line; do not retry a dead model call on stage.
+
 ## Rehearse without the robot
 
 ```sh

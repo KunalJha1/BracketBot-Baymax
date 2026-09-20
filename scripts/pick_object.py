@@ -50,6 +50,9 @@ SHOULDER_LATERAL_METRES = 0.0975
 # Flatter approaches first: they let the jaws reach the thick middle of an
 # object without the fingertips dropping into the table clearance band.
 GRASP_PITCHES_DEGREES = (25.0, 35.0, 45.0, 20.0, 55.0)
+# Close to the body the arm cannot stretch out flat, so come down steeply.
+NEAR_OBJECT_METRES = 0.34
+NEAR_GRASP_PITCHES_DEGREES = (60.0, 75.0, 45.0, 85.0, 35.0)
 GRASP_HEIGHT_FRACTION = 0.5      # aim for the object's mid-height (its thickest part)
 GRASP_BELOW_TOP_METRES = 0.02    # but never above this much below the top
 MIN_GRASP_ABOVE_TABLE = 0.065
@@ -99,9 +102,11 @@ RAISE_BEHIND_EDGE_METRES = 0.07   # climb this far behind the measured edge
 MIN_TABLE_EDGE_METRES = 0.13      # closer than this the raise is cramped
 # Automatic spacing: back away from the table in short verified steps.
 SPACE_TARGET_EDGE_METRES = 0.17
-SPACE_SPEED_MPS = 0.05
-SPACE_STEP_METRES = 0.05
-SPACE_MAX_TOTAL_METRES = 0.22
+SPACE_SPEED_MPS = 0.10
+SPACE_PULSE_SECONDS = 2.0
+SPACE_MAX_PULSES = 5
+SPACE_MIN_OBJECT_METRES = 0.34   # nearer than this the arm cannot fold to grasp
+SPACE_GOAL_OBJECT_METRES = 0.40
 DRIVE_PERIOD_SECONDS = 0.01
 RAISE_CLEARANCE_METRES = 0.03
 # Hanging rest pose: joints straight, prismatic lift all the way down. The
@@ -864,19 +869,43 @@ def measure_edge(Reader, frames=3):
     return float(np.median(edges))
 
 
-def auto_space(Reader, Type, Writer):
-    """Back the base away from the table until the edge is comfortably clear.
+def nearest_target_distance(Reader):
+    """Forward distance of the object the pick would choose, or None."""
 
-    Open-loop bursts of at most SPACE_STEP_METRES at SPACE_SPEED_MPS, each
-    followed by a fresh depth measurement. Aborts if the edge does not move
-    the expected way (wrong sign, blocked wheel, someone pushing the robot).
+    with tr.nonsuppressing(Reader("camera.points", keeptime=False)) as reader:
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
+            if reader.ready():
+                count = int(reader.data["num_points"])
+                arm = points_to_arm(np.asarray(reader.data["points"])[:count].astype(np.float64))
+                try:
+                    plane = fit_table_plane(arm)
+                except RuntimeError:
+                    return None
+                objects = find_objects(arm, plane)
+                item = select_graspable(objects, near=scan.near, max_reach=1.0)
+                if item is None and scan.near is not None:
+                    item = object_near(arm, plane, scan.near)
+                return None if item is None else float(item.center[0])
+            time.sleep(0.02)
+    return None
+
+
+def auto_space(Reader, Type, Writer):
+    """Back the base up until the target sits at a comfortable grasp distance.
+
+    Depth is the ground truth: drive a continuous pulse (a balancing base only
+    wiggles on short ones), stop, let it settle, measure the object again, and
+    repeat. Backward only, so it can never drive into the table.
     """
 
-    edge = measure_edge(Reader)
-    log("space", f"table edge {edge:.3f} m from the arm base (target {SPACE_TARGET_EDGE_METRES:.2f})")
-    if edge >= MIN_TABLE_EDGE_METRES:
-        return edge
-    travelled = 0.0
+    distance = nearest_target_distance(Reader)
+    if distance is None:
+        log("space", "no target visible; skipping spacing")
+        return
+    log("space", f"target is {distance:.3f} m ahead (want >= {SPACE_MIN_OBJECT_METRES:.2f})")
+    if distance >= SPACE_MIN_OBJECT_METRES:
+        return
     with tr.nonsuppressing(Writer("drive.ctrl", Type("drive_ctrl"), keeptime=False)) as drive:
 
         def twist(v):
@@ -884,32 +913,28 @@ def auto_space(Reader, Type, Writer):
                 frame["twist"] = np.array([v, 0.0], dtype=np.float32)
 
         try:
-            while edge < SPACE_TARGET_EDGE_METRES and travelled < SPACE_MAX_TOTAL_METRES:
-                if cancel_event.is_set():
-                    raise RuntimeError("spacing cancelled")
-                step = min(SPACE_STEP_METRES, SPACE_TARGET_EDGE_METRES - edge + 0.01)
-                seconds = step / SPACE_SPEED_MPS
+            for pulse in range(1, SPACE_MAX_PULSES + 1):
+                if cancel_event.is_set() or distance >= SPACE_GOAL_OBJECT_METRES:
+                    break
                 began = time.monotonic()
-                while time.monotonic() - began < seconds and not cancel_event.is_set():
+                while time.monotonic() - began < SPACE_PULSE_SECONDS and not cancel_event.is_set():
                     twist(-SPACE_SPEED_MPS)
                     time.sleep(DRIVE_PERIOD_SECONDS)
-                for _ in range(40):
+                for _ in range(60):
                     twist(0.0)
                     time.sleep(DRIVE_PERIOD_SECONDS)
-                time.sleep(1.2)  # let the balancer settle before trusting depth
-                measured = measure_edge(Reader)
-                travelled += step
-                log("space", f"backed {step * 100:.0f} cm; edge {edge:.3f} -> {measured:.3f} m")
-                if measured < edge - 0.015:
-                    raise RuntimeError(
-                        f"edge got closer while backing up ({edge:.3f} -> {measured:.3f} m); stopping")
-                edge = measured
+                time.sleep(1.5)  # let the balancer settle before trusting depth
+                measured = nearest_target_distance(Reader)
+                if measured is None:
+                    log("space", "lost sight of the target; stopping the spacing")
+                    break
+                log("space", f"pulse {pulse}: target {distance:.3f} -> {measured:.3f} m")
+                distance = measured
         finally:
             for _ in range(30):
                 twist(0.0)
                 time.sleep(DRIVE_PERIOD_SECONDS)
-    log("space", f"spacing done: edge {edge:.3f} m after {travelled * 100:.0f} cm")
-    return edge
+    log("space", f"spacing done: target at {distance:.3f} m")
 
 
 def rest_arms(Config, Reader, Type, Writer, sides=("left", "right")):
@@ -994,8 +1019,16 @@ def execute(plan_only=True, pid_file=None, stop_at=None, adjust=False,
     if abs(rpy[0]) >= UPRIGHT_DEGREES or abs(rpy[1]) >= UPRIGHT_DEGREES:
         raise RuntimeError("robot is not upright")
 
-    if auto_space_enabled:
-        auto_space(Reader, Type, Writer)
+    def space_if_needed():
+        # Must run with lean already held: entering lean mode shifts the base
+        # forward ~17 cm (measured), which would undo any spacing done before.
+        if not auto_space_enabled:
+            return
+        try:
+            auto_space(Reader, Type, Writer)
+        except RuntimeError as exc:
+            log("space", f"continuing without spacing: {exc}")
+
     # A balancing base rocks as the arm extends, which moves the hand away from
     # where depth measured the object. Lean mode braces the base, so hold it for
     # the whole pick (both successful early picks ran with lean on; the miss
@@ -1013,10 +1046,12 @@ def execute(plan_only=True, pid_file=None, stop_at=None, adjust=False,
             external = False
     if not allow_lean or external:
         log("lean", "lean already held elsewhere" if external else "lean disabled by flag")
+        space_if_needed()
         plane, item = scan(Reader)
         return pick_with(bbos, Config, Reader, Type, Writer, plane, item,
                          plan_only, stop_at, adjust, grip_torque, box_for(plane, item, place))
     with LeanHold(Type, Writer, STABILITY_LEAN_DEGREES):
+        space_if_needed()
         plane, item = scan(Reader)
         return pick_with(bbos, Config, Reader, Type, Writer, plane, item,
                          plan_only, stop_at, adjust, grip_torque, box_for(plane, item, place))
@@ -1069,7 +1104,9 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
         raise RuntimeError("no usable arm: " + "; ".join(rejected))
 
     failures = []
-    options = [(pitch, fraction) for fraction in (1.0, 0.5, 0.0) for pitch in GRASP_PITCHES_DEGREES]
+    pitches = (NEAR_GRASP_PITCHES_DEGREES if object_reach(item) < NEAR_OBJECT_METRES
+               else GRASP_PITCHES_DEGREES)
+    options = [(pitch, fraction) for fraction in (1.0, 0.5, 0.0) for pitch in pitches]
     for pitch, yaw_fraction in options:
         try:
             path, marks, observation = plan_pick(cfg, start, side, item, plane, pitch, yaw_fraction)
