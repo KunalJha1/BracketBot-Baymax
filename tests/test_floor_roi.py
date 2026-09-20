@@ -1,4 +1,5 @@
 from pathlib import Path
+import math
 import sys
 
 import cv2
@@ -79,3 +80,36 @@ def test_view_focus_follows_whichever_view_sees_the_low_person():
     assert next_view_focus("floor", 0, {2: "alert"}, [], []) == ("floor", 1)
     assert next_view_focus("floor", 1, {2: "alert"}, [], []) == ("rect", 0)
     assert next_view_focus("rect", 1, {2: "alert"}, [], []) == ("floor", 0)
+
+
+def base_to_raw_pixels(points_base):
+    """Base [right, forward, up] -> raw left-eye pixels (the inverse of floor_roi's map)."""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
+    import fall_check_frame as fcf
+
+    camera = (np.linalg.inv(fcf.R_CAM_TO_BASE) @ (np.asarray(points_base).T - fcf.CAM_ORIGIN[:, None])).T
+    camera = camera[camera[:, 2] > 0.05]
+    normalised = (camera[:, :2] / camera[:, 2:3]).reshape(-1, 1, 2).astype(np.float64)
+    return cv2.fisheye.distortPoints(normalised, RAW_CAMERA_MATRIX, RAW_FISHEYE_D).reshape(-1, 2)
+
+
+def lying_body(forward, heading_deg, side=0.0):
+    along = np.array([math.sin(math.radians(heading_deg)), math.cos(math.radians(heading_deg)), 0.0])
+    across = np.array([along[1], -along[0], 0.0])
+    origin = np.array([side, forward, 0.12])
+    layout = [(1.40, -0.2), (1.40, 0.2), (0.90, -0.15), (0.90, 0.15),
+              (0.45, -0.15), (0.45, 0.15), (0.0, -0.13), (0.0, 0.13), (1.62, 0.0)]
+    return np.array([origin + a * along + c * across for a, c in layout])
+
+
+@pytest.mark.parametrize("forward", [1.5, 2.0, 2.5, 3.0, 4.0, 5.0])
+@pytest.mark.parametrize("heading", [0, 45, 90])
+def test_the_floor_crop_actually_covers_a_body_lying_ahead(forward, heading):
+    """The crop is only worth its cost if people on the floor land inside it."""
+    x0, y0, x1, y1 = FLOOR_ROI
+    pixels = base_to_raw_pixels(lying_body(forward, heading))
+    inside = ((pixels[:, 0] >= x0) & (pixels[:, 0] <= x1)
+              & (pixels[:, 1] >= y0) & (pixels[:, 1] <= y1)).mean()
+
+    assert inside == 1.0, f"only {inside:.0%} of joints inside the crop"
