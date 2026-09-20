@@ -1,11 +1,14 @@
 import json
+from http.server import ThreadingHTTPServer
 import threading
 import time
 from types import SimpleNamespace
+import urllib.request
 import wave
 
 import pytest
 
+from scripts import robot_dashboard
 from scripts.robot_dashboard import (
     ACTION_LIST,
     ACTIONS,
@@ -20,6 +23,8 @@ from scripts.robot_dashboard import (
     FOLLOW_RUNNER,
     FOLLOW_STATUS_PREFIX,
     GREETER_ACTION_RUNNER,
+    Handler,
+    NETWORK_PROFILES,
     REMOTE_TABLE_REST_RUNNER,
     REMOTE_GREETER_ACTION_RUNNER,
     ROUTINE_LIST,
@@ -39,7 +44,10 @@ from scripts.robot_dashboard import (
     missing_action_asset,
     parse_hosts,
     remote_python_command,
+    save_voice_upload,
+    ssh_options_for_host,
     start_source_reloader,
+    voice_uploads,
 )
 
 
@@ -204,6 +212,93 @@ def test_public_catalog_hides_execution_details():
 
     sound_public = ACTIONS["music-calm"].public()
     assert sound_public["preview_url"] == "/api/audio/music-calm"
+
+
+def test_voice_upload_is_saved_and_exposed_in_status(tmp_path, monkeypatch):
+    monkeypatch.setattr(robot_dashboard, "VOICE_UPLOAD_DIR", tmp_path)
+    payload = b"\x00\x00\x00\x18ftypisom" + b"voice-data"
+
+    first = save_voice_upload("Warm Greeting.mp4", payload)
+    second = save_voice_upload("Warm Greeting.mp4", payload)
+
+    assert first == {
+        "id": "warm-greeting",
+        "label": "Warm Greeting",
+        "description": "Uploaded voice clip",
+        "preview_url": "/api/voice/warm-greeting",
+    }
+    assert second["id"] == "warm-greeting-2"
+    assert (tmp_path / "warm-greeting.mp4").read_bytes() == payload
+    assert [clip["id"] for clip in voice_uploads()] == [
+        "warm-greeting",
+        "warm-greeting-2",
+    ]
+    state = RobotController(("not-used",), simulate=True).state.snapshot()
+    assert state["voice_uploads"] == voice_uploads()
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload", "message"),
+    [
+        ("clip.wav", b"\x00\x00\x00\x18ftypisom", "Choose an MP4 file"),
+        ("clip.mp4", b"", "The uploaded file is empty"),
+        ("clip.mp4", b"not-an-mp4", "The uploaded file is not a valid MP4 container"),
+    ],
+)
+def test_voice_upload_rejects_invalid_files(tmp_path, monkeypatch, filename, payload, message):
+    monkeypatch.setattr(robot_dashboard, "VOICE_UPLOAD_DIR", tmp_path)
+
+    with pytest.raises(ValueError, match=message):
+        save_voice_upload(filename, payload)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_dashboard_page_has_persistent_voice_upload_controls():
+    assert "/api/voice/upload" in PAGE
+    assert "Upload MP4" in PAGE
+    assert "button.dataset.voice=item.id" in PAGE
+
+
+def test_dashboard_page_has_allowlisted_network_controls():
+    assert "/api/network" in PAGE
+    assert "button.dataset.network=item.id" in PAGE
+    assert "Robot network" in PAGE
+
+
+def test_voice_upload_and_playback_http_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setattr(robot_dashboard, "VOICE_UPLOAD_DIR", tmp_path)
+    old_controller = Handler.controller
+    Handler.controller = RobotController(("not-used",), simulate=True)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    payload = b"\x00\x00\x00\x18ftypisom" + b"spoken-hello"
+    try:
+        request = urllib.request.Request(
+            f"{base}/api/voice/upload",
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "video/mp4", "X-File-Name": "Spoken%20Hello.mp4"},
+        )
+        with urllib.request.urlopen(request) as response:
+            result = json.load(response)
+            assert response.status == 201
+        assert result["clip"]["id"] == "spoken-hello"
+
+        with urllib.request.urlopen(f"{base}/api/status") as response:
+            status = json.load(response)
+        assert status["voice_uploads"] == result["voice_uploads"]
+
+        with urllib.request.urlopen(f"{base}/api/voice/spoken-hello") as response:
+            assert response.headers["Content-Type"] == "video/mp4"
+            assert response.read() == payload
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=2)
+        Handler.controller = old_controller
 
 
 def test_generated_music_is_robot_speaker_compatible_pcm():
@@ -463,6 +558,61 @@ def test_default_routes_try_mdns_wifi_before_usb():
     assert SSH_PROBE_OPTIONS[-4:] == (
         "-o", "ControlMaster=no", "-o", "ControlPath=none"
     )
+
+
+def test_mdns_route_bypasses_stale_ssh_hostname_config():
+    options = ssh_options_for_host("bracketbot@bracketbot-184.local", probe=True)
+
+    assert options[-2:] == ("-o", "HostName=bracketbot-184.local")
+    assert ssh_options_for_host("bot")[-2:] != ("-o", "HostName=bot")
+
+
+def test_network_profiles_only_expose_the_two_saved_choices():
+    assert set(NETWORK_PROFILES) == {"hotspot", "bib-wifi"}
+    assert NETWORK_PROFILES["hotspot"]["connection"] == "LG-SmartRug"
+    assert NETWORK_PROFILES["bib-wifi"]["connection"] == "bb-wifi"
+
+
+def test_simulation_network_switch_updates_status():
+    controller = RobotController(("not-used",), simulate=True)
+
+    assert controller.switch_network("bib-wifi") == (True, "Switched to bib-wifi")
+    state = controller.state.snapshot()
+    assert state["network_profile"] == "bib-wifi"
+    assert state["network_transition"] is False
+    assert controller.switch_network("unknown") == (False, "Unknown Wi-Fi profile")
+
+
+def test_network_switch_is_blocked_during_lean():
+    controller = RobotController(("not-used",), simulate=True)
+    controller.state.lean_enabled = True
+
+    ok, message = controller.switch_network("bib-wifi")
+
+    assert ok is False
+    assert "balance mode" in message
+
+
+def test_network_switch_dispatches_saved_profile_without_exposing_password(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="network-switch-started\n", stderr="")
+
+    monkeypatch.setattr("scripts.robot_dashboard.subprocess.run", fake_run)
+    controller = RobotController(("bot",))
+    controller.state.host = "bot"
+
+    controller._switch_network("bot", "bib-wifi", NETWORK_PROFILES["bib-wifi"])
+
+    command = calls[0]
+    assert command[0] == "ssh"
+    assert "nmcli connection up bb-wifi ifname wlan_usb" in command[-1]
+    assert "password" not in command[-1].lower()
+    state = controller.state.snapshot()
+    assert state["connected"] is False
+    assert state["network_profile"] == "bib-wifi"
 
 
 def test_action_bundle_contains_each_runner_and_asset_once():
