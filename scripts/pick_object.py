@@ -172,6 +172,48 @@ def log(stage, message):
     print(f"[pick][{stage}] {message}", flush=True)
 
 
+class Deferred:
+    """Run ``work`` on a thread now; ``result()`` waits for it and re-raises."""
+
+    def __init__(self, work):
+        self._work, self._value, self._error = work, None, None
+        self._thread = threading.Thread(target=self._run, name="deferred-plan", daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            self._value = self._work()
+        except BaseException as exc:  # noqa: BLE001 - handed to the caller of result()
+            self._error = exc
+
+    def wait(self):
+        self._thread.join()
+
+    def result(self):
+        self._thread.join()
+        if self._error is not None:
+            raise self._error
+        return self._value
+
+
+class Timing:
+    """Seconds since the job began, logged at each startup milestone."""
+
+    def __init__(self):
+        self.began = self.last = time.monotonic()
+
+    def restart(self):
+        self.began = self.last = time.monotonic()
+
+    def mark(self, label):
+        now = time.monotonic()
+        log("timing", f"{label}: +{now - self.last:.2f}s (t={now - self.began:.2f}s)")
+        self.last = now
+
+
+TIMING = Timing()
+
+
 def fmt(values):
     return tr.format_values(values)
 
@@ -828,6 +870,11 @@ def measure_frame(camera_points, near=None, virtual=None, box_side=None, report=
         f"width={0 if item is None else item.width:.3f}",
     )
     box = None if item is None else find_box(arm, plane, objects, exclude=item, side_of=box_side)
+    if (box is not None and filled_box is None and virtual is None
+            and inside_footprint(box, item.center[:2])):
+        # The chosen object is sitting inside the container: it has been
+        # delivered already. Look again with the container's contents hidden.
+        return measure_frame(camera_points, near, virtual, box_side, report, filled_box=box)
     return plane, item, box
 
 
@@ -1439,15 +1486,17 @@ def execute(plan_only=True, pid_file=None, stop_at=None, adjust=False,
                     return "PLACED" if placed else None
                 raise
             box = kept_box or box_for(plane, item, place)
+            others = [other for other in scan.others
+                      if box is None or not inside_footprint(box, other.center[:2])]
             result = pick_with(bbos, Config, Reader, Type, Writer, plane, item,
-                               plan_only, stop_at, adjust, grip_torque, box)
+                               plan_only, stop_at, adjust, grip_torque, box,
+                               others if everything and box is not None else ())
+            placed = pick_with.placed
             if plan_only or stop_at or cancel_event.is_set():
                 return result
             if result == "PLACED" or (result == "PICKED" and box is None):
                 failures = 0
                 if result == "PLACED":
-                    placed += 1
-                    pick_with.placed = placed
                     kept_box = box  # it stops looking empty once something is in it
                 if not (everything and result == "PLACED") or placed >= MAX_OBJECTS:
                     log("complete", f"delivered {placed} object(s)")
@@ -1618,12 +1667,6 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
     log("plan", f"accepted pitch={first['pitch']:.0f}deg "
                 f"yaw_fraction={first['yaw_fraction']:.1f} phases=" + ",".join(
                     f"{name}:{len(phase)}" for name, phase in phases.items()))
-    if plan_only:
-        if place_box is not None:
-            plan_carry(first, pick_with.placed)  # report, without moving, if the box is reachable
-        log("complete", "plan-only succeeded; no arm writers were opened")
-        return None
-
     # The ready pose: arm raised above the table edge, gripper open. Every
     # later object is planned from here, so the arm never goes back to rest
     # between objects.
@@ -1638,12 +1681,29 @@ def pick_with(bbos, Config, Reader, Type, Writer, plane, item,
     if chain:
         log("plan", f"{len(chain)} more object(s) queued for the {side} arm: "
                     + ", ".join(f"({c.center[0]:.2f}, {c.center[1]:.2f})" for c in chain))
+    if plan_only:
+        if place_box is not None:
+            plan_carry(first, pick_with.placed)  # report, without moving, if the box is reachable
+        for number, other in enumerate(chain, start=1):
+            try:
+                queued = plan_can(other, ready)
+                log("plan", f"queued object {number} at ({other.center[0]:.2f}, "
+                            f"{other.center[1]:.2f}) validated from the ready pose: "
+                            f"pitch={queued['pitch']:.0f}deg")
+                if place_box is not None:
+                    plan_carry(queued, pick_with.placed + number)
+            except RuntimeError as exc:
+                log("plan", f"queued object {number} would be skipped: {exc}")
+        log("complete", "plan-only succeeded; no arm writers were opened")
+        return None
+
     jobs = queue.Queue()
+    jobs.abandon = threading.Event()  # set by the motion loop when it stops early
 
     def plan_everything():
         jobs.put(plan_extras(first, pick_with.placed))
         for number, other in enumerate(chain, start=1):
-            if cancel_event.is_set():
+            if cancel_event.is_set() or jobs.abandon.is_set():
                 break
             try:
                 jobs.put(plan_extras(plan_can(other, ready), pick_with.placed + number))
@@ -1667,15 +1727,21 @@ def run_motion(*args, **kwargs):
 
     # The motion routine leaves through several early returns (and a finally
     # that retraces the arm), so the result travels in a dict, not a return.
-    outcome = {"result": None}
+    outcome = {"result": None, "placed": 0}
     _run_motion(outcome, *args, **kwargs)
-    log("complete", f"pick attempt finished: {outcome['result']}")
-    return outcome["result"]
+    log("complete", f"pick attempt finished: {outcome['result']} "
+                    f"({outcome['placed']} delivered this run)")
+    return outcome["result"], outcome["placed"]
 
 
-def _run_motion(outcome, Config, Reader, Type, Writer, cfg, side, start, phases, stop_at=None,
-                grip_torque=GRIP_CLOSE_TORQUE_NM, extras=None):
+def _run_motion(outcome, Config, Reader, Type, Writer, cfg, side, start, job, stop_at=None,
+                grip_torque=GRIP_CLOSE_TORQUE_NM, jobs=None, planner=None):
+    """``job`` is the first object's plan; ``jobs`` then delivers it again with
+    its retries and carry attached, followed by one job per further object
+    (planned in the background from the ready pose) and finally ``None``."""
+
     attempts = carry = None
+    phases, ready_index = job["phases"], job["ready_index"]
     with ExitStack() as stack:
         state = stack.enter_context(tr.nonsuppressing(Reader(f"arm_{side}.state", keeptime=False)))
         control = stack.enter_context(tr.nonsuppressing(
@@ -1803,8 +1869,9 @@ def _run_motion(outcome, Config, Reader, Type, Writer, cfg, side, start, phases,
             set_torque(True)
             enabled = True
             reached = play(approach, APPROACH_SECONDS, True, "approach", pace="approach")
-            if extras is not None:
-                attempts, carry = extras.result()
+            if jobs is not None:
+                job = jobs.get()
+                attempts, carry = job["attempts"], job["carry"]
             if cancel_event.is_set():
                 return
             if stop_at == "pregrasp":
@@ -1812,80 +1879,107 @@ def _run_motion(outcome, Config, Reader, Type, Writer, cfg, side, start, phases,
                 cancel_event.wait(HOLD_SECONDS)
                 return
             if attempts:
-                for number, (offset, descend, lift) in enumerate(attempts, start=1):
-                    if cancel_event.is_set():
-                        break
-                    log("retry", f"attempt={number}/{len(attempts)} nudge_cm={fmt(offset * 100)}")
-                    stage = "descend"
-                    reached = play(descend, DESCEND_SECONDS, True, "descend", pace="descend")
-                    if cancel_event.is_set():
-                        break
-                    stage = "grip"
-                    holding, hold_turns = close_until_contact(descend[-1].copy())
-                    if holding:
-                        holding = hold_with_force(descend[-1].copy(), grip_torque)
-                    result = "PICKED" if holding else "MISS"
-                    if holding and number < len(attempts) and grip_is_pinched(
-                            grip["radians"], LAST_GOOD_GRIP_RADIANS.get(side)):
-                        # Only the rim is caught. Lifting this drops the can and
-                        # knocks it over; let go where it stands and re-grip.
-                        log("grip", f"pinched ({grip['radians']:.3f} rad); re-gripping, not lifting")
-                        holding, result = False, "PINCHED"
-                    if holding:
-                        stage = "lift"
-                        reached = play(with_gripper(lift, hold_turns), LIFT_SECONDS, False,
-                                       "lift", pace="lift")
-                        data = tr.fresh(state)
-                        still = gripper_radians(cfg, np.asarray(data["pos"])) >= HOLDING_MIN_RADIANS
-                        result = "PICKED" if still else "SLIPPED"
-                        log("evidence", f"attempt={number} after lift holding={still} "
-                                        f"current={float(np.asarray(data['current'])[GRIPPER_INDEX]):.2f}A")
-                        if carry is None or not still:
-                            cancel_event.wait(HOLD_SECONDS)
-                        if carry is not None and still:
-                            # Carrying is deliberately not cancellable: a Stop
-                            # mid-carry finishes over the box and releases there
-                            # rather than dropping the object anywhere.
-                            stage = "carry"
-                            carry = np.asarray(densify([lift[-1], *carry]), dtype=np.float64)
-                            play(with_gripper(carry, hold_turns), CARRY_SECONDS, False, "carry",
-                                 pace="carry")
-                            release(with_gripper([carry[-1]], hold_turns)[0])
-                            holding = False
-                            result = "PLACED"
-                            log("place", "released above the box")
-                            play(with_gripper(carry[::-1], open_turns), CARRY_SECONDS, False,
-                                 "leave-box", pace="carry")
-                            play(with_gripper(lift[::-1], open_turns), LIFT_SECONDS, False,
-                                 "lower-empty", pace="ascend")
-                        else:
-                            stage = "put-back"
-                            play(with_gripper(lift[::-1], hold_turns), LIFT_SECONDS, False,
-                                 "lower", pace="lower")
-                            holding = False
-                    open_pose = descend[-1].copy()
-                    open_pose[GRIPPER_INDEX] = open_turns
-                    release(open_pose)
-                    command(open_pose)
-                    time.sleep(0.6)
-                    play(with_gripper(descend[::-1], open_turns), DESCEND_SECONDS, False, "ascend",
-                         pace="ascend")
+                while True:
+                    result = None
+                    for number, (offset, descend, lift) in enumerate(attempts, start=1):
+                        if cancel_event.is_set():
+                            break
+                        log("retry", f"attempt={number}/{len(attempts)} nudge_cm={fmt(offset * 100)}")
+                        stage = "descend"
+                        reached = play(descend, DESCEND_SECONDS, True, "descend", pace="descend")
+                        if cancel_event.is_set():
+                            break
+                        stage = "grip"
+                        holding, hold_turns = close_until_contact(descend[-1].copy())
+                        if holding:
+                            holding = hold_with_force(descend[-1].copy(), grip_torque)
+                        result = "PICKED" if holding else "MISS"
+                        if holding and number < len(attempts) and grip_is_pinched(
+                                grip["radians"], LAST_GOOD_GRIP_RADIANS.get(side)):
+                            # Only the rim is caught. Lifting this drops the can and
+                            # knocks it over; let go where it stands and re-grip.
+                            log("grip", f"pinched ({grip['radians']:.3f} rad); re-gripping, not lifting")
+                            holding, result = False, "PINCHED"
+                        if holding:
+                            stage = "lift"
+                            reached = play(with_gripper(lift, hold_turns), LIFT_SECONDS, False,
+                                           "lift", pace="lift")
+                            data = tr.fresh(state)
+                            still = gripper_radians(cfg, np.asarray(data["pos"])) >= HOLDING_MIN_RADIANS
+                            result = "PICKED" if still else "SLIPPED"
+                            log("evidence", f"attempt={number} after lift holding={still} "
+                                            f"current={float(np.asarray(data['current'])[GRIPPER_INDEX]):.2f}A")
+                            if carry is None or not still:
+                                cancel_event.wait(HOLD_SECONDS)
+                            if carry is not None and still:
+                                # Carrying is deliberately not cancellable: a Stop
+                                # mid-carry finishes over the box and releases there
+                                # rather than dropping the object anywhere.
+                                stage = "carry"
+                                carry = np.asarray(densify([lift[-1], *carry]), dtype=np.float64)
+                                play(with_gripper(carry, hold_turns), CARRY_SECONDS, False, "carry",
+                                     pace="carry")
+                                release(with_gripper([carry[-1]], hold_turns)[0])
+                                holding = False
+                                result = "PLACED"
+                                log("place", "released above the box")
+                                play(with_gripper(carry[::-1], open_turns), CARRY_SECONDS, False,
+                                     "leave-box", pace="carry")
+                                play(with_gripper(lift[::-1], open_turns), LIFT_SECONDS, False,
+                                     "lower-empty", pace="ascend")
+                            else:
+                                stage = "put-back"
+                                play(with_gripper(lift[::-1], hold_turns), LIFT_SECONDS, False,
+                                     "lower", pace="lower")
+                                holding = False
+                        open_pose = descend[-1].copy()
+                        open_pose[GRIPPER_INDEX] = open_turns
+                        release(open_pose)
+                        command(open_pose)
+                        time.sleep(0.6)
+                        play(with_gripper(descend[::-1], open_turns), DESCEND_SECONDS, False, "ascend",
+                             pace="ascend")
+                        stage = "approach"
+                        reached = len(approach) - 1
+                        log("retry", f"attempt={number} result={result}")
+                        outcome["result"] = result
+                        if result in {"PICKED", "PLACED"}:
+                            LAST_GOOD_NUDGE_CM[side] = tuple(
+                                float(v) for v in np.round(offset * 100.0, 1))
+                            LAST_GOOD_GRIP_RADIANS[side] = grip["radians"]
+                            break
+                        if result == "SLIPPED":
+                            # It was lifted and dropped: nobody knows where it is
+                            # now, so more blind nudges only knock it about. Pull
+                            # back and let the caller look again.
+                            log("retry", "dropped it; retreating to re-scan before another try")
+                            break
+                    if result == "PLACED":
+                        outcome["placed"] += 1
+                    if result != "PLACED" or cancel_event.is_set() or jobs is None:
+                        return
+                    job = jobs.get()  # planned while this object was being carried
+                    if job is None or not job["attempts"]:
+                        return
+                    # Straight on to the next object: up to the ready pose and
+                    # out again, without lowering the arm to rest in between.
+                    target = job["item"].center
+                    log("retry", f"next object at ({target[0]:.2f}, {target[1]:.2f}); "
+                                 "not returning to rest")
                     stage = "approach"
-                    reached = len(approach) - 1
-                    log("retry", f"attempt={number} result={result}")
-                    outcome["result"] = result
-                    if result in {"PICKED", "PLACED"}:
-                        LAST_GOOD_NUDGE_CM[side] = tuple(
-                            float(v) for v in np.round(offset * 100.0, 1))
-                        LAST_GOOD_GRIP_RADIANS[side] = grip["radians"]
-                        break
-                    if result == "SLIPPED":
-                        # It was lifted and dropped: nobody knows where it is
-                        # now, so more blind nudges only knock it about. Pull
-                        # back and let the caller look again.
-                        log("retry", "dropped it; retreating to re-scan before another try")
-                        break
-                return
+                    play(with_gripper(approach[ready_index:][::-1], open_turns),
+                         APPROACH_SECONDS, False, "to-ready", pace="approach")
+                    reached = ready_index
+                    # Keep the raise as the way home; swap in the new reach.
+                    approach = np.vstack([approach[:ready_index + 1],
+                                          job["phases"]["approach"][1:]])
+                    descend, lift = job["phases"]["descend"], job["phases"]["lift"]
+                    attempts, carry = job["attempts"], job["carry"]
+                    reached = ready_index + play(
+                        with_gripper(approach[ready_index:], open_turns), APPROACH_SECONDS,
+                        True, "approach", pace="approach")
+                    if cancel_event.is_set():
+                        return
             stage = "descend"
             reached = play(descend, DESCEND_SECONDS, True, "descend", pace="descend")
             if cancel_event.is_set():
@@ -1920,8 +2014,9 @@ def _run_motion(outcome, Config, Reader, Type, Writer, cfg, side, start, phases,
             play(with_gripper(lift[::-1], hold_turns), LIFT_SECONDS, False, "lower", pace="lower")
             holding = False
         finally:
-            if extras is not None:
-                extras.wait()  # never leave the planner running on the shared solver
+            if planner is not None:
+                jobs.abandon.set()
+                planner.wait()  # never leave the planner running on the shared solver
             if enabled:
                 if holding:
                     # Stop arrived mid-grip or mid-lift: set the object back down first.

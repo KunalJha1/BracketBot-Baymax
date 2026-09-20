@@ -211,9 +211,9 @@ def test_lift_clears_the_box_rim_and_release_spots_stay_inside_the_walls():
     lift_point = np.array([0.21, -0.33, 0.95])
     candidates = place_candidates(box, lift_point, 85.0, -0.8)
     assert candidates[0][0][:2] == pytest.approx(box.center[:2])    # centre first
-    assert len(candidates) == 12                                    # 3 spots x 4 pitches
+    assert len(candidates) == 24                  # 3 spots x 4 pitches, level then sunk
     for position, quaternion, _ in candidates:
-        assert position[2] == lift_point[2]                         # carried level
+        assert lift_point[2] - 0.04 < position[2] <= lift_point[2]  # level, or sunk a little
         offset = np.abs(position[:2] - np.asarray(box.center[:2]))
         assert np.all(offset <= 0.35 / 2 - PLACE_INSIDE_WALL_METRES + 1e-9)
         assert np.linalg.norm(quaternion) == pytest.approx(1.0)
@@ -265,8 +265,9 @@ def test_cans_already_in_the_box_are_not_targets_and_drop_spots_rotate():
 def test_all_mode_rescans_after_a_drop_and_stops_when_the_table_is_clear(monkeypatch):
     import contextlib
     import scripts.pick_object as po
+    from scripts.tabletop_scene import TableObject
 
-    box = object()
+    box = TableObject((0.47, -0.22, 0.79), 0.10, 0.25, 0.25, 0.0, 5000)
     scans, rounds = [], iter(["SLIPPED", "PLACED", "PLACED"])
 
     def fake_scan(_reader):
@@ -277,8 +278,15 @@ def test_all_mode_rescans_after_a_drop_and_stops_when_the_table_is_clear(monkeyp
         return "plane", "item"
 
     fake_scan.last_box = fake_scan.filled_box = None
+    fake_scan.others = []
     monkeypatch.setattr(po, "scan", fake_scan)
-    monkeypatch.setattr(po, "pick_with", lambda *args: next(rounds))
+    def fake_pick_with(*args):
+        result = next(rounds)
+        fake_pick_with.placed += result == "PLACED"
+        return result
+
+    fake_pick_with.placed = 0
+    monkeypatch.setattr(po, "pick_with", fake_pick_with)
     monkeypatch.setattr(po.tr, "_load_bbos",
                         lambda: (None, None, lambda *a, **k: contextlib.nullcontext(), None, None))
     monkeypatch.setattr(po.tr, "fresh", lambda _reader: {"rpy": [0.0, 0.0, 0.0]})
