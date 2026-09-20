@@ -65,6 +65,9 @@ class FollowConfig:
     points_stale: float = 0.3
     lost_after: float = 1.0
     lost_timeout: float = 10.0
+    # After lost_timeout: False waits for a restart; True searches again and follows
+    # whoever next stands in the lock-on zone (the voice "follow me until I say stop").
+    relock_after_loss: bool = False
     upright_deg: float = 25.0
     odom_mismatch_time: float = 0.5
     # Obstacle corridor (robot-local metres)
@@ -750,6 +753,12 @@ class FollowLoop:
             else:
                 self.state = BLOCKED if self.corridor.blocked else FOLLOWING
         elif self.state == LOST and t - self.lost_since > self.cfg.lost_timeout:
+            if self.cfg.relock_after_loss:
+                self.tracker.reset()
+                self.lock_on.reset()
+                self.state = SEARCHING
+                self.lost_since = None
+                return
             self.tracker.association = "restart-required"
             self.tracker.uncertain = True  # retain the old target; never auto-select somebody else
 

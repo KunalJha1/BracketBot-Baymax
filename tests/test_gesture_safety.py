@@ -284,3 +284,33 @@ def test_contact_gestures_keep_the_slow_playback_speed():
     for name in ("handshake", "fist bump", "hug", "dance"):
         assert playback_speed(name) == 0.6
     assert playback_speed("wave") == playback_speed("goodbye") == 0.75
+
+
+def test_pose_at_blends_between_recorded_frames():
+    from bbapps.greeter.gesture_safety import pose_at
+
+    times = np.asarray([0.0, 1.0, 3.0])
+    trajectory = np.asarray([[0.0, 0.0], [1.0, 2.0], [3.0, 2.0]])
+
+    assert pose_at(times, trajectory, -1.0) == pytest.approx([0.0, 0.0])
+    assert pose_at(times, trajectory, 0.25) == pytest.approx([0.25, 0.5])
+    assert pose_at(times, trajectory, 1.0) == pytest.approx([1.0, 2.0])
+    assert pose_at(times, trajectory, 2.0) == pytest.approx([2.0, 2.0])
+    assert pose_at(times, trajectory, 9.0) == pytest.approx([3.0, 2.0])
+
+
+def test_hug_is_smooth_and_returns_to_its_resting_pose():
+    import json
+    from pathlib import Path
+
+    from bbapps.greeter.gesture_safety import trajectory_arrays
+
+    movements = Path(__file__).resolve().parents[1] / "bbapps" / "greeter" / "movements"
+    times, poses = trajectory_arrays(json.loads((movements / "hug.json").read_text()))
+    for side in ("left", "right"):
+        velocity = np.diff(poses[side], axis=0) / np.diff(times)[:, None]
+        assert np.abs(velocity).max() < 0.3
+        # No frame-to-frame jerk: the old recording stepped by whole encoder ticks.
+        assert np.abs(np.diff(velocity, axis=0)).max() < 0.03
+        assert np.abs(poses[side]).max() < 0.30
+        assert poses[side][-1] == pytest.approx(poses[side][0], abs=0.005)

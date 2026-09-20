@@ -210,6 +210,7 @@ def estimate_hr(t, rgb, fs=30.0, method="pos", prev_bpm=None, track_bpm=15.0):
 # ----------------------------------------------------------------------------
 
 FACE_SCORE = 0.75
+FACE_DETECT_MAX_WIDTH = 640
 
 
 def face_skin_mask(face, image_shape):
@@ -262,13 +263,25 @@ class FaceROI:
     def __call__(self, frame_bgr, _t_ms):
         """Returns (mean_rgb (3,), nose_xy, face_width_px, mask) or None if no face."""
         h, w = frame_bgr.shape[:2]
-        if self.detector_size != (w, h):
-            self.detector.setInputSize((w, h))
-            self.detector_size = (w, h)
-        _, faces = self.detector.detect(frame_bgr)
+        scale = min(1.0, FACE_DETECT_MAX_WIDTH / w)
+        detect_w = max(1, int(round(w * scale)))
+        detect_h = max(1, int(round(h * scale)))
+        detect_size = (detect_w, detect_h)
+        if self.detector_size != detect_size:
+            self.detector.setInputSize(detect_size)
+            self.detector_size = detect_size
+        detection_frame = (
+            frame_bgr if detect_size == (w, h)
+            else self.cv2.resize(frame_bgr, detect_size, interpolation=self.cv2.INTER_AREA)
+        )
+        _, faces = self.detector.detect(detection_frame)
         if faces is None or not len(faces):
             return None
         face = max(faces, key=lambda row: float(row[2] * row[3] * row[-1]))
+        if detect_size != (w, h):
+            face = np.asarray(face, dtype=np.float32).copy()
+            face[[0, 2, 4, 6, 8, 10, 12]] *= w / detect_w
+            face[[1, 3, 5, 7, 9, 11, 13]] *= h / detect_h
         mask = face_skin_mask(face, frame_bgr.shape)
         if mask is None or self.cv2.countNonZero(mask) < 400:  # face too small/far
             return None

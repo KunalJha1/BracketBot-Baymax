@@ -6,7 +6,7 @@ import math
 import numpy as np
 import pytest
 
-from follow_core import FollowConfig, FollowLoop, LockOn, Perception, PersonObservation, Tracker, TickInputs, Pose2D, FOLLOWING, LOST, hist_distance
+from follow_core import FollowConfig, FollowLoop, LockOn, Perception, PersonObservation, Tracker, TickInputs, Pose2D, FOLLOWING, LOST, SEARCHING, hist_distance
 from follow_perception import clothing_histogram, find_people
 from robot_follow import perceive, point_colors
 from test_follow_perception import standing_person
@@ -94,6 +94,20 @@ def test_long_loss_never_auto_locks_a_new_person_even_if_they_match_colour():
         assert out.state == LOST
         assert out.association == "restart-required"
         assert out.v == out.omega == 0
+
+
+def test_relock_after_loss_searches_again_and_follows_whoever_stands_in_front():
+    loop = FollowLoop(replace(CFG, relock_after_loss=True))
+    for i in range(11):
+        out = tick(loop, i * .1, [obs()])
+    assert out.state == FOLLOWING
+    for i in range(11, 160):
+        out = tick(loop, i * .1, [])
+        assert out.v == out.omega == 0 or out.state != SEARCHING
+    assert out.state == SEARCHING
+    for i in range(160, 180):
+        out = tick(loop, i * .1, [obs(hist=BLUE)])
+    assert out.state == FOLLOWING
 
 
 def test_geometry_only_does_not_switch_when_one_person_disappears_after_an_ambiguous_crossing():

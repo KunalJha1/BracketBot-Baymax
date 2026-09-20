@@ -83,6 +83,9 @@ def build_parser():
     parser.add_argument("--ignore-writer", action="append", default=[], metavar="PATTERN",
                         help="a DRIVE_WRITER_PATTERNS entry the caller guarantees is idle (the voice "
                              "assistant passes person_tracker.py, which it keeps from turning meanwhile)")
+    parser.add_argument("--relock", action="store_true",
+                        help="after a long loss, search again and follow whoever stands in the "
+                             "lock-on zone instead of waiting for a restart")
     parser.add_argument("--calibration", type=Path, default=DEFAULT_PATH,
                         help="robot-specific JSON calibration (default: ~/.config/baymax/follow.json)")
     return parser
@@ -104,7 +107,8 @@ def parse_args(argv=None):
 def loop_config(args):
     if args.ground_approach:
         return approach_config(0.0 if args.rotate_only else args.v_max)
-    return replace(FollowConfig(), v_max=0.0 if args.rotate_only else args.v_max)
+    return replace(FollowConfig(), v_max=0.0 if args.rotate_only else args.v_max,
+                   relock_after_loss=args.relock)
 
 
 def read_ground_target(path, wall_now, calibration):

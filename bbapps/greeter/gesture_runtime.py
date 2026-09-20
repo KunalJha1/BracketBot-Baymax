@@ -20,6 +20,7 @@ try:
         ease_seconds,
         plan_recorded_gesture,
         playback_speed,
+        pose_at,
         spoken_safety_refusal,
         trajectory_arrays,
     )
@@ -30,6 +31,7 @@ except ImportError:
         ease_seconds,
         plan_recorded_gesture,
         playback_speed,
+        pose_at,
         spoken_safety_refusal,
         trajectory_arrays,
     )
@@ -194,16 +196,15 @@ def play_recorded_movement(name, plan, cancel_event, shutdown_event):
             if not cancel_event.is_set() and not shutdown_event.is_set():
                 playback_times = plan.times / playback_speed(name)
                 began = time.monotonic()
-                index = 0
-                while index < len(playback_times) - 1:
+                elapsed = 0.0
+                while elapsed < playback_times[-1]:
                     if cancel_event.is_set() or shutdown_event.is_set():
                         break
                     elapsed = time.monotonic() - began
-                    index = min(
-                        int(np.searchsorted(playback_times, elapsed)),
-                        len(playback_times) - 1,
-                    )
-                    last = {side: plan.poses[side][index] for side in plan.sides}
+                    last = {
+                        side: pose_at(playback_times, plan.poses[side], elapsed)
+                        for side in plan.sides
+                    }
                     command(last)
                     time.sleep(TICK_SECONDS)
             ease(last, plan.starts)

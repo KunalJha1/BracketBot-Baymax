@@ -118,6 +118,43 @@ def test_yunet_face_roi_loads_real_shipped_model():
     assert roi(frame, 0) is None
 
 
+def test_yunet_detection_uses_bounded_preview_but_full_resolution_mask(monkeypatch):
+    face = np.array(
+        [[10, 20, 100, 120, 40, 60, 80, 60, 60, 80, 45, 110, 75, 110, 0.99]],
+        dtype=np.float32,
+    )
+
+    class Detector:
+        def __init__(self):
+            self.input_size = None
+            self.detected_shape = None
+
+        def setInputSize(self, size):
+            self.input_size = size
+
+        def detect(self, frame):
+            self.detected_shape = frame.shape
+            return None, face
+
+    detector = Detector()
+    roi = rppg.FaceROI.__new__(rppg.FaceROI)
+    import cv2
+    roi.cv2 = cv2
+    roi.detector = detector
+    roi.detector_size = None
+    frame = np.full((960, 1280, 3), 120, np.uint8)
+
+    result = roi(frame, 0)
+
+    assert detector.input_size == (640, 480)
+    assert detector.detected_shape == (480, 640, 3)
+    assert result is not None
+    _rgb, nose, face_width, mask = result
+    assert face_width == pytest.approx(200)
+    assert nose.tolist() == pytest.approx([120, 160])
+    assert mask.shape == (960, 1280)
+
+
 def test_robot_cli_self_test_loads_model_without_camera():
     script = Path(__file__).resolve().parents[1] / "scripts" / "robot_rppg.py"
     completed = subprocess.run(

@@ -159,7 +159,7 @@ def test_salute_lifts_holds_then_waves_with_left_arm():
         (ROOT / "bbapps" / "greeter" / "movements" / "wave.json").read_text()
     )
     extension_source = json.loads(
-        (ROOT / "bbapps" / "greeter" / "movements" / "hug.json").read_text()
+        (ROOT / "bbapps" / "greeter" / "movements" / "reach.json").read_text()
     )
     recorded_poses = source + extension_source
     wave_poses = frames[hold_index + 1 :]
@@ -188,7 +188,7 @@ def test_namaste_uses_a_two_arm_chest_pose_and_bounded_hold():
     frames = json.loads(action_resource_path(ACTIONS["namaste"]).read_text())
     times = [frame["t"] for frame in frames]
     source = json.loads(
-        (ROOT / "bbapps" / "greeter" / "movements" / "hug.json").read_text()
+        (ROOT / "bbapps" / "greeter" / "movements" / "reach.json").read_text()
     )
 
     assert ACTIONS["namaste"].channels == ("left-arm", "right-arm")

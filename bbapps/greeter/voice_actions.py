@@ -257,6 +257,7 @@ class FollowRunner:
                 # Ours, and idle: the action lock keeps it from turning while we drive.
                 "--ignore-writer", "person_tracker.py",
                 "--no-led",                # the assistant holds BBOS's only led.ctrl writer
+                "--relock",                # keep following until told to stop
             ],
             cwd=self.script.parent,
             stdin=subprocess.PIPE,
@@ -681,6 +682,8 @@ class VoiceActionController:
                 def on_state(state):
                     if leds is not None and state in FOLLOW_STATE_LED:
                         leds.start_effect(*FOLLOW_STATE_LED[state], 3600.0)
+                    if state == "SEARCHING":
+                        spoken.clear()     # a fresh lock-on after a long loss: speak again
                     message = FOLLOW_STATE_MESSAGES.get(state)
                     # Say each state once: a person weaving through a doorway
                     # would otherwise be told "I lost you" every few seconds.

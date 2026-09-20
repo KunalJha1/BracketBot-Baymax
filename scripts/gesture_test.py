@@ -273,11 +273,19 @@ def main():
             if not interrupts:
                 print(f"[gesture] playing {name}", flush=True)
                 started = time.monotonic()
-                index = 0
-                while index < len(times) - 1 and not interrupts:
+                elapsed = 0.0
+                while elapsed < playback_times[-1] and not interrupts:
                     elapsed = time.monotonic() - started
-                    index = min(int(np.searchsorted(playback_times, elapsed)), len(times) - 1)
-                    last = {side: poses[side][index] for side in sides}
+                    # Blend between frames: the loop ticks faster than the
+                    # recording was sampled, and holding a frame looks choppy.
+                    index = int(np.clip(np.searchsorted(playback_times, elapsed), 1, len(times) - 1))
+                    span = playback_times[index] - playback_times[index - 1]
+                    blend = float(np.clip((elapsed - playback_times[index - 1]) / span, 0.0, 1.0))
+                    last = {
+                        side: poses[side][index - 1]
+                        + blend * (poses[side][index] - poses[side][index - 1])
+                        for side in sides
+                    }
                     command(last)
                     time.sleep(TICK)
 

@@ -1,6 +1,6 @@
 """Build an extend-salute-wave gesture from proven arm recordings.
 
-The hand extension comes from ``hug.json`` and the raised salute/wave comes from
+The hand extension comes from ``reach.json`` and the raised salute/wave comes from
 ``wave.json``. A smooth bounded blend joins those two recorded poses. Keeping
 this generator beside the asset makes that provenance reviewable and the JSON
 reproducible.
@@ -17,7 +17,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SOURCE = ROOT / "bbapps" / "greeter" / "movements" / "wave.json"
-DEFAULT_EXTENSION_SOURCE = ROOT / "bbapps" / "greeter" / "movements" / "hug.json"
+DEFAULT_EXTENSION_SOURCE = ROOT / "bbapps" / "greeter" / "movements" / "reach.json"
 DEFAULT_OUTPUT = ROOT / "bbapps" / "greeter" / "movements" / "salute.json"
 LIFT_SECONDS = 1.25
 EXTEND_SOURCE_SECONDS = 1.51

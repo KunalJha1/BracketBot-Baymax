@@ -160,6 +160,18 @@ def playback_speed(name: str) -> float:
     return PLAYBACK_SPEEDS.get(name, DEFAULT_PLAYBACK_SPEED)
 
 
+def pose_at(times: np.ndarray, trajectory: np.ndarray, elapsed: float) -> np.ndarray:
+    """Pose at ``elapsed``, blended between the two surrounding frames.
+
+    The control loop ticks faster than recordings were sampled, so holding the
+    nearest frame makes the arm advance in visible steps.
+    """
+    index = int(np.clip(np.searchsorted(times, elapsed), 1, len(times) - 1))
+    span = times[index] - times[index - 1]
+    blend = float(np.clip((elapsed - times[index - 1]) / span, 0.0, 1.0))
+    return trajectory[index - 1] + blend * (trajectory[index] - trajectory[index - 1])
+
+
 def ease_seconds(from_poses: Mapping[str, object], to_poses: Mapping[str, object]) -> float:
     """Shortest ease that keeps the fastest joint under the ease speed limit."""
     distance = max(

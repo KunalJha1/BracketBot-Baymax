@@ -273,7 +273,7 @@ ACTION_LIST = (
             channels=("right-arm",), key="2", resource="handshake.json", risk="contact-motion"),
     _action("fist-bump", "Fist bump", "Offer a right-handed fist bump", "Gestures", "gesture",
             channels=("right-arm",), key="3", resource="fist bump.json", risk="contact-motion"),
-    _action("hug", "Hug", "Reach both arms forward and wrap them in for a hug", "Gestures", "gesture",
+    _action("hug", "Hug", "Open both arms wide, reach around the person, and close in for a gentle hug", "Gestures", "gesture",
             channels=("left-arm", "right-arm"), key="4", resource="hug.json", risk="contact-motion"),
     _action("namaste", "Namaste", "Bring both hands together at chest height", "Gestures", "gesture",
             channels=("left-arm", "right-arm"), key="n", resource="namaste.json", risk="motion"),
