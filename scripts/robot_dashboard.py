@@ -64,6 +64,12 @@ SSH_PROBE_OPTIONS = (
 # ConnectTimeout to each address, so the outer probe must allow more than one
 # attempt before deciding that hotspot discovery failed.
 SSH_PROBE_TIMEOUT = 12
+# Budget for a remote command that carries its own retry loop. Those loops poll
+# for up to ~3 s by themselves, and SSH setup is added on top of that. A trivial
+# round-trip to a CPU-saturated robot over a phone hotspot was measured between
+# 2 s and 12 s, so a 6 s budget expired before the command could report back and
+# turned a healthy robot into "Robot action preload failed".
+SSH_COMMAND_TIMEOUT = 25
 DEFAULT_SSH_HOSTS = (
     "botwifi",
     "bracketbot@bracketbot-184.local",
@@ -365,7 +371,7 @@ class RobotController:
             ["ssh", *SSH_OPTIONS, host, remote],
             capture_output=True,
             text=True,
-            timeout=6,
+            timeout=SSH_COMMAND_TIMEOUT,
         )
         if result.returncode != 0:
             error_type = RobotConnectionError if result.returncode == 255 else RuntimeError
@@ -867,7 +873,7 @@ class RobotController:
                     "sleep 0.25; done; exit 1",
                 ],
                 capture_output=True,
-                timeout=6,
+                timeout=SSH_COMMAND_TIMEOUT,
             )
 
         threading.Thread(target=request_stop, name=thread_name, daemon=True).start()
