@@ -56,6 +56,12 @@ REMOTE_BASE_RUNNER = "/tmp/robot_base_mode.py"
 REMOTE_GREETER_ACTION_RUNNER = "/tmp/greeter_action.py"
 REMOTE_TABLE_REST_RUNNER = "/tmp/table_rest.py"
 REMOTE_DEMO_ARM_RESERVATION = "/tmp/bracketbot-demo-arm-reserved"
+RPPG_RUNNER = ROOT / "scripts" / "robot_rppg.py"
+# robot_rppg.py imports both of these from its own directory on the robot.
+RPPG_MODULES = (ROOT / "rppg.py", ROOT / "rppg_view.py",
+                ROOT / "assets" / "models" / "face_detection_yunet_2026may.onnx")
+REMOTE_RPPG_RUNNER = "/tmp/robot_rppg.py"
+RPPG_VIEW_PORT = 8021
 FOLLOW_RUNNER = ROOT / "scripts" / "robot_follow.py"
 FOLLOW_MODULES = tuple(ROOT / "scripts" / name for name in (
     "follow_core.py", "follow_perception.py", "follow_calibration.py",
@@ -526,6 +532,16 @@ class DashboardState:
         self.follow_gap = FOLLOW_GAP_DEFAULT
         self.follow_process = None
         self.follow_pid_file = None
+        # The heart-rate debug view: a read-only scan on the robot that also
+        # serves what it sees. It never moves anything, so it has no pid file
+        # and no interlock with the arms - only its own process to stop.
+        self.heart_enabled = False
+        self.heart_requested = False
+        self.heart_transition = False
+        self.heart_phase = "Heart-rate view off"
+        self.heart_url = None
+        self.heart_reading = None
+        self.heart_process = None
         # Assume a poll "just happened" at start-up so follow can begin normally;
         # kept fresh by every real /api/status request from here on.
         self.last_status_poll = time.monotonic()
@@ -588,6 +604,11 @@ class DashboardState:
                 "follow_mode": self.follow_mode,
                 "follow_status": self.follow_status,
                 "follow_gap": self.follow_gap,
+                "heart_enabled": self.heart_enabled,
+                "heart_transition": self.heart_transition,
+                "heart_phase": self.heart_phase,
+                "heart_url": self.heart_url,
+                "heart_reading": self.heart_reading,
                 "follow_gap_min": FOLLOW_GAP_MIN,
                 "follow_gap_max": FOLLOW_GAP_MAX,
                 "network_transition": self.network_transition,
@@ -1627,6 +1648,150 @@ class RobotController:
         ).start()
         return True, "Starting follow mode"
 
+    def set_heart_view(self, enabled):
+        """Start or stop the read-only heart-rate scan and its debug view on the robot.
+
+        The scan opens a Reader on the head camera and nothing else: it cannot
+        move the robot, so unlike follow it needs no lean or demo interlock. It
+        is still someone's face on an unauthenticated page, so it runs only
+        while it is switched on here and the page dies with the process.
+        """
+        if not isinstance(enabled, bool):
+            return False, "enabled must be true or false"
+        with self.state.lock:
+            state = self.state
+            if state.host is None:
+                return False, "Robot is not connected; choose Reconnect"
+            if state.heart_transition:
+                return False, "The heart-rate view is already changing"
+            if enabled == state.heart_enabled:
+                return False, ("The heart-rate view is already on" if enabled
+                               else "The heart-rate view is already off")
+            if enabled:
+                state.heart_requested = True
+                state.heart_transition = True
+                state.heart_reading = None
+                state.heart_phase = "Starting the heart-rate view…"
+                state.error = None
+                host = state.host
+            else:
+                state.heart_requested = False
+        if not enabled:
+            self._stop_heart_view()
+            return True, "Stopping the heart-rate view"
+        target = self._simulate_heart_view if self.state.simulate else self._run_heart_view
+        threading.Thread(target=target, args=(host,), name="heart-view", daemon=True).start()
+        return True, "Starting the heart-rate view"
+
+    def _heart_view_url(self, host):
+        """The robot's own page. SSH hosts look like user@name, and only the name routes."""
+        return f"http://{host.split('@')[-1]}:{RPPG_VIEW_PORT}/"
+
+    def _stop_heart_view(self):
+        with self.state.lock:
+            process = self.state.heart_process
+            self.state.heart_phase = "Stopping the heart-rate view…"
+        if process is None or process.poll() is not None:
+            # Simulation, or the scan already exited: nothing is left to run the
+            # finally block that normally clears this, so clear it here.
+            self._finish_heart_view("Heart-rate view off")
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+    def _finish_heart_view(self, message):
+        with self.state.lock:
+            self.state.heart_enabled = False
+            self.state.heart_requested = False
+            self.state.heart_transition = False
+            self.state.heart_process = None
+            self.state.heart_url = None
+            self.state.heart_phase = message
+
+    def _simulate_heart_view(self, host):
+        with self.state.lock:
+            self.state.heart_enabled = True
+            self.state.heart_transition = False
+            self.state.heart_url = self._heart_view_url(host)
+            self.state.heart_phase = "Simulated: no scan is running"
+            self.state.heart_reading = {"bpm": 72.0, "snr_db": 6.0, "confident": True}
+
+    def _run_heart_view(self, host):
+        process = None
+        try:
+            self.state.add_log("Copying the heart-rate scan to the robot")
+            self._deploy(host, RPPG_RUNNER, *RPPG_MODULES)
+            with self.state.lock:
+                if not self.state.heart_requested:
+                    return
+            remote_command = remote_python_command(
+                REMOTE_RPPG_RUNNER, "--view", "--monitor", "--progress-json",
+                "--view-port", str(RPPG_VIEW_PORT),
+            )
+            process = subprocess.Popen(
+                ["ssh", *SSH_OPTIONS, host, remote_command],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+            with self.state.lock:
+                self.state.heart_process = process
+                self.state.heart_enabled = True
+                self.state.heart_transition = False
+                self.state.heart_url = self._heart_view_url(host)
+                self.state.heart_phase = "Ask the person to face the camera and hold still"
+                should_stop = not self.state.heart_requested
+            if should_stop:
+                process.terminate()
+            assert process.stdout is not None
+            for line in process.stdout:
+                self._note_heart_line(line)
+            process.wait()
+        except RobotConnectionError as exc:
+            with self.state.lock:
+                self.state.error = f"Heart-rate view failed: {exc}"
+        except Exception as exc:  # noqa: BLE001 - surfaced to the operator, never raised on
+            with self.state.lock:
+                self.state.error = f"Heart-rate view failed: {exc}"
+        finally:
+            with self.state.lock:
+                requested = self.state.heart_requested
+            self._finish_heart_view(
+                "Heart-rate view stopped" if not requested else "Heart-rate view ended on the robot"
+            )
+
+    def _note_heart_line(self, line):
+        """Read one JSON line from the scan. Anything else is a log line, not a reading."""
+        line = line.strip()
+        if not line:
+            return
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            self.state.add_log(f"[heart] {line}")
+            return
+        if not isinstance(message, dict):
+            return
+        with self.state.lock:
+            if "result" in message:
+                result = message.get("result")
+                self.state.heart_reading = None if result is None else {
+                    "bpm": result.get("bpm"),
+                    "snr_db": result.get("snr_db"),
+                    "confident": bool(result.get("confident")),
+                }
+                self.state.heart_phase = (
+                    "No clear reading from that scan; starting another"
+                    if result is None else "Scan complete; starting another"
+                )
+            elif "progress" in message:
+                self.state.heart_phase = f"Scanning… {float(message['progress']) * 100:.0f}%"
+
     def set_follow_gap(self, gap):
         if isinstance(gap, bool) or not isinstance(gap, (int, float)) or not math.isfinite(gap):
             return False, "gap must be a number of metres"
@@ -2001,6 +2166,21 @@ button:disabled { opacity:.48; cursor:not-allowed; filter:saturate(.4); }
 .positioning-copy { margin:0 0 14px 38px; color:var(--muted); font-size:.82rem; }
 .positioning-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
 .positioning-grid button { min-height:112px; }
+.heart { margin-top:24px; padding:20px; border:1px solid var(--line); border-radius:28px;
+  background:linear-gradient(145deg,rgba(255,255,255,.88),rgba(255,240,241,.72)); }
+.heart h2 { display:flex; align-items:center; gap:10px; margin:0 0 5px; color:#4d484c;
+  font-size:.78rem; letter-spacing:.12em; text-transform:uppercase; }
+.heart-copy { margin:0 0 14px 38px; color:var(--muted); font-size:.82rem; }
+.heart-row { display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+.heart-row button { flex:0 0 auto; min-width:220px; }
+.heart-detail { color:var(--muted); font-size:.86rem; font-weight:700; }
+.heart-reading { color:#14744d; font-weight:800; }
+.heart-view { display:none; margin-top:14px; }
+.heart-view.on { display:block; }
+.heart-view img { width:100%; max-width:980px; border-radius:18px; border:1px solid var(--line);
+  background:#131316; display:block; }
+.heart-view a { display:inline-block; margin-top:8px; color:var(--muted); font-size:.8rem; }
+.heart-note { margin:10px 0 0; color:var(--muted); font-size:.78rem; max-width:70ch; }
 .follow-gap { display:flex; align-items:center; gap:14px; margin-top:14px; color:var(--muted); font-size:.9rem; font-weight:700; }
 .follow-gap input { flex:1; accent-color:var(--red); }
 .secondary,.stop { min-height:60px; border-radius:18px; text-align:center; font-size:.9rem; font-weight:800; }
@@ -2100,6 +2280,23 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:560px; overflow:a
       <button id="table-rest" class="action-card" data-action="table-rest"><span class="key">R</span><span class="label">Place arms on table</span><span class="desc">Place, release control, then run another action from that pose</span></button>
     </div>
   </section>
+  <section class="heart" aria-labelledby="heart-title">
+    <h2 id="heart-title"><span class="group-icon" aria-hidden="true">&hearts;</span>Heart-rate debug view</h2>
+    <p class="heart-copy">Shows what the head camera sees and what the model does to it: green is the
+      skin the average was taken over, red is what the skin gate threw away, and the spectra are what
+      the rate is read off. Ask the person first.</p>
+    <div class="heart-row">
+      <button id="heart" class="secondary" aria-pressed="false"><span class="key">V</span>Show camera view</button>
+      <span id="heart-detail" class="heart-detail">Heart-rate view: off</span>
+    </div>
+    <div id="heart-view" class="heart-view">
+      <img id="heart-stream" alt="Live view of the head camera with the rPPG model's working drawn on it">
+      <a id="heart-link" href="#" target="_blank" rel="noopener">Open the view in its own tab</a>
+    </div>
+    <p class="heart-note">A camera-based demo estimate, not a medical measurement: it must not be used
+      to diagnose, triage, or decide anything about a person. The page on the robot is unauthenticated
+      and shows whoever is in front of the camera, so leave it on only while you are watching it.</p>
+  </section>
   <div class="controls">
     <button id="reconnect" class="secondary">Reconnect</button>
     <button id="follow" class="secondary" aria-pressed="false"><span class="key">F</span>Follow me</button>
@@ -2123,6 +2320,37 @@ const latencyDetail=document.getElementById('latency-detail');
 const follow=document.getElementById('follow'), followDetail=document.getElementById('follow-detail');
 const groundCheckIn=document.getElementById('ground-check-in');
 const gap=document.getElementById('gap'), gapValue=document.getElementById('gap-value');
+const heart=document.getElementById('heart'), heartDetail=document.getElementById('heart-detail');
+const heartView=document.getElementById('heart-view'), heartStream=document.getElementById('heart-stream');
+const heartLink=document.getElementById('heart-link');
+let heartStreamUrl=null;
+function heartText(c) {
+  if(c.heart_transition) return `Heart-rate view: ${c.heart_phase}`;
+  if(!c.heart_enabled) return 'Heart-rate view: off';
+  const r=c.heart_reading;
+  if(!r||r.bpm==null) return `Heart-rate view: on · ${c.heart_phase}`;
+  const sure=r.confident?'':' (signal weak, do not rely on it)';
+  return `Heart-rate view: on · about ${r.bpm.toFixed(0)} BPM${sure}`;
+}
+function renderHeart(c) {
+  heart.disabled=!c.connected||c.heart_transition;
+  heart.setAttribute('aria-pressed', c.heart_enabled?'true':'false');
+  heart.classList.toggle('lean-active', c.heart_enabled);
+  heart.innerHTML=`<span class="key">V</span>${c.heart_transition?'Changing view…':c.heart_enabled?'Hide camera view':'Show camera view'}`;
+  heartDetail.textContent=heartText(c);
+  heartDetail.classList.toggle('heart-reading', !!(c.heart_enabled&&c.heart_reading&&c.heart_reading.confident));
+  const url=c.heart_enabled&&c.heart_url?c.heart_url:null;
+  // Point the <img> at the stream once per session: re-setting src restarts it.
+  if(url&&heartStreamUrl!==url) {
+    heartStreamUrl=url;
+    heartStream.src=url+'stream.mjpg';
+    heartLink.href=url;
+  } else if(!url&&heartStreamUrl) {
+    heartStreamUrl=null;
+    heartStream.removeAttribute('src');
+  }
+  heartView.classList.toggle('on', !!url);
+}
 let gapDragging=false;
 function followText(c) {
   if(c.follow_mode==='ground') {
@@ -2331,6 +2559,7 @@ async function refresh() {
     groundCheckIn.textContent=groundOn?'Stop check-in':'Check on person';
     gap.disabled=groundOn;
     followDetail.textContent=followText(current);
+    renderHeart(current);
     gap.min=current.follow_gap_min; gap.max=current.follow_gap_max;
     if(!gapDragging){ gap.value=current.follow_gap; gapValue.textContent=`${Number(current.follow_gap).toFixed(1)} m`; }
     lean.className='secondary '+(current.lean_enabled?'lean-active':'');
@@ -2381,6 +2610,7 @@ demoComplete.addEventListener('click',()=>post('/api/demo/complete').then(refres
 lean.addEventListener('click',()=>post('/api/lean',{enabled:!current.lean_enabled}).then(refresh));
 tableRest.addEventListener('click',()=>post('/api/run',{action:'table-rest'}).then(refresh));
 follow.addEventListener('click',()=>post('/api/follow',{enabled:!current.follow_enabled}).then(refresh));
+heart.addEventListener('click',()=>post('/api/heart',{enabled:!current.heart_enabled}).then(refresh));
 groundCheckIn.addEventListener('click',()=>post('/api/follow',{enabled:!current.follow_enabled,mode:'ground'}).then(refresh));
 gap.addEventListener('input',()=>{ gapDragging=true; gapValue.textContent=`${Number(gap.value).toFixed(1)} m`; });
 gap.addEventListener('change',()=>{ gapDragging=false; post('/api/follow/gap',{gap:Number(gap.value)}).then(refresh); });
@@ -2393,6 +2623,7 @@ document.addEventListener('keydown',event=>{
   if(event.repeat||event.target.matches('input,textarea,select')) return;
   if(event.key.toLowerCase()==='z'&&!lean.disabled){ event.preventDefault(); lean.click(); return; }
   if(event.key.toLowerCase()==='f'&&!follow.disabled){ event.preventDefault(); follow.click(); return; }
+  if(event.key.toLowerCase()==='v'&&!heart.disabled){ event.preventDefault(); heart.click(); return; }
   const action=current.actions?.find(item=>item.key===event.key);
   const routine=current.routines?.find(item=>item.key===event.key);
   const selector=action?`[data-action="${action.id}"]`:routine?`[data-routine="${routine.id}"]`:null;
@@ -2486,6 +2717,10 @@ class Handler(BaseHTTPRequestHandler):
             body = self._json_body()
             ok, message = self.controller.set_follow(body.get("enabled"), body.get("mode", "follow"))
             self._send({"ok": ok, "message": message}, HTTPStatus.ACCEPTED if ok else HTTPStatus.CONFLICT)
+        elif self.path == "/api/heart":
+            ok, message = self.controller.set_heart_view(self._json_body().get("enabled"))
+            self._send({"ok": ok, "message": message},
+                       HTTPStatus.ACCEPTED if ok else HTTPStatus.CONFLICT)
         elif self.path == "/api/follow/gap":
             ok, message = self.controller.set_follow_gap(self._json_body().get("gap"))
             self._send({"ok": ok, "message": message}, HTTPStatus.ACCEPTED if ok else HTTPStatus.BAD_REQUEST)
@@ -2568,11 +2803,17 @@ def start_source_reloader(server, controller, source, reload_requested, stop_eve
                 or state["follow_enabled"]
                 or state["follow_transition"]
                 or state["network_transition"]
+                # Restarting would orphan the scan's SSH process, leaving an
+                # unauthenticated camera page up on the robot with no dashboard
+                # left that knows how to stop it.
+                or state["heart_enabled"]
+                or state["heart_transition"]
             )
             if busy:
                 if not announced_wait:
                     print(
-                        "[reload] source changed; waiting for actions, demo, lean, and follow to stop",
+                        "[reload] source changed; waiting for actions, demo, lean, follow, "
+                        "and the heart-rate view to stop",
                         flush=True,
                     )
                     announced_wait = True

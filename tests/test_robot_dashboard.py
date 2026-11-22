@@ -26,7 +26,11 @@ from scripts.robot_dashboard import (
     GREETER_ACTION_RUNNER,
     Handler,
     NETWORK_PROFILES,
+    REMOTE_RPPG_RUNNER,
     REMOTE_TABLE_REST_RUNNER,
+    RPPG_MODULES,
+    RPPG_RUNNER,
+    RPPG_VIEW_PORT,
     REMOTE_GREETER_ACTION_RUNNER,
     ROUTINE_LIST,
     ROUTINES,
@@ -890,7 +894,7 @@ def test_ground_check_in_simulates_a_single_spoken_line():
     wait_for(lambda: follow_off(controller))
     state = controller.state.snapshot()
     assert state["follow_phase"] == "Check-in complete"
-    assert sum("hello specimen, are you in trouble" in line for line in state["log"]) == 1
+    assert sum("Are you okay? Do you need help?" in line for line in state["log"]) == 1
     assert state["error"] is None
 
 
@@ -1131,3 +1135,86 @@ def test_judge_demo_refuses_to_start_while_following():
     assert ok is False
     assert "Stop following" in message
     assert controller.state.snapshot()["demo"]["active"] is False
+
+
+# ---------------------------------------------------------------------------
+# Heart-rate debug view
+# ---------------------------------------------------------------------------
+
+def test_heart_view_files_exist_and_ship_together():
+    """The robot imports all of these from /tmp; a missing one fails only on the robot."""
+    assert RPPG_RUNNER.is_file()
+    for module in RPPG_MODULES:
+        assert module.is_file(), module
+    names = {path.name for path in RPPG_MODULES}
+    assert {"rppg.py", "rppg_view.py"} <= names
+    assert any(name.endswith(".onnx") for name in names), "the face model must ship too"
+
+
+def test_heart_view_starts_and_stops_and_reports_its_url():
+    controller = RobotController(("bracketbot@bracketbot.local",), simulate=True)
+
+    assert controller.state.snapshot()["heart_enabled"] is False
+    ok, _message = controller.set_heart_view(True)
+    assert ok
+    for _ in range(50):
+        if controller.state.snapshot()["heart_enabled"]:
+            break
+        time.sleep(0.02)
+    snapshot = controller.state.snapshot()
+    assert snapshot["heart_enabled"] is True
+    assert snapshot["heart_url"].endswith(f":{RPPG_VIEW_PORT}/")
+
+    assert controller.set_heart_view(True) == (False, "The heart-rate view is already on")
+    ok, _message = controller.set_heart_view(False)
+    assert ok
+    assert controller.state.snapshot()["heart_enabled"] is False
+    assert controller.state.snapshot()["heart_url"] is None
+
+
+def test_heart_view_rejects_a_non_boolean_and_an_offline_robot():
+    controller = RobotController(("not-used",), simulate=True)
+    assert controller.set_heart_view("yes") == (False, "enabled must be true or false")
+
+    offline = RobotController(("not-used",), simulate=True)
+    offline.state.host = None
+    ok, message = offline.set_heart_view(True)
+    assert not ok and "not connected" in message
+
+
+def test_heart_view_url_uses_the_hostname_not_the_ssh_login():
+    controller = RobotController(("not-used",), simulate=True)
+    assert controller._heart_view_url("bracketbot@bracketbot.local") == (
+        f"http://bracketbot.local:{RPPG_VIEW_PORT}/"
+    )
+    assert controller._heart_view_url("10.0.0.4") == f"http://10.0.0.4:{RPPG_VIEW_PORT}/"
+
+
+def test_heart_view_reads_scan_results_without_trusting_the_stream():
+    controller = RobotController(("not-used",), simulate=True)
+
+    controller._note_heart_line('{"progress": 0.5, "bpm": 71.0, "snr_db": 3.0}')
+    assert "50%" in controller.state.snapshot()["heart_phase"]
+
+    controller._note_heart_line(
+        '{"result": {"bpm": 72.4, "snr_db": 5.0, "confident": true}, "fps": 27.0}'
+    )
+    assert controller.state.snapshot()["heart_reading"] == {
+        "bpm": 72.4, "snr_db": 5.0, "confident": True,
+    }
+
+    controller._note_heart_line('{"result": null}')
+    assert controller.state.snapshot()["heart_reading"] is None
+
+    controller._note_heart_line("uv: Building environment...")   # not JSON; must not raise
+    controller._note_heart_line("[1, 2, 3]")                     # JSON, but not an object
+
+
+def test_heart_view_page_has_the_card_and_never_claims_a_medical_reading():
+    assert 'id="heart"' in PAGE
+    assert "renderHeart(current)" in PAGE
+    assert "/api/heart" in PAGE
+    assert "heart-stream" in PAGE
+    assert "stream.mjpg" in PAGE
+    assert "not a medical measurement" in PAGE
+    assert "unauthenticated" in PAGE

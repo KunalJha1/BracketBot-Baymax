@@ -204,7 +204,7 @@ from these lines: a light, the spoken line, then a wave.
 single approach to the existing depth-grounded lying-pose detector. It uses
 range and bearing PID control, caps forward motion at **0.05 m/s** and turning
 at **0.20 rad/s**, and stops **1.0 m outside the observed body envelope**. Once
-the wheels have settled it says, "hello specimen, are you in trouble", then
+the wheels have settled it says, "Are you okay? Do you need help?", then
 ends the action. Press the button again for another attempt; `Esc` cancels.
 
 This mode needs the updated robot vision service and existing robot-specific
@@ -581,8 +581,9 @@ medication schedule.
 
 Remote photoplethysmography (rPPG) reads a pulse from the sub-percent colour
 changes skin shows as blood volume changes. `rppg.py` holds the signal chain:
-OpenCV YuNet forehead and cheek ROI, POS projection, bandpass, FFT peak with an
-SNR gate.
+OpenCV YuNet forehead and cheek ROI, a skin gate over the pixels inside it, POS
+projection, bandpass, and a rate read off the stacked spectrum of the whole
+scan rather than off the best single window.
 
 **This is not a medical device.** It produces a demo-grade estimate from a
 camera. Do not use it to diagnose, triage, screen, or trigger robot actions,
@@ -597,24 +598,57 @@ uv run --extra rppg python laptop_rppg.py
 ```
 
 Sit 50–70 cm from the camera in even front lighting and hold still for about
-ten seconds. The panel shows the raw ROI green trace, the pulse signal, the
-spectrum, and a luminance-drift readout that exposes auto-exposure hunting.
-Press `m` to switch POS to plain green and watch it fail under changing light,
-`r` to record a CSV, and `q` to quit. Re-analyse a recording offline with
+ten seconds. The frame is drawn with the model's own working on top — the
+detector's box, the steadied box the ROI used, and which pixels survived the
+skin gate, green for kept and red for thrown away — beside the raw ROI green
+trace, the pulse signal, this window's spectrum and the stacked spectrum of the
+whole scan. Press `m` to switch POS to plain green and watch it fail under
+changing light, `g` to toggle the skin gate and watch the red pixels rejoin the
+average, `b` to toggle box steadying, `e` to toggle face-metered exposure, `r`
+to record a CSV, and `q` to quit. Re-analyse a recording offline with
 `--replay rppg_*.csv`.
+
+Exposure is set from the face rather than from the frame. The camera's own
+auto-exposure is switched off — its corrections are far larger than the ~0.1–1%
+the pulse moves the skin — and a slow loop then steps exposure until the skin
+sits near the middle of the sensor's range with nothing clipped, and holds it
+there. Watch the `skin NN%` readout settle; it normally takes two or three
+moves in the first couple of seconds and nothing after that, because each move
+costs the analysis window it lands in. `--no-meter` locks exposure where the
+camera left it instead, and `--exposure-target` aims somewhere other than the
+default 52%.
+
+### See what the robot camera sees
+
+The same picture is available from the robot, which is the only way to tell a
+scan that failed from a scan that never had a face to work with. The dashboard
+has a **Heart-rate debug view** tile (or press `V`) that starts it over SSH and
+embeds the stream; to run it by hand:
+
+```sh
+scp scripts/robot_rppg.py rppg.py rppg_view.py \
+    assets/models/face_detection_yunet_2026may.onnx bot:/tmp/
+ssh bot 'cd /tmp && ~/.local/bin/uv run robot_rppg.py --view --monitor'
+```
+
+Then open `http://<robot>:8021/`. `--monitor` repeats the scan until you stop
+it, which is the useful mode for tuning. The page is **unauthenticated and
+shows a live camera view of whoever is in front of the robot**: serve it on a
+trusted network, only while someone is watching it, and stop it afterwards.
 
 On the robot, check the camera before attempting any measurement:
 
 ```sh
-scp scripts/robot_rppg.py rppg.py assets/models/face_detection_yunet_2026may.onnx bot:/tmp/
 ssh bot 'cd /tmp && ~/.local/bin/uv run robot_rppg.py --check'
 ```
 
 The check reports frame rate, the split eye's shape, how often a face was
 found, its pixel width, and `lum_drift_pct`. That last number decides whether a
-measurement is worth attempting: the robot app is read-only and **cannot lock
-the camera's exposure**, and auto-exposure steps are larger than the pulse
-itself. The port doc gives the thresholds. Only if the check passes:
+measurement is worth attempting: the robot app is read-only and **cannot set
+the camera's exposure** — the head camera is a shared topic, so the face
+metering the laptop tool does is deliberately off there — and auto-exposure
+steps are larger than the pulse itself. The port doc gives the thresholds. Only
+if the check passes:
 
 ```sh
 ssh bot 'cd /tmp && ~/.local/bin/uv run robot_rppg.py --duration 20'
@@ -647,6 +681,7 @@ trusting any of it.
 | `scripts/wave_test.py` | Focused standalone wave runner |
 | `people_detector.py` | Local YOLO + YuNet + visible-expression pipeline |
 | `rppg.py` | Contactless heart-rate signal chain and ROI extraction |
+| `rppg_view.py` | Shared debug rendering for the laptop tool and the robot's view |
 | `laptop_rppg.py` | Laptop-webcam rPPG concept check with a live debug view |
 | `scripts/robot_rppg.py` | Read-only head-camera rPPG scan and camera check |
 | `assets/models/` | Documented YuNet and EmotiEffLib ONNX assets |
@@ -690,7 +725,7 @@ button or keyboard action.
 python3 -m py_compile scripts/robot_dashboard.py scripts/gesture_test.py \
   scripts/robot_effect.py scripts/robot_base_mode.py scripts/table_rest.py \
   scripts/check_yolo_runtime.py people_detector.py scripts/robot_rppg.py \
-  rppg.py laptop_rppg.py
+  rppg.py rppg_view.py laptop_rppg.py
 uv run --extra vision --extra rppg --extra dev pytest
 uv run --extra vision python scripts/check_yolo_runtime.py
 git diff --check

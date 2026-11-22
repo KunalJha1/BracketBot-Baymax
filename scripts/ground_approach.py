@@ -13,7 +13,7 @@ from follow_core import (
     Track, corridor_count, supervise,
 )
 
-GROUND_LINE = "hello specimen, are you in trouble"
+GROUND_LINE = "Are you okay? Do you need help?"
 TARGET_MAX_AGE = 0.65
 STANDOFF = 1.0
 

@@ -5,7 +5,7 @@ existing YOLO pose/depth detector must have confirmed one possible person on
 the ground for two seconds. The robot slowly faces and approaches that track,
 stops outside its body envelope, waits for stationary wheels, and says exactly:
 
-> hello specimen, are you in trouble
+> Are you okay? Do you need help?
 
 It completes after speaking once. Another button press is required to repeat.
 The action never starts on boot or as a side effect of a navigation alert.

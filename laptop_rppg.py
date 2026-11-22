@@ -13,9 +13,18 @@ Setup:
   uv run --extra rppg python laptop_rppg.py --cam 1          # other camera
   uv run --extra rppg python laptop_rppg.py --replay rec.csv # offline re-analysis
 
+Exposure is metered on the face, not the frame: the camera's own AE is switched off
+and a slow loop steps exposure until the skin sits near the middle of the sensor's range
+with nothing clipped, then holds still. Watch the "skin NN%" readout settle. Each move it
+makes is a step in the raw trace, so the window it lands in is thrown away rather than
+read - which is why the loop is deliberately reluctant to move at all.
+
 Keys (live window):
   q / Esc   quit
   m         toggle method POS <-> GREEN (watch GREEN fail under lighting changes)
+  g         toggle the skin gate (watch the red pixels rejoin the average)
+  b         toggle box steadying
+  e         toggle face-metered exposure (watch a dark face stay dark without it)
   r         start/stop recording CSV (t, R, G, B) for offline tuning
   space     reset buffer
   l         try to (re)lock exposure / white balance
@@ -35,11 +44,10 @@ from collections import deque
 import cv2
 import numpy as np
 
-from rppg import FaceROI, HeartRateTracker, MIN_SECONDS, DEFAULT_MODEL, HR_LO_HZ, HR_HI_HZ
-
-PANEL_W = 440
-COL = {"g": (80, 220, 80), "c": (230, 200, 60), "y": (60, 220, 240), "r": (70, 70, 240),
-       "w": (235, 235, 235), "d": (110, 110, 110), "bg": (22, 22, 22)}
+import rppg_view
+from rppg import (DEFAULT_MODEL, EXPOSURE_TARGET, FaceExposure, FaceROI,
+                  HeartRateTracker, MIN_SECONDS, OpenCVExposure, skin_luma_stats)
+from rppg_view import COL
 
 
 # ----------------------------------------------------------------------------
@@ -64,110 +72,7 @@ def open_webcam(index, w, h, fps):
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
     cap.set(cv2.CAP_PROP_FPS, fps)
-    for _ in range(30):                                   # let AE/AWB settle first
-        cap.read()
     return cap
-
-
-def lock_exposure(cap):
-    """
-    Best effort. Laptop webcams vary a lot; the live 'lum drift' readout tells you
-    whether it actually held. POS tolerates some AE drift, green-only does not.
-    """
-    if sys.platform == "darwin":
-        return "macOS: OpenCV can't lock AE (POS still OK)"
-    exp = cap.get(cv2.CAP_PROP_EXPOSURE)
-    if sys.platform == "win32":
-        ok = cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)     # DSHOW: 0.25 = manual
-    else:
-        ok = cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)        # V4L2 menu: 1 = manual
-    cap.set(cv2.CAP_PROP_EXPOSURE, exp)                    # hold settled value
-    cap.set(cv2.CAP_PROP_AUTO_WB, 0)
-    return f"AE lock {'requested' if ok else 'unsupported'} (exp={exp:g})"
-
-
-# ----------------------------------------------------------------------------
-# Drawing
-# ----------------------------------------------------------------------------
-
-def txt(img, s, xy, scale=0.5, color=COL["w"], thick=1):
-    cv2.putText(img, s, xy, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
-
-
-def draw_trace(img, rect, y, color, label):
-    x0, y0, w, h = rect
-    cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), COL["d"], 1)
-    txt(img, label, (x0 + 5, y0 + 15), 0.42, COL["d"])
-    y = np.asarray(y, float)
-    if len(y) < 2 or not np.all(np.isfinite(y)):
-        return
-    lo, hi = np.percentile(y, 1), np.percentile(y, 99)
-    if hi - lo < 1e-12:
-        return
-    ys = np.clip((y - lo) / (hi - lo), 0, 1)
-    xs = np.linspace(x0 + 2, x0 + w - 2, len(y))
-    pts = np.column_stack([xs, y0 + h - 4 - ys * (h - 22)]).astype(np.int32)
-    cv2.polylines(img, [pts], False, color, 1, cv2.LINE_AA)
-
-
-def draw_spectrum(img, rect, freqs, psd, bpm, snr_ok):
-    x0, y0, w, h = rect
-    cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), COL["d"], 1)
-    f_lo, f_hi = 0.5, 4.0
-    fx = lambda f: int(x0 + (f - f_lo) / (f_hi - f_lo) * w)
-    # passband shading + ticks
-    ov = img.copy()
-    cv2.rectangle(ov, (fx(HR_LO_HZ), y0 + 1), (fx(HR_HI_HZ), y0 + h - 1), (45, 45, 45), -1)
-    cv2.addWeighted(ov, 0.6, img, 0.4, 0, img)
-    txt(img, "spectrum (BPM)  shaded = search band", (x0 + 5, y0 + 15), 0.42, COL["d"])
-    for b in (60, 90, 120, 150, 180, 210):
-        x = fx(b / 60)
-        cv2.line(img, (x, y0 + h - 4), (x, y0 + h), COL["d"], 1)
-        txt(img, str(b), (x - 10, y0 + h + 14), 0.38, COL["d"])
-    if freqs is None:
-        return
-    m = (freqs >= f_lo) & (freqs <= f_hi)
-    p = psd[m] / (psd[m].max() + 1e-20)
-    pts = np.column_stack([[fx(f) for f in freqs[m]], y0 + h - 3 - p * (h - 22)]).astype(np.int32)
-    cv2.polylines(img, [pts], False, COL["y"], 1, cv2.LINE_AA)
-    if bpm is not None:
-        x = fx(bpm / 60)
-        cv2.line(img, (x, y0 + 18), (x, y0 + h), COL["g"] if snr_ok else COL["r"], 1)
-        x2 = fx(2 * bpm / 60)                              # harmonic marker
-        if x2 < x0 + w:
-            cv2.line(img, (x2, y0 + h - 12), (x2, y0 + h), COL["d"], 1)
-
-
-def build_panel(h, st):
-    p = np.full((h, PANEL_W, 3), COL["bg"], np.uint8)
-    bpm_txt = f"{st['bpm_disp']:.0f}" if st["bpm_disp"] is not None else "--"
-    txt(p, bpm_txt, (20, 70), 2.2, COL["g"] if st["confident"] else COL["w"], 3)
-    txt(p, "BPM", (20 + 45 * len(bpm_txt) + 10, 70), 0.7, COL["d"], 2)
-    snr = st["snr"]
-    txt(p, f"SNR {snr:+.1f} dB" if snr is not None else "SNR --", (260, 35), 0.55,
-        COL["g"] if st["snr_ok"] else COL["r"])
-    txt(p, f"method {st['method'].upper()}", (260, 58), 0.5, COL["c"])
-    txt(p, f"fps {st['fps']:.1f}", (260, 80), 0.5, COL["w"])
-
-    res = st["res"]
-    rgb = res["rgb_u"][:, 1] if res is not None else st["raw_g"]
-    draw_trace(p, (10, 100, PANEL_W - 20, 80), rgb, COL["g"], "raw ROI green (steps = auto-exposure)")
-    draw_trace(p, (10, 190, PANEL_W - 20, 90), res["h"] if res is not None else [], COL["c"],
-               "pulse signal (after POS/green + bandpass)")
-    draw_spectrum(p, (10, 290, PANEL_W - 20, 110),
-                  res["freqs"] if res is not None else None,
-                  res["psd"] if res is not None else None, st["bpm_raw"], st["snr_ok"])
-
-    y = 440
-    spread = st.get("spread")
-    txt(p, f"agree +-{spread:.1f} BPM" if spread is not None else "agree --", (260, 102), 0.5,
-        COL["g"] if st["confident"] else COL["d"])
-    txt(p, st["status"], (10, y), 0.55, st["status_col"]); y += 20
-    txt(p, f"lum drift (2s): {st['lum_drift']:.2f}%   face {st['face_w']:.0f}px", (10, y), 0.45); y += 18
-    txt(p, st["lock_msg"], (10, y), 0.42, COL["d"]); y += 18
-    if st["rec"]:
-        txt(p, "REC", (PANEL_W - 55, y - 36), 0.6, COL["r"], 2)
-    return p
 
 
 # ----------------------------------------------------------------------------
@@ -177,7 +82,18 @@ def build_panel(h, st):
 def run_live(a):
     ensure_model(a.model)
     cap = open_webcam(a.cam, a.width, a.height, a.fps)
-    lock_msg = lock_exposure(cap) if not a.no_lock else "AE lock disabled"
+    # Taking the camera off its own AE and then steering exposure from the face are
+    # the same job split in two, and both halves live in rppg.py, so the robot runs
+    # the loop this tool is tuned against. Best effort either way: webcams vary a
+    # lot, and the "lum drift" and "skin NN%" readouts are how you see whether this
+    # camera honoured any of it.
+    exposure = OpenCVExposure(cap, fps=a.fps)
+    exposure.auto()                                       # undo a lock a previous run left behind
+    lock_msg = exposure.manual() if not a.no_lock else "AE lock disabled (camera AE still on)"
+    # Metering the face is only meaningful once the camera has stopped metering the
+    # frame; with --no-lock the loop would be arguing with the camera's own AE.
+    metering_possible = exposure.locked and not a.no_meter
+    meter = FaceExposure(target=a.exposure_target) if metering_possible else None
     roi = FaceROI(a.model)
 
     lum_hist = deque()
@@ -187,6 +103,7 @@ def run_live(a):
     fps, t_last = 0.0, time.monotonic()
     writer, rec_file = None, None
     status, status_col, face_w = "starting", COL["w"], 0.0
+    skin = None
 
     def new_tracker():
         """The robot's tracker, same settings: buffer, SNR gate, tracking, aggregation."""
@@ -212,9 +129,19 @@ def run_live(a):
         if r is None:
             if tracker.t:
                 reset()
+            if meter:
+                meter.observe(now, None)
+            skin = None
             status, status_col = "NO FACE / too far", COL["r"]
         else:
             rgb, nose, face_w, mask = r
+            skin = skin_luma_stats(frame, mask)
+            if meter:
+                factor = meter.observe(now, skin)
+                if factor is not None and exposure.apply(factor):
+                    # The step dwarfs the pulse: keep the lock, drop the window it
+                    # would have landed in.
+                    tracker.clear()
             moved = last_nose is not None and np.linalg.norm(nose - last_nose) / face_w > a.motion_max
             last_nose = nose
             if moved:
@@ -233,10 +160,7 @@ def run_live(a):
 
             # luminance stability readout: exposes AE hunting
             lum_hist.append((now, float(np.dot(rgb, [0.299, 0.587, 0.114]))))
-            # overlay ROI
-            tint = frame.copy(); tint[mask > 0] = (0, 255, 0)
-            cv2.addWeighted(tint, 0.25, frame, 0.75, 0, frame)
-            cv2.circle(frame, tuple(nose.astype(int)), 3, COL["c"], -1)
+            frame = rppg_view.draw_overlay(frame, roi.last, nose)
 
         while lum_hist and now - lum_hist[0][0] > 2.0:
             lum_hist.popleft()
@@ -247,30 +171,34 @@ def run_live(a):
             next_an = now + 0.5
             tracker.update(now)                            # gate, tracking and unlock live here
 
-        agg = tracker.result()
-        snr = tracker.last_snr
-        st = dict(bpm_disp=None if agg is None else agg["bpm"], bpm_raw=tracker.last_bpm, snr=snr,
-                  snr_ok=snr is not None and snr >= a.snr_min,
-                  confident=bool(agg and agg["confident"]),
-                  spread=None if agg is None else agg["spread_bpm"],
-                  method=method, fps=fps, res=tracker.last,
-                  raw_g=[c[1] for c in tracker.rgb], status=status, status_col=status_col,
-                  lum_drift=lum_drift, face_w=face_w, lock_msg=lock_msg, rec=writer is not None)
-        canvas = np.hstack([frame, build_panel(frame.shape[0], st)]) \
-            if frame.shape[0] >= 500 else \
-            np.hstack([cv2.resize(frame, (int(frame.shape[1] * 500 / frame.shape[0]), 500)),
-                       build_panel(500, st)])
-        cv2.imshow("rPPG concept check", canvas)
+        st = rppg_view.state_from(tracker, frame_fps=fps, status=status, status_col=status_col,
+                                  lum_drift=lum_drift, face_w=face_w,
+                                  clip_hi=None if skin is None else skin["clip_hi"],
+                                  clip_lo=None if skin is None else skin["clip_lo"],
+                                  lock_msg=lock_msg,
+                                  note=meter.describe() if meter else "face metering off",
+                                  note_col=COL["g"] if meter and meter.settled else COL["d"],
+                                  detail=roi.last, rec=writer is not None)
+        cv2.imshow("rPPG concept check", rppg_view.compose(frame, st))
 
         k = cv2.waitKey(1) & 0xFF
         if k in (ord("q"), 27):
             break
         elif k == ord("m"):
             method = "green" if method == "pos" else "pos"; reset()
+        elif k == ord("g"):
+            roi.skin_gate = not roi.skin_gate; reset()
+        elif k == ord("b"):
+            roi.steady = not roi.steady; roi.box = None; reset()
+        elif k == ord("e"):
+            meter = None if meter or not metering_possible \
+                else FaceExposure(target=a.exposure_target)
         elif k == ord(" "):
             reset()
         elif k == ord("l"):
-            lock_msg = lock_exposure(cap)
+            lock_msg = exposure.manual()
+            metering_possible = exposure.locked and not a.no_meter
+            meter = FaceExposure(target=a.exposure_target) if metering_possible else None
         elif k == ord("r"):
             if writer:
                 rec_file.close(); writer = None
@@ -282,6 +210,7 @@ def run_live(a):
 
     if writer:
         rec_file.close(); print(f"saved {rec_path}")
+    exposure.auto(settle_frames=0)                        # leave the webcam usable for other apps
     cap.release(); cv2.destroyAllWindows()
 
 
@@ -332,7 +261,12 @@ if __name__ == "__main__":
     ap.add_argument("--motion-max", type=float, default=0.03)
     ap.add_argument("--method", choices=["pos", "green"], default="pos")
     ap.add_argument("--model", default=str(DEFAULT_MODEL))
-    ap.add_argument("--no-lock", action="store_true", help="leave auto-exposure on")
+    ap.add_argument("--no-lock", action="store_true",
+                    help="leave the camera's own auto-exposure on (also disables face metering)")
+    ap.add_argument("--no-meter", action="store_true",
+                    help="lock exposure where it settled, without metering it on the face")
+    ap.add_argument("--exposure-target", type=float, default=EXPOSURE_TARGET,
+                    help="skin brightness to aim for, as a fraction of full scale")
     ap.add_argument("--replay", help="CSV from 'r' key to re-analyze offline")
     a = ap.parse_args()
     run_replay(a) if a.replay else run_live(a)
